@@ -1,0 +1,37 @@
+app:
+  polling_interval_sec: 10
+  stable_for_sec: 90
+  stale_processing_hours: 6
+
+paths:
+  watch_folder: /Volumes/geonha/GH_archive/01_TUK/06_lecture_recordings/00_inbox
+  stable_audio_folder: /Volumes/geonha/GH_archive/01_TUK/06_lecture_recordings/01_audio
+  transcript_folder: /Volumes/geonha/GH_archive/01_TUK/06_lecture_recordings/02_transcripts
+  error_folder: /Volumes/geonha/GH_archive/01_TUK/06_lecture_recordings/99_errors
+  tmp_dir: /Users/geonha/lecture_stt/tmp
+  db_path: /Users/geonha/lecture_stt/state/jobs.sqlite3
+
+engine:
+  engine: faster-whisper
+
+transcribe:
+  model_size: large-v3
+  device: cpu
+  compute_type: int8
+  language: ko
+  task: transcribe
+  beam_size: 5
+  vad_filter: false
+  word_timestamps: false
+
+ffmpeg:
+  binary_path: /opt/homebrew/bin/ffmpeg
+
+logging:
+  file: logs/app.log
+  max_bytes: 5242880
+  backup_count: 5
+
+cleanup:
+  retain_days: 7
+  retain_min_transcripts: 5

@@ -1,0 +1,177 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import os
+import shutil
+import re
+import tempfile
+import time
+import traceback
+import uuid
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Union
+
+
+logger = logging.getLogger(__name__)
+
+
+_WHITESPACE_RE = re.compile(r"\s+")
+_INVALID_CHARS_RE = re.compile(r"[^0-9A-Za-z가-힣_-]")
+_MULTI_UNDERSCORE_RE = re.compile(r"_+")
+
+
+def local_timestamp() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def sanitize_stem(stem: str, max_length: int = 80) -> str:
+    if not stem:
+        return "audio"
+
+    name = stem.strip()
+    name = _WHITESPACE_RE.sub("_", name)
+    # remove path separators and risky filename characters while keeping Hangul/ASCII letters,
+    # digits, underscore, and dash.
+    name = name.replace("/", "_").replace("\\", "_")
+    name = name.replace(":", "_").replace("*", "_")
+    name = name.replace("?", "_").replace("\"", "_")
+    name = name.replace("<", "_").replace(">", "_").replace("|", "_")
+    name = _INVALID_CHARS_RE.sub("_", name)
+    name = _MULTI_UNDERSCORE_RE.sub("_", name)
+    name = name.strip("._-")
+
+    if not name:
+        return "audio"
+
+    name = name[:max_length]
+    name = name.strip("._-")
+    return name or "audio"
+
+
+def short_id(length: int = 8) -> str:
+    return uuid.uuid4().hex[:length]
+
+
+def ensure_dir(path: Union[str, Path]) -> Path:
+    directory = Path(path)
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def now_iso() -> str:
+    return datetime.now().astimezone().isoformat()
+
+
+def stacktrace(exc: BaseException) -> str:
+    return "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+
+
+def compute_sha256(path: Union[str, Path], chunk_size: int = 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def atomic_write(path: Union[str, Path], data: Any, encoding: str = "utf-8") -> None:
+    target = Path(path)
+    ensure_dir(target.parent)
+
+    if isinstance(data, (dict, list)):
+        content = json.dumps(data, ensure_ascii=False, indent=2)
+        mode = "w"
+        kwargs = {"encoding": encoding}
+    elif isinstance(data, str):
+        content = data
+        mode = "w"
+        kwargs = {"encoding": encoding}
+    elif isinstance(data, (bytes, bytearray)):
+        content = data
+        mode = "wb"
+        kwargs = {}
+    else:
+        content = str(data)
+        mode = "w"
+        kwargs = {"encoding": encoding}
+
+    with tempfile.NamedTemporaryFile(mode=mode, delete=False, dir=str(target.parent), prefix=f".{target.name}", suffix=".tmp", **kwargs) as f:
+        f.write(content)
+        temp_path = Path(f.name)
+
+    os.replace(temp_path, target)
+
+
+def safe_move_file(src: Union[str, Path], dst: Union[str, Path]) -> None:
+    src_path = Path(src)
+    dst_path = Path(dst)
+    if not src_path.exists():
+        raise FileNotFoundError(f"Source file does not exist: {src_path}")
+    if dst_path.exists():
+        raise FileExistsError(f"Destination file already exists: {dst_path}")
+
+    ensure_dir(dst_path.parent)
+
+    try:
+        os.replace(src_path, dst_path)
+        return
+    except OSError:
+        # Cross-device rename fallback: copy → fsync temp copy → replace atomically.
+        tmp_path = dst_path.with_name(f".{dst_path.name}.{uuid.uuid4().hex}.tmp")
+        copied = False
+        try:
+            shutil.copy2(src_path, tmp_path)
+            copied = True
+            try:
+                with open(tmp_path, "rb") as handle:
+                    os.fsync(handle.fileno())
+            except OSError:
+                logger.debug("Unable to fsync temporary copy %s", tmp_path, exc_info=True)
+
+            os.replace(tmp_path, dst_path)
+            try:
+                src_path.unlink()
+            except OSError:
+                logger.warning("Failed to remove source file after copy-move: %s", src_path, exc_info=True)
+            return
+        finally:
+            if copied and tmp_path.exists():
+                # If os.replace consumed it, this is usually a no-op.
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+            if not copied and tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+
+
+def is_temporary_file(path: Path) -> bool:
+    name = path.name
+    if name.startswith("."):
+        return True
+    if name.startswith("~"):
+        return True
+    lower = name.lower()
+    if lower.endswith(".tmp") or lower.endswith(".part"):
+        return True
+    return False
+
+
+def read_text_file(path: Union[str, Path], default: str = "") -> str:
+    try:
+        return Path(path).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return default
+
+
+def now() -> float:
+    return time.time()
