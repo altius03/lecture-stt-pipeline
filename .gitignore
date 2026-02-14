@@ -18,3 +18,10 @@ config/config.yaml
 __pycache__/
 *.pyc
 .venv/
+.env
+config/config.yaml
+state/
+tmp/
+.venv/
+.idea/
+.DS_Store
