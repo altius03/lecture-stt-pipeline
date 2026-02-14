@@ -132,7 +132,7 @@ tail -f /Users/geonha/lecture_stt/state/logs/launchd.out.log
 tail -f /Users/geonha/lecture_stt/state/logs/launchd.err.log
 ```
 
-`launchd`는 PATH가 제한될 수 있으므로 `notifier`, `ffmpeg`, `python`, `config` 경로는 plist에서 모두 절대 경로로 지정되어 있습니다.
+`launchd`는 PATH가 제한될 수 있으므로 `python`, `config`, `ffmpeg` 경로는 plist에서 모두 절대 경로로 지정되어 있습니다.
 
 ---
 
@@ -164,6 +164,7 @@ Paused: skipping --once
 ## Discord 알림 (성공/실패)
 
 `discord` 알림은 `.env`의 `DISCORD_WEBHOOK_URL`이 설정되어 있을 때만 전송됩니다.
+웹훅 URL이 비어 있으면 알림은 건너뛰고 파이프라인은 계속 동작합니다.
 
 - 실패 알림: 작업이 `ERROR` 상태가 되면 전송됩니다.
   - 파일명/캐노니컬명/경로/실패 사유를 포함합니다.
@@ -173,7 +174,7 @@ Paused: skipping --once
   - `/Users/geonha/lecture_stt/state/notified/success_<job_id>`
   - `/Users/geonha/lecture_stt/state/notified/error_<job_id>`
 
-컨텐츠가 길 경우(예: 긴 예외 메시지)에는 전송 전에 길이 제한(Discord 안전 한계 대비)으로 잘라서 보냅니다.
+컨텐츠가 길 경우(예: 긴 예외 메시지)에는 전송 전에 길이 제한(최대 1900자, `...(생략)` 포함)으로 잘라서 보냅니다.
 
 ---
 
