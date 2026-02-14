@@ -313,7 +313,10 @@ class STTPipeline:
         self._last_pause_log_at = 0.0
 
         self.conn = db.init_db(str(self.db_path))
-        self.notifier = DiscordNotifier(os.getenv("DISCORD_WEBHOOK_URL"))
+        self.notifier = DiscordNotifier(
+            os.getenv("DISCORD_WEBHOOK_URL"),
+            state_dir=self.db_path.parent,
+        )
 
     def startup_recovery(self) -> None:
         counts = db.recover_processing_jobs(self.conn, stale_processing_hours=self.stale_processing_hours)
@@ -457,6 +460,17 @@ class STTPipeline:
                 transcript_txt_path=str(txt_path),
                 transcript_json_path=str(json_path),
             )
+            self.notifier.notify_success({
+                "job_id": job_id,
+                "orig_name": source_path.name,
+                "canonical_base": canonical_base,
+                "orig_inbox_path": str(source_path),
+                "canonical_audio_path": str(canonical_audio_path),
+                "transcript_txt_path": str(txt_path),
+                "transcript_json_path": str(json_path),
+                "elapsed_sec": 0.0,
+                "updated_at": utils.now_iso(),
+            })
             return True
         except (OSError, json.JSONDecodeError, ValueError):
             for replay_file in (txt_path, json_path):
@@ -579,6 +593,17 @@ class STTPipeline:
                 total_sec=total_sec,
                 engine_params=json.dumps(metadata),
             )
+            self.notifier.notify_success({
+                "job_id": job_id,
+                "orig_name": source_path.name,
+                "canonical_base": canonical_base,
+                "orig_inbox_path": str(source_path),
+                "canonical_audio_path": str(canonical_audio_final),
+                "transcript_txt_path": str(txt_path),
+                "transcript_json_path": str(json_path),
+                "elapsed_sec": total_sec,
+                "updated_at": ended_at,
+            })
             self._log(logging.INFO, "done", job_ctx)
 
         except Exception as exc:
@@ -604,6 +629,8 @@ class STTPipeline:
                 "canonical_base": canonical_base,
                 "orig_inbox_path": str(source_path),
                 "canonical_audio_path": str(error_audio) if error_audio else str(canonical_audio),
+                "transcript_txt_path": str(txt_path),
+                "transcript_json_path": str(json_path),
                 "error_message": str(exc),
             })
             self._log(logging.ERROR, "failed", job_ctx)

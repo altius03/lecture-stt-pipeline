@@ -72,6 +72,21 @@ Pause flag location:
 
 `/Users/geonha/lecture_stt/state/paused`
 
+## Discord notifications (Korean)
+
+Both 성공/실패 알림을 한국어로 보냅니다.  
+`DISCORD_WEBHOOK_URL`이 설정되어 있어야 하며, 미설정이면 알림은 건너뜁니다.
+
+성공 메시지는 `DONE` 전환 및 결과 파일 저장 후 전송되고,
+실패 메시지는 예외 발생 시 전송됩니다.
+
+중복 알림 방지를 위해 아래 마커 파일을 사용합니다.
+
+- `state/notified/success_<job_id>`
+- `state/notified/error_<job_id>`
+
+성공/실패 각각 한 번만 POST 되고, 같은 `job_id`는 재시작해도 재전송되지 않습니다.
+
 ## Run manually
 
 ```bash
