@@ -32,22 +32,157 @@ def load_config(config_path: str = "config/config.yaml") -> dict:
     explicit = Path(config_path)
     if not explicit.is_absolute():
         explicit = repo_root / explicit
+    if not explicit.exists():
+        raise FileNotFoundError(f"Missing required config file: {explicit}")
+    if explicit.stat().st_size == 0:
+        raise ValueError(f"Config file is empty: {explicit}")
 
-    example_path = repo_root / "config" / "config.example.yaml"
+    with open(explicit, "r", encoding="utf-8") as f:
+        try:
+            loaded = yaml.safe_load(f)
+        except yaml.YAMLError as exc:
+            raise ValueError(f"Failed to parse YAML in {explicit}: {exc}") from exc
 
-    if explicit.exists():
-        path_to_load = explicit
-    elif example_path.exists():
-        path_to_load = example_path
-        logger = logging.getLogger("lecture_stt")
-        logger.warning("config/config.yaml missing. Falling back to config/config.example.yaml")
-    else:
-        raise FileNotFoundError("Neither config/config.yaml nor config/config.example.yaml exists")
-
-    with open(path_to_load, "r", encoding="utf-8") as f:
-        loaded = yaml.safe_load(f) or {}
+    if not isinstance(loaded, dict):
+        raise ValueError(f"Config must be a YAML mapping in {explicit}")
+    if not loaded:
+        raise ValueError(f"Config file has no content: {explicit}")
 
     return loaded
+
+
+def validate_config(config_path: str, config: dict) -> dict:
+    config_path_obj = Path(config_path)
+
+    def require_section(name: str) -> Dict[str, Any]:
+        section = config.get(name)
+        if not isinstance(section, dict):
+            raise ValueError(f"Config error in {config_path_obj}: missing/invalid section '{name}'")
+        return section
+
+    app = require_section("app")
+    paths = require_section("paths")
+    ffmpeg_cfg = require_section("ffmpeg")
+    transcribe = require_section("transcribe")
+
+    required_app = ["polling_interval_sec", "stable_for_sec", "stale_processing_hours"]
+    for key in required_app:
+        if key not in app:
+            raise ValueError(f"Config error in {config_path_obj}: missing key '{key}' under 'app'")
+
+    try:
+        polling_interval_sec = int(app["polling_interval_sec"])
+        stable_for_sec = int(app["stable_for_sec"])
+        stale_processing_hours = int(app["stale_processing_hours"])
+    except Exception as exc:
+        raise ValueError("Config error: app polling/stable/stale values must be integers") from exc
+
+    if polling_interval_sec <= 0:
+        raise ValueError("Config error: app.polling_interval_sec must be greater than 0")
+    if stable_for_sec <= 0:
+        raise ValueError("Config error: app.stable_for_sec must be greater than 0")
+    if stale_processing_hours <= 0:
+        raise ValueError("Config error: app.stale_processing_hours must be greater than 0")
+
+    app["polling_interval_sec"] = polling_interval_sec
+    app["stable_for_sec"] = stable_for_sec
+    app["stale_processing_hours"] = stale_processing_hours
+
+    required_paths = [
+        "watch_folder",
+        "stable_audio_folder",
+        "transcript_folder",
+        "error_folder",
+        "tmp_dir",
+        "db_path",
+    ]
+    for key in required_paths:
+        if key not in paths:
+            raise ValueError(f"Config error in {config_path_obj}: missing key '{key}' under 'paths'")
+        value = paths[key]
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"Config error: paths.{key} must be a non-empty string")
+
+    watch_folder = Path(paths["watch_folder"])
+    if not watch_folder.exists():
+        raise FileNotFoundError(
+            f"Config error: watch_folder does not exist: {watch_folder} (create it and rerun)"
+        )
+    if not watch_folder.is_dir():
+        raise NotADirectoryError(f"Config error: watch_folder is not a directory: {watch_folder}")
+
+    writable_dirs = [
+        ("paths.stable_audio_folder", Path(paths["stable_audio_folder"])),
+        ("paths.transcript_folder", Path(paths["transcript_folder"])),
+        ("paths.error_folder", Path(paths["error_folder"])),
+        ("paths.tmp_dir", Path(paths["tmp_dir"])),
+    ]
+    for label, directory in writable_dirs:
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise PermissionError(f"Config error: cannot create {label} directory {directory}") from exc
+        probe = directory / f".lecture_stt_write_probe_{os.getpid()}"
+        try:
+            probe.write_text("", encoding="utf-8")
+            probe.unlink()
+        except OSError as exc:
+            raise PermissionError(f"Config error: cannot write in {label} directory {directory}") from exc
+
+    db_parent = Path(paths["db_path"]).parent
+    try:
+        db_parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise PermissionError(f"Config error: cannot create db_path parent directory {db_parent}") from exc
+    state_log_dir = db_parent / "logs"
+    try:
+        state_log_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise PermissionError(
+            f"Config error: cannot create state logs directory {state_log_dir}"
+        ) from exc
+    try:
+        probe = state_log_dir / f".lecture_stt_state_probe_{os.getpid()}"
+        probe.write_text("", encoding="utf-8")
+        probe.unlink()
+    except OSError as exc:
+        raise PermissionError(f"Config error: cannot write in state logs directory {state_log_dir}") from exc
+
+    if "binary_path" not in ffmpeg_cfg:
+        raise ValueError(f"Config error in {config_path_obj}: missing key 'binary_path' under 'ffmpeg'")
+    ffmpeg_path = Path(ffmpeg_cfg["binary_path"])
+    if not ffmpeg_path.exists():
+        raise FileNotFoundError(f"Config error: ffmpeg binary not found: {ffmpeg_path}")
+    if not os.access(ffmpeg_path, os.X_OK):
+        raise PermissionError(f"Config error: ffmpeg binary not executable: {ffmpeg_path}")
+
+    required_transcribe = [
+        "model_size",
+        "device",
+        "compute_type",
+        "language",
+        "task",
+        "beam_size",
+        "vad_filter",
+        "word_timestamps",
+    ]
+    for key in required_transcribe:
+        if key not in transcribe:
+            raise ValueError(f"Config error in {config_path_obj}: missing key '{key}' under 'transcribe'")
+
+    for key in ["model_size", "device", "compute_type", "language", "task"]:
+        if not isinstance(transcribe[key], str) or not str(transcribe[key]).strip():
+            raise ValueError(f"Config error: transcribe.{key} must be a non-empty string")
+
+    try:
+        beam_size = int(transcribe["beam_size"])
+        transcribe["beam_size"] = beam_size
+    except Exception as exc:
+        raise ValueError("Config error: transcribe.beam_size must be an integer") from exc
+    transcribe["vad_filter"] = bool(transcribe["vad_filter"])
+    transcribe["word_timestamps"] = bool(transcribe["word_timestamps"])
+
+    return _ensure_config_defaults(config)
 
 
 def _ensure_config_defaults(config: dict) -> dict:
@@ -172,6 +307,10 @@ class STTPipeline:
             stable_for_sec=self.stable_for_sec,
             polling_interval_sec=self.polling_interval_sec,
         )
+
+        self.pause_sleep_sec = max(30, self.polling_interval_sec)
+        self._was_paused = False
+        self._last_pause_log_at = 0.0
 
         self.conn = db.init_db(str(self.db_path))
         self.notifier = DiscordNotifier(os.getenv("DISCORD_WEBHOOK_URL"))
@@ -477,6 +616,29 @@ class STTPipeline:
         self._log(logging.INFO, "pipeline start", {"job_id": "-", "canonical_base": "-"})
 
         while True:
+            if utils.is_paused(self.config):
+                now = utils.now()
+                if not self._was_paused:
+                    self._was_paused = True
+                    self._last_pause_log_at = now
+                    self._log(logging.INFO, "pipeline paused", {"job_id": "-", "canonical_base": "-"})
+                elif now - self._last_pause_log_at >= 60:
+                    self._last_pause_log_at = now
+                    self._log(logging.INFO, "pipeline paused", {"job_id": "-", "canonical_base": "-"})
+
+                if run_once:
+                    msg = "Paused: skipping --once"
+                    print(msg)
+                    self._log(logging.INFO, msg, {"job_id": "-", "canonical_base": "-"})
+                    return
+
+                time.sleep(self.pause_sleep_sec)
+                continue
+            if self._was_paused:
+                self._was_paused = False
+                self._last_pause_log_at = 0.0
+                self._log(logging.INFO, "pipeline resumed", {"job_id": "-", "canonical_base": "-"})
+
             stable_files = self.watcher.scan_stable_files()
             if not stable_files:
                 if run_once:
@@ -496,6 +658,10 @@ class STTPipeline:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Always-on lecture STT worker")
     parser.add_argument("--once", action="store_true", help="Process at most one stable file")
+    control_group = parser.add_mutually_exclusive_group()
+    control_group.add_argument("--pause", action="store_true", help="Pause scanning/processing")
+    control_group.add_argument("--resume", action="store_true", help="Resume scanning/processing")
+    control_group.add_argument("--status", action="store_true", help="Print pause status and exit")
     parser.add_argument(
         "--config",
         default="config/config.yaml",
@@ -507,8 +673,24 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     load_dotenv("/Users/geonha/lecture_stt/.env", override=False)
-    config = _ensure_config_defaults(load_config(args.config))
 
+    if args.pause or args.resume or args.status:
+        if args.pause:
+            utils.set_paused(True)
+            print(f"Paused: pause flag created at {utils.get_pause_flag_path()}")
+            return
+        if args.resume:
+            utils.set_paused(False)
+            print(f"Resumed: pause flag removed at {utils.get_pause_flag_path()}")
+            return
+
+        paused = utils.is_paused()
+        state = "PAUSED" if paused else "RESUMED"
+        print(f"Pipeline status: {state}")
+        print(f"Pause flag: {utils.get_pause_flag_path()}")
+        return
+
+    config = validate_config(args.config, load_config(args.config))
     logging_cfg = config["logging"]
     logger = setup_logging(
         logging_cfg["file"],
@@ -516,7 +698,7 @@ def main() -> None:
         int(logging_cfg["backup_count"]),
     )
 
-    logger.info("Loaded configuration")
+    logger.info("Loaded and validated configuration from %s", args.config)
     STTPipeline(config=config, logger=logger).run(run_once=args.once)
 
 

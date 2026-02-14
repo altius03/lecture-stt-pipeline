@@ -175,3 +175,28 @@ def read_text_file(path: Union[str, Path], default: str = "") -> str:
 
 def now() -> float:
     return time.time()
+
+
+def get_pause_flag_path(config: dict | None = None) -> Path:
+    if isinstance(config, dict):
+        db_path = (config.get("paths") or {}).get("db_path")
+        if db_path:
+            try:
+                return Path(db_path).expanduser().parent / "paused"
+            except Exception:
+                pass
+
+    return Path("/Users/geonha/lecture_stt/state/paused")
+
+
+def is_paused(config: dict | None = None) -> bool:
+    return get_pause_flag_path(config).exists()
+
+
+def set_paused(paused: bool, config: dict | None = None) -> None:
+    pause_path = get_pause_flag_path(config)
+    pause_path.parent.mkdir(parents=True, exist_ok=True)
+    if paused:
+        pause_path.touch(exist_ok=True)
+    else:
+        pause_path.unlink(missing_ok=True)

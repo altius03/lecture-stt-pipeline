@@ -58,7 +58,19 @@ cp .env.example .env
 # DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
 ```
 
-If `config/config.yaml` is missing, the app uses `config/config.example.yaml` with a loud warning.
+`config/config.yaml` is required. The pipeline fails at startup if config is missing, empty, or missing required keys.
+
+## Pause/Resume/Status
+
+```bash
+python src/main.py --pause   # stop scanning and processing new files
+python src/main.py --resume  # resume scanning and processing
+python src/main.py --status  # show current pause state
+```
+
+Pause flag location:
+
+`/Users/geonha/lecture_stt/state/paused`
 
 ## Run manually
 
