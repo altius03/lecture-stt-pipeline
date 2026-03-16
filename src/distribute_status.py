@@ -35,6 +35,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     show_parser = subparsers.add_parser("show", help="Show one delivery row")
     show_parser.add_argument("logical_stem", help="Logical stem to inspect")
 
+    clear_parser = subparsers.add_parser("clear", help="Delete one delivery row from the DB")
+    clear_parser.add_argument("logical_stem", help="Logical stem to delete from deliveries")
+    clear_parser.add_argument("--dry-run", action="store_true", help="Show the target row without deleting it")
+    clear_parser.add_argument("--yes", action="store_true", help="Actually delete the row")
+
     return parser.parse_args(argv)
 
 
@@ -99,6 +104,12 @@ def fetch_deliveries(
 
 def fetch_delivery_detail(conn: sqlite3.Connection, logical_stem: str) -> sqlite3.Row | None:
     return db.get_delivery(conn, logical_stem)
+
+
+def delete_delivery(conn: sqlite3.Connection, logical_stem: str) -> int:
+    cursor = conn.execute("DELETE FROM deliveries WHERE logical_stem = ?", (logical_stem,))
+    conn.commit()
+    return int(cursor.rowcount)
 
 
 def print_summary(conn: sqlite3.Connection, *, limit: int) -> int:
@@ -203,6 +214,30 @@ def print_show(conn: sqlite3.Connection, logical_stem: str) -> int:
     return 0
 
 
+def print_clear(conn: sqlite3.Connection, logical_stem: str, *, dry_run: bool, confirmed: bool) -> int:
+    row = fetch_delivery_detail(conn, logical_stem)
+    if row is None:
+        print(f"Delivery not found: {logical_stem}", file=sys.stderr)
+        return 1
+
+    payload = {key: row[key] for key in row.keys()}
+    if dry_run:
+        print(f"Would delete delivery row: {logical_stem}")
+        print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+
+    if not confirmed:
+        print("Refusing to delete without --yes. Use --dry-run to inspect first.", file=sys.stderr)
+        return 2
+
+    deleted = delete_delivery(conn, logical_stem)
+    if deleted != 1:
+        print(f"Delivery not found: {logical_stem}", file=sys.stderr)
+        return 1
+    print(f"Deleted delivery row: {logical_stem}")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     command = args.command or "summary"
@@ -222,6 +257,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         if command == "show":
             return print_show(conn, args.logical_stem)
+        if command == "clear":
+            return print_clear(conn, args.logical_stem, dry_run=args.dry_run, confirmed=args.yes)
         raise ValueError(f"Unsupported command: {command}")
     finally:
         conn.close()

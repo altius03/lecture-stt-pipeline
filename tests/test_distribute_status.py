@@ -100,6 +100,30 @@ class DistributeStatusCliTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("Delivery not found: missing", stderr)
 
+    def test_clear_requires_yes(self) -> None:
+        code, _, stderr = self._run("clear", "260316LC_1")
+        self.assertEqual(code, 2)
+        self.assertIn("Refusing to delete without --yes", stderr)
+
+        row = db.get_delivery(self.conn, "260316LC_1")
+        self.assertIsNotNone(row)
+
+    def test_clear_dry_run_keeps_row(self) -> None:
+        code, stdout, _ = self._run("clear", "260316LC_1", "--dry-run")
+        self.assertEqual(code, 0)
+        self.assertIn("Would delete delivery row: 260316LC_1", stdout)
+
+        row = db.get_delivery(self.conn, "260316LC_1")
+        self.assertIsNotNone(row)
+
+    def test_clear_deletes_row(self) -> None:
+        code, stdout, _ = self._run("clear", "260316LC_1", "--yes")
+        self.assertEqual(code, 0)
+        self.assertIn("Deleted delivery row: 260316LC_1", stdout)
+
+        row = db.get_delivery(self.conn, "260316LC_1")
+        self.assertIsNone(row)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -139,10 +139,14 @@ bash /Users/geonha/lecture_stt/scripts/run_distribute.sh
 bash /Users/geonha/lecture_stt/scripts/distribute_status.sh
 bash /Users/geonha/lecture_stt/scripts/distribute_status.sh list --only-problems
 bash /Users/geonha/lecture_stt/scripts/distribute_status.sh show 260316LC_1
+bash /Users/geonha/lecture_stt/scripts/distribute_status.sh clear 260316LC_1 --dry-run
+bash /Users/geonha/lecture_stt/scripts/distribute_status.sh clear 260316LC_1 --yes
 ```
   - 기본값은 aggregate summary입니다.
   - `list --only-problems`는 `INCOMPLETE`, `BLOCKED`, `CONFLICT`, `ERROR` 위주로 최근 항목을 보여줍니다.
   - `show <stem>`은 `deliveries` row 전체를 JSON으로 출력합니다.
+  - `clear <stem>`은 `deliveries` row만 삭제합니다. source/destination 파일은 건드리지 않습니다.
+  - `clear`는 기본적으로 거부되며, 실제 삭제에는 `--yes`가 필요합니다.
 
 ## 6. 운영 확인
 1. 폴더 파일 수 확인
