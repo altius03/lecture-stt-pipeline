@@ -132,7 +132,17 @@ bash /Users/geonha/lecture_stt/scripts/run_distribute.sh
   - correction은 `{stem}.txt` + `{stem}.json` pair 단위로만 배포됩니다.
   - summary는 correction 이력이 확인될 때만 TUK/Obsidian으로 배포됩니다.
   - overwrite는 하지 않으며, 동일 파일은 hash 비교 후 idempotent하게 처리합니다.
-  - 구조화 로그는 `/Users/geonha/lecture_stt/state/logs/downstream.jsonl`에 기록됩니다.
+- 구조화 로그는 `/Users/geonha/lecture_stt/state/logs/downstream.jsonl`에 기록됩니다.
+
+- 상태 확인 CLI
+```bash
+bash /Users/geonha/lecture_stt/scripts/distribute_status.sh
+bash /Users/geonha/lecture_stt/scripts/distribute_status.sh list --only-problems
+bash /Users/geonha/lecture_stt/scripts/distribute_status.sh show 260316LC_1
+```
+  - 기본값은 aggregate summary입니다.
+  - `list --only-problems`는 `INCOMPLETE`, `BLOCKED`, `CONFLICT`, `ERROR` 위주로 최근 항목을 보여줍니다.
+  - `show <stem>`은 `deliveries` row 전체를 JSON으로 출력합니다.
 
 ## 6. 운영 확인
 1. 폴더 파일 수 확인
