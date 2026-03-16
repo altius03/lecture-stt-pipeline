@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 
 
 def _load_config(config_path: str = "/Users/geonha/lecture_stt/config/config.yaml") -> dict:
+    # 실행에 필요한 설정을 읽고 없으면 기본 예시를 fallback으로 사용한다.
     repo_root = Path("/Users/geonha/lecture_stt")
     config_path = Path(config_path)
     if not config_path.is_absolute():
@@ -27,10 +28,11 @@ def _load_config(config_path: str = "/Users/geonha/lecture_stt/config/config.yam
 
 
 def _ensure_config_defaults(config: dict) -> dict:
+    # 누락 값은 기본값으로 채워 정리 작업이 중단되지 않게 한다.
     defaults = {
         "paths": {
-            "stable_audio_folder": "/Volumes/geonha/GH_archive/01_TUK/06_lecture_recordings/01_audio",
-            "transcript_folder": "/Volumes/geonha/GH_archive/01_TUK/06_lecture_recordings/02_transcripts",
+            "stable_audio_folder": "/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings/01_audio",
+            "transcript_folder": "/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings/02_transcripts",
             "tmp_dir": "/Users/geonha/lecture_stt/tmp",
         },
         "cleanup": {
@@ -46,6 +48,7 @@ def _ensure_config_defaults(config: dict) -> dict:
 
 
 def _assert_under_base(candidate: Path, base: Path) -> None:
+    # 삭제 대상이 루트 디렉터리 밖이면 즉시 중단한다.
     candidate = candidate.resolve()
     base = base.resolve()
     if not candidate.is_relative_to(base):
@@ -53,6 +56,7 @@ def _assert_under_base(candidate: Path, base: Path) -> None:
 
 
 def _delete_path(path: Path, dry_run: bool) -> bool:
+    # dry-run이면 실제 삭제 없이 대상만 출력한다.
     if dry_run:
         print(f"[dry-run] would remove: {path}")
         return False
@@ -66,6 +70,7 @@ def _delete_path(path: Path, dry_run: bool) -> bool:
 
 
 def _cleanup_audio(audio_dir: Path, cutoff_ts: float, dry_run: bool) -> tuple[int, int]:
+    # 컷오프 이전의 오디오 파일만 제거한다.
     if not audio_dir.exists():
         print(f"audio folder missing: {audio_dir}")
         return 0, 0
@@ -89,6 +94,7 @@ def _cleanup_audio(audio_dir: Path, cutoff_ts: float, dry_run: bool) -> tuple[in
 
 
 def _cleanup_transcripts(transcript_dir: Path, cutoff_ts: float, dry_run: bool, min_keep: int) -> tuple[int, int]:
+    # 유지할 최소 개수를 제외하고 오래된 트랜스크립트만 정리한다.
     if not transcript_dir.exists():
         return 0, 0
     if not transcript_dir.is_dir():
@@ -114,6 +120,7 @@ def _cleanup_transcripts(transcript_dir: Path, cutoff_ts: float, dry_run: bool, 
 
 
 def _cleanup_tmp(tmp_dir: Path, dry_run: bool) -> int:
+    # 임시 파일/폴더 잔여물을 정리한다.
     if not tmp_dir.exists():
         return 0
     if not tmp_dir.is_dir():
@@ -136,6 +143,7 @@ def _cleanup_tmp(tmp_dir: Path, dry_run: bool) -> int:
 
 
 def main() -> None:
+    # argparse로 dry-run/apply 모드를 받아 보존 기준에 따라 삭제를 실행한다.
     parser = argparse.ArgumentParser(description="Cleanup old lecture STT artifacts")
     parser.add_argument(
         "--config",

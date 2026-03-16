@@ -1,257 +1,146 @@
-# Lecture STT Pipeline
+# Lecture STT 운영 가이드
 
-## 개요
+## 1. 시스템 개요
+- 업로드된 음성 파일을 자동으로 텍스트로 변환합니다.
+- 기본 감시 폴더: `00_inbox`
+- 출력 폴더: `02_transcripts`
+- 실패 폴더: `99_errors`
+- 관리 폴더
+  - `01_audio`: 변환 전 임시 원본 보관
+  - `state/jobs.sqlite3`: 처리 이력 DB
+  - `logs/app.log`: 실행 로그
 
-`lecture_stt`는 iPhone/Voice Memo 등으로 업로드된 강의 음성 파일을 수신해 자동으로 텍스트로 변환하는 macOS 상시 동작 파이프라인입니다.
-
-- `00_inbox` 폴더를 감시합니다.
-- 파일이 안정 상태(90초 이상 크기/수정 시각 변화 없음)가 되면 처리 대상으로 간주합니다.
-- 파일을 `01_audio`로 이동·이름 정규화 후 `faster-whisper`로 전사합니다.
-- 결과를 `txt`/`json`으로 저장합니다.
-- SQLite(`jobs` 테이블)에 작업 상태를 기록합니다.
-
-실행 모드는 두 가지입니다.
-
-- 항상 실행: `launchd`(KeepAlive)로 백그라운드 데몬화
-- 1회 테스트: `--once`
-
-추가 운영 특징:
-
-- 수동 정지/재개: 프로세스를 죽이지 않고 `--pause`, `--resume` 플래그로 제어
-- 엄격한 시작 검증: `config/config.yaml`이 유효하지 않으면 즉시 종료(예: 예전처럼 예시 파일로 fallback 없음)
-
----
-
-## 경로/디렉터리
-
-- 작업 디렉터리(워크트리): `/Users/geonha/lecture_stt`
-- 감시 대상(인박스): `/Volumes/geonha/GH_archive/01_TUK/06_lecture_recordings/00_inbox`
-- 안정 상태 저장(오디오): `/Volumes/geonha/GH_archive/01_TUK/06_lecture_recordings/01_audio`
-- 전사 결과 저장: `/Volumes/geonha/GH_archive/01_TUK/06_lecture_recordings/02_transcripts`
-- 실패 처리 저장: `/Volumes/geonha/GH_archive/01_TUK/06_lecture_recordings/99_errors`
+## 2. 기본 폴더 구조(고정)
+- 프로젝트: `/Users/geonha/lecture_stt`
+- 인박스: `/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings/00_inbox`
+- 오디오 임시 보관: `/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings/01_audio`
+- 텍스트: `/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings/02_transcripts`
+- 오류: `/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings/99_errors`
+- 임시 폴더: `/Users/geonha/lecture_stt/tmp`
 - DB: `/Users/geonha/lecture_stt/state/jobs.sqlite3`
-- 임시 파일: `/Users/geonha/lecture_stt/tmp`
-- ffmpeg: `/opt/homebrew/bin/ffmpeg`
-- 가상환경: `/Users/geonha/lecture_stt/.venv`
-- 일시정지 플래그: `/Users/geonha/lecture_stt/state/paused`
-- launchd 로그:
-  - `/Users/geonha/lecture_stt/state/logs/launchd.out.log`
-  - `/Users/geonha/lecture_stt/state/logs/launchd.err.log`
+- 로그: `/Users/geonha/lecture_stt/logs/app.log`
 
----
-
-## STT 기본 파라미터(현재 동작 기준)
-
-파이프라인 기본값은 코드/설정에서 다음과 같이 사용됩니다.
-
-- `faster-whisper`
-  - `model_size`: `large-v3`
-  - `device`: `cpu`
-  - `compute_type`: `int8`
-  - `language`: `ko`
-  - `task`: `transcribe`
-  - `beam_size`: `5`
-  - `vad_filter`: `false`
-  - `word_timestamps`: `false`
-
----
-
-## 환경 구성 (config/config.yaml 필수, fail-fast)
-
-`config/config.yaml`은 필수이며, 예시 파일로 대체되지 않습니다.
-
-- `config/config.yaml`이 없으면 즉시 실패
-- 비어 있으면(0 bytes) 즉시 실패
-- YAML 파싱 실패하면 즉시 실패
-- 필수 키 검증 실패(`app`, `paths`, `ffmpeg`, `transcribe`) 시 즉시 실패
-- 수치 검증 실패(음수/0/형식 오류) 시 즉시 실패
-- 파일시스템 점검:
-  - `watch_folder` 존재 확인
-  - 출력 디렉터리/임시 디렉터리 생성/쓰기 가능 여부 확인
-  - `ffmpeg` 존재 + 실행권한 확인
-  - DB 부모 디렉터리 및 `state/logs` 생성/쓰기 가능 여부 확인
-
-최초 설정은 아래와 같이 시작합니다.
-
+## 3. 최초 준비
+1. 가상환경 생성
 ```bash
-cp config/config.example.yaml config/config.yaml
-cp .env.example .env
+cd /Users/geonha/lecture_stt
+python3 -m venv .venv
+/Users/geonha/lecture_stt/.venv/bin/pip install -r /Users/geonha/lecture_stt/requirements.txt
 ```
 
-`/Volumes/...` 경로는 외부 볼륨이므로 마운트되지 않으면 검증에서 실패합니다. 실패 상태에서 launchd는 재시작을 반복할 수 있습니다.
-
+2. 환경 파일 준비
 ```bash
-# .env
+cp /Users/geonha/lecture_stt/config/config.example.yaml /Users/geonha/lecture_stt/config/config.yaml
+```
+
+3. Discord 알림 사용 시(선택)
+```bash
+cat > /Users/geonha/lecture_stt/.env <<'EOF'
 DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
+EOF
 ```
 
----
-
-## 실행 방법
-
-### A) 1회 실행 (`--once`)
-
+4. 폴더 접근 권한 확인
 ```bash
-bash scripts/run_once.sh
+mkdir -p "/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings/00_inbox"
+mkdir -p "/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings/01_audio"
+mkdir -p "/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings/02_transcripts"
+mkdir -p "/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings/99_errors"
 ```
 
-또는 아래처럼 직접 실행:
+## 4. 파일 처리 방식
+1. 음성 파일은 `00_inbox`에 넣습니다.
+2. 파일 복사가 끝나고 안정 시간(기본 90초)이 지나면 처리 대상으로 인식됩니다.
+3. 변환 완료 시 텍스트는 `02_transcripts`에 저장됩니다.
+4. 실패 시 `99_errors`로 이동되며, 실패 사유는 앱 로그와 알림에 남습니다.
 
-```bash
-/Users/geonha/lecture_stt/.venv/bin/python /Users/geonha/lecture_stt/src/main.py --once --config /Users/geonha/lecture_stt/config/config.yaml
-```
+## 5. 실행 방법
 
-### B) 터미널에서 데몬(수동 실행)
-
+### 5.1 수동 실행(터미널)
+- 시작
 ```bash
 /Users/geonha/lecture_stt/.venv/bin/python /Users/geonha/lecture_stt/src/main.py --config /Users/geonha/lecture_stt/config/config.yaml
 ```
 
-### C) launchd (항상 실행 권장)
-
+- 1회 실행(테스트)
 ```bash
-plist=/Users/geonha/lecture_stt/launchd/com.geonha.lecture-stt.plist
-uid=$(id -u)
-
-launchctl bootout "gui/$uid" "$plist" 2>/dev/null || true
-launchctl bootstrap "gui/$uid" "$plist"
-launchctl kickstart -k "gui/$uid/com.geonha.lecture-stt"
+bash /Users/geonha/lecture_stt/scripts/run_once.sh
 ```
 
-상태 확인:
-
-```bash
-launchctl print "gui/$(id -u)/com.geonha.lecture-stt" >/dev/null 2>&1 && echo LOADED || echo NOT
-pgrep -af "/Users/geonha/lecture_stt/src/main.py" || echo "not running"
-```
-
-로그 확인:
-
-```bash
-tail -f /Users/geonha/lecture_stt/state/logs/launchd.out.log
-tail -f /Users/geonha/lecture_stt/state/logs/launchd.err.log
-```
-
-`launchd`는 PATH가 제한될 수 있으므로 `python`, `config`, `ffmpeg` 경로는 plist에서 모두 절대 경로로 지정되어 있습니다.
-
----
-
-## Pause / Resume / Status
-
-CLI 제어:
-
+- 일시정지/재개/상태 확인
 ```bash
 /Users/geonha/lecture_stt/.venv/bin/python /Users/geonha/lecture_stt/src/main.py --pause
 /Users/geonha/lecture_stt/.venv/bin/python /Users/geonha/lecture_stt/src/main.py --resume
 /Users/geonha/lecture_stt/.venv/bin/python /Users/geonha/lecture_stt/src/main.py --status
 ```
 
-동작 설명:
-
-- `--pause`는 `/Users/geonha/lecture_stt/state/paused` 파일을 생성합니다.
-  - 파이프라인은 실행 중인 프로세스를 종료하지 않고 스캔/처리를 멈춥니다.
-  - 처리 중 작업이 있다면 마무리하고 그 후 유휴 상태에서 멈춥니다.
-- `--resume`은 플래그 파일을 삭제해 재개합니다.
-- `--status`는 현재 상태(`PAUSED/RESUMED`)를 출력하고 종료합니다.
-- 파이프라인이 `--paused` 상태일 때 `--once`를 호출하면 다음 메시지를 출력하고 즉시 종료합니다.
-
-```text
-Paused: skipping --once
+### 5.2 자동 실행(launchd, 선택)
+```bash
+mkdir -p /Users/geonha/Library/LaunchAgents
+cp /Users/geonha/lecture_stt/launchd/com.geonha.lecture-stt.plist /Users/geonha/Library/LaunchAgents/com.geonha.lecture-stt.plist
+uid=$(id -u)
+launchctl bootout "gui/$uid" /Users/geonha/Library/LaunchAgents/com.geonha.lecture-stt.plist 2>/dev/null || true
+launchctl bootstrap "gui/$uid" /Users/geonha/Library/LaunchAgents/com.geonha.lecture-stt.plist
+launchctl kickstart -k "gui/$uid/com.geonha.lecture-stt"
 ```
 
----
-
-## Discord 알림 (성공/실패)
-
-`discord` 알림은 `.env`의 `DISCORD_WEBHOOK_URL`이 설정되어 있을 때만 전송됩니다.
-웹훅 URL이 비어 있으면 알림은 건너뛰고 파이프라인은 계속 동작합니다.
-
-- 실패 알림: 작업이 `ERROR` 상태가 되면 전송됩니다.
-  - 파일명/캐노니컬명/경로/실패 사유를 포함합니다.
-- 성공 알림: 작업이 `DONE` 상태로 전환되고 `txt`, `json` 출력이 저장된 뒤 전송됩니다.
-- 알림 실패(네트워크/웹훅 에러)는 파이프라인을 중단하지 않고 로그만 남기고 계속 동작합니다.
-- 중복 전송 방지 marker:
-  - `/Users/geonha/lecture_stt/state/notified/success_<job_id>`
-  - `/Users/geonha/lecture_stt/state/notified/error_<job_id>`
-
-컨텐츠가 길 경우(예: 긴 예외 메시지)에는 전송 전에 길이 제한(최대 1900자, `...(생략)` 포함)으로 잘라서 보냅니다.
-
----
-
-## 운영 모니터링
-
-- launchd 로드/프로세스 확인
-- 로그 추적
-- DB 상태 확인
-
+- 중지
 ```bash
-launchctl print "gui/$(id -u)/com.geonha.lecture-stt" >/dev/null 2>&1 && echo LOADED || echo NOT
-pgrep -af "/Users/geonha/lecture_stt/src/main.py" || echo "not running"
+uid=$(id -u)
+launchctl bootout "gui/$uid" /Users/geonha/Library/LaunchAgents/com.geonha.lecture-stt.plist
+```
 
-tail -f /Users/geonha/lecture_stt/state/logs/launchd.out.log
-tail -f /Users/geonha/lecture_stt/state/logs/launchd.err.log
+### 5.3 웹 컨트롤 패널(권장)
+- 실행
+```bash
+bash /Users/geonha/lecture_stt/scripts/run_gui.sh
+```
+- 브라우저 접속: `http://127.0.0.1:8765`
+- 기본 동작: 시작 / 일시정지(재개) / 중지 / 새로고침
+- 포트 변경
+```bash
+WEB_PANEL_HOST=127.0.0.1 WEB_PANEL_PORT=8765 bash /Users/geonha/lecture_stt/scripts/run_gui.sh
+```
 
+- 원격 사용은 SSH 터널을 권장합니다.
+
+## 6. 운영 확인
+1. 폴더 파일 수 확인
+```bash
+ls -1 "/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings/00_inbox" | wc -l
+ls -1 "/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings/01_audio" | wc -l
+ls -1 "/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings/02_transcripts" | wc -l
+ls -1 "/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings/99_errors" | wc -l
+```
+
+2. 최근 작업 확인
+```bash
+sqlite3 /Users/geonha/lecture_stt/state/jobs.sqlite3 "select id,status,orig_name,updated_at,error_message from jobs order by id desc limit 20;"
+```
+
+3. 상태 집계
+```bash
+sqlite3 /Users/geonha/lecture_stt/state/jobs.sqlite3 "select status,count(*) from jobs group by status order by status;"
+```
+
+4. 로그 확인
+```bash
 tail -f /Users/geonha/lecture_stt/logs/app.log
 ```
 
-SQLite 최근 상태 조회:
+## 7. 운영 주의사항
+- `launchd` 자동 실행과 웹 패널의 Start/Stop을 동시에 쓰면 중복 제어가 생깁니다.
+- 웹 패널은 Tkinter를 사용하지 않습니다.
+- `00_inbox`만 감시 대상이므로 다른 폴더를 쓰면 변환되지 않습니다.
 
-```bash
-sqlite3 /Users/geonha/lecture_stt/state/jobs.sqlite3 "select id,status,orig_name,updated_at,error_message from jobs order by id desc limit 5;"
-```
-
-watch 대체 루프:
-
-```bash
-while true; do
-  clear
-  date
-  sqlite3 /Users/geonha/lecture_stt/state/jobs.sqlite3 "select id,status,orig_name,updated_at from jobs order by id desc limit 20;"
-  sleep 2
-done
-```
-
-폴더 기반 단계 확인:
-
-- inbox: `/Volumes/geonha/GH_archive/01_TUK/06_lecture_recordings/00_inbox`
-- audio: `/Volumes/geonha/GH_archive/01_TUK/06_lecture_recordings/01_audio`
-- transcripts: `/Volumes/geonha/GH_archive/01_TUK/06_lecture_recordings/02_transcripts`
-- errors: `/Volumes/geonha/GH_archive/01_TUK/06_lecture_recordings/99_errors`
-
----
-
-## 문제 해결(트러블슈팅)
-
-### 1) `config/config.yaml`이 0바이트
-
-```bash
-cp -f /Users/geonha/lecture_stt/config/config.example.yaml /Users/geonha/lecture_stt/config/config.yaml
-```
-
-### 2) 외부 볼륨 미마운트
-
-`watch_folder`가 없으면 시작 검증에서 실패합니다.
-
-```bash
-ls -la /Volumes/geonha/GH_archive/01_TUK/06_lecture_recordings/00_inbox
-```
-
-### 3) ffmpeg 경로/권한
-
-```bash
-ls -l /opt/homebrew/bin/ffmpeg
-/opt/homebrew/bin/ffmpeg -version
-```
-
-### 4) launchd PATH 이슈
-
-`launchd`는 로그인 셸과 PATH가 다를 수 있으므로 plist는 python/config/ffmpeg 경로를 절대 경로로 사용하고 있습니다.
-필요 시 plist의 `ProgramArguments`(python), `WorkingDirectory`, 환경변수를 재확인하세요.
-
-### 5) launchd가 반복 재시작하는 경우
-
-`config` 검증 실패가 원인일 수 있습니다. 최근 로그를 먼저 확인하세요.
-
-```bash
-tail -n 100 /Users/geonha/lecture_stt/state/logs/launchd.err.log
-```
+## 8. 자주 발생하는 문제
+- `watch_folder does not exist`  
+  - `/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings/00_inbox` 경로 확인
+- `cannot write in paths.*`  
+  - iCloud 권한/동기화 상태 확인
+- `ffmpeg binary not found`  
+  - `which ffmpeg`, `ffmpeg -version` 확인
+- 웹 화면이 안 열릴 때  
+  - 실행 터미널에 `Web control panel running at` 메시지 확인  
+  - 브라우저에서 `127.0.0.1:8765` 접속
+  - 포트 충돌이면 `WEB_PANEL_PORT` 변경

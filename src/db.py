@@ -16,6 +16,7 @@ STATUS_DONE = "DONE"
 STATUS_ERROR = "ERROR"
 
 
+# DB 파일 연결과 기본 PRAGMA 설정을 한 번에 수행한다.
 def _connect(db_path: str) -> sqlite3.Connection:
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path, timeout=5.0)
@@ -27,6 +28,7 @@ def _connect(db_path: str) -> sqlite3.Connection:
     return conn
 
 
+# 테이블/인덱스를 준비하고 최초 커넥션을 반환한다.
 def init_db(db_path: str) -> sqlite3.Connection:
     conn = _connect(db_path)
     conn.executescript(
@@ -56,6 +58,7 @@ def init_db(db_path: str) -> sqlite3.Connection:
         )
         """
     )
+    _ensure_job_columns(conn, {"current_step", "progress_pct", "eta_sec"})
     conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs (status)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_sha256 ON jobs (sha256)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs (created_at)")
@@ -64,10 +67,27 @@ def init_db(db_path: str) -> sqlite3.Connection:
     return conn
 
 
+def _existing_columns(conn: sqlite3.Connection) -> set[str]:
+    rows = conn.execute("PRAGMA table_info(jobs)").fetchall()
+    return {str(row["name"]) for row in rows}
+
+
+def _ensure_job_columns(conn: sqlite3.Connection, required: set[str]) -> None:
+    existing = _existing_columns(conn)
+    if "current_step" not in existing:
+        conn.execute("ALTER TABLE jobs ADD COLUMN current_step TEXT")
+    if "progress_pct" not in existing:
+        conn.execute("ALTER TABLE jobs ADD COLUMN progress_pct INTEGER DEFAULT 0")
+    if "eta_sec" not in existing:
+        conn.execute("ALTER TABLE jobs ADD COLUMN eta_sec INTEGER")
+    conn.commit()
+
+
 def _now() -> str:
     return utils.now_iso()
 
 
+# Path 타입 값을 문자열로 바꿔 SQLite 바인딩 호환성을 확보한다.
 def _clean_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     result = {}
     for key, value in payload.items():
@@ -77,9 +97,21 @@ def _clean_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
-def create_job(conn: sqlite3.Connection, *, status: str, orig_inbox_path: str, orig_name: str, canonical_base: str,
-               canonical_audio_path: str, transcript_txt_path: str, transcript_json_path: str,
-               engine_params: Optional[Dict[str, Any]] = None) -> int:
+def create_job(
+    conn: sqlite3.Connection,
+    *,
+    status: str,
+    orig_inbox_path: str,
+    orig_name: str,
+    canonical_base: str,
+    canonical_audio_path: str,
+    transcript_txt_path: str,
+    transcript_json_path: str,
+    engine_params: Optional[Dict[str, Any]] = None,
+    current_step: str | None = None,
+    progress_pct: int | None = None,
+    eta_sec: int | None = None,
+) -> int:
     payload = _clean_payload({
         "status": status,
         "created_at": _now(),
@@ -92,6 +124,12 @@ def create_job(conn: sqlite3.Connection, *, status: str, orig_inbox_path: str, o
         "transcript_json_path": transcript_json_path,
         "engine_params": json.dumps(engine_params or {}, ensure_ascii=False),
     })
+    if current_step is not None:
+        payload["current_step"] = current_step
+    if progress_pct is not None:
+        payload["progress_pct"] = progress_pct
+    if eta_sec is not None:
+        payload["eta_sec"] = eta_sec
     columns = ", ".join(payload.keys())
     placeholders = ", ".join([":" + key for key in payload.keys()])
     conn.execute(f"INSERT INTO jobs ({columns}) VALUES ({placeholders})", payload)
@@ -103,6 +141,7 @@ def get_job(conn: sqlite3.Connection, job_id: int) -> Optional[sqlite3.Row]:
     return conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
 
 
+# 컬럼 부분 갱신(타임스탬프 자동 갱신 포함)용 공용 함수.
 def update_job(conn: sqlite3.Connection, job_id: int, **fields: Any) -> None:
     if not fields:
         return
@@ -137,6 +176,7 @@ def set_status(conn: sqlite3.Connection, job_id: int, status: str, **extra: Any)
     update_job(conn, job_id, status=status, **extra)
 
 
+# 동일 sha256 완료 작업을 최신순으로 찾아 중복 전송/재처리에 활용한다.
 def find_done_job_by_sha(conn: sqlite3.Connection, sha256: str) -> Optional[sqlite3.Row]:
     return conn.execute(
         "SELECT * FROM jobs WHERE sha256 = ? AND status = ? ORDER BY created_at DESC LIMIT 1",
@@ -144,10 +184,22 @@ def find_done_job_by_sha(conn: sqlite3.Connection, sha256: str) -> Optional[sqli
     ).fetchone()
 
 
+# 현재 처리 중인 작업 목록을 조회한다.
 def list_processing_jobs(conn: sqlite3.Connection):
     return conn.execute("SELECT * FROM jobs WHERE status = ? ORDER BY id ASC", (STATUS_PROCESSING,)).fetchall()
 
 
+def get_status_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    counts = {"PENDING": 0, "PROCESSING": 0, "DONE": 0, "ERROR": 0}
+    rows = conn.execute("SELECT status, count(*) AS cnt FROM jobs GROUP BY status").fetchall()
+    for row in rows:
+        status = str(row["status"])
+        if status in counts:
+            counts[status] = int(row["cnt"])
+    return counts
+
+
+# txt/json 결과가 둘 다 존재하고 세그먼트 배열이 있으면 완료된 결과로 본다.
 def _has_complete_transcripts(txt_path: str | None, json_path: str | None) -> bool:
     if not txt_path or not json_path:
         return False
@@ -170,6 +222,7 @@ def _has_complete_transcripts(txt_path: str | None, json_path: str | None) -> bo
 
 
 def _is_stale_processing(updated_at_raw: str | None, now: datetime, stale_seconds: int) -> bool:
+    # 업데이트 시각 기준 stale 여부를 판정해 복구 정책에 반영한다.
     if not updated_at_raw:
         return True
     try:
@@ -180,6 +233,7 @@ def _is_stale_processing(updated_at_raw: str | None, now: datetime, stale_second
 
 
 def recover_processing_jobs(conn: sqlite3.Connection, stale_processing_hours: int = 6) -> Dict[str, int]:
+    # 시작 시 끊긴 PROCESSING 작업을 정상 종료/재시도/오류로 복구한다.
     now = datetime.now().astimezone()
     stale_seconds = stale_processing_hours * 3600
     counts = {"done": 0, "pending": 0, "error": 0}
@@ -193,8 +247,8 @@ def recover_processing_jobs(conn: sqlite3.Connection, stale_processing_hours: in
         updated_at_raw = row["updated_at"]
         is_stale = _is_stale_processing(updated_at_raw, now, stale_seconds)
 
-        # Always recover processing jobs at startup so interrupted runs cannot be stuck.
-        # Keep stale check only in logs/metadata for observability.
+        # 시작 시 PROCESSING 작업을 복구해 중단된 실행이 계속 걸리지 않게 한다.
+        # 오래된 상태인지는 메타 데이터로만 기록해 추적한다.
         transcript_ready = _has_complete_transcripts(txt, json_path)
         if transcript_ready:
             set_status(
@@ -241,4 +295,3 @@ def recover_processing_jobs(conn: sqlite3.Connection, stale_processing_hours: in
 
     conn.commit()
     return counts
-

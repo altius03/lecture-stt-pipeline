@@ -4,10 +4,10 @@ app:
   stale_processing_hours: 6
 
 paths:
-  watch_folder: /Volumes/geonha/GH_archive/01_TUK/06_lecture_recordings/00_inbox
-  stable_audio_folder: /Volumes/geonha/GH_archive/01_TUK/06_lecture_recordings/01_audio
-  transcript_folder: /Volumes/geonha/GH_archive/01_TUK/06_lecture_recordings/02_transcripts
-  error_folder: /Volumes/geonha/GH_archive/01_TUK/06_lecture_recordings/99_errors
+  watch_folder: "/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings/00_inbox"
+  stable_audio_folder: "/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings/01_audio"
+  transcript_folder: "/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings/02_transcripts"
+  error_folder: "/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings/99_errors"
   tmp_dir: /Users/geonha/lecture_stt/tmp
   db_path: /Users/geonha/lecture_stt/state/jobs.sqlite3
 

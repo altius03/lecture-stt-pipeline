@@ -22,11 +22,14 @@ from db import (
     STATUS_PROCESSING,
 )
 from notifier import DiscordNotifier
+from postprocess import postprocess
+from quality_gate import evaluate as quality_evaluate
 from transcribe import EngineParams, STTWorker
 from watcher import PollingWatcher
 import utils
 
 
+# 설정 파일을 읽고 기본 형식 유효성을 검사한다.
 def load_config(config_path: str = "config/config.yaml") -> dict:
     repo_root = Path(__file__).resolve().parents[1]
     explicit = Path(config_path)
@@ -50,8 +53,8 @@ def load_config(config_path: str = "config/config.yaml") -> dict:
 
     return loaded
 
-
 def validate_config(config_path: str, config: dict) -> dict:
+    # 설정 섹션/타입/값 범위를 검증해 실행 시 실패를 앞당긴다.
     config_path_obj = Path(config_path)
 
     def require_section(name: str) -> Dict[str, Any]:
@@ -59,6 +62,20 @@ def validate_config(config_path: str, config: dict) -> dict:
         if not isinstance(section, dict):
             raise ValueError(f"Config error in {config_path_obj}: missing/invalid section '{name}'")
         return section
+
+    def parse_bool(name: str, value: Any) -> bool:
+        # 문자열/정수 입력이 섞여도 의도한 불리언으로 안전하게 해석한다.
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int) and value in (0, 1):
+            return bool(value)
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"1", "true", "yes", "y", "on"}:
+                return True
+            if normalized in {"0", "false", "no", "n", "off"}:
+                return False
+        raise ValueError(f"Config error: {name} must be a boolean")
 
     app = require_section("app")
     paths = require_section("paths")
@@ -179,12 +196,19 @@ def validate_config(config_path: str, config: dict) -> dict:
         transcribe["beam_size"] = beam_size
     except Exception as exc:
         raise ValueError("Config error: transcribe.beam_size must be an integer") from exc
-    transcribe["vad_filter"] = bool(transcribe["vad_filter"])
-    transcribe["word_timestamps"] = bool(transcribe["word_timestamps"])
+    if beam_size <= 0:
+        raise ValueError("Config error: transcribe.beam_size must be greater than 0")
+    transcribe["vad_filter"] = parse_bool("transcribe.vad_filter", transcribe["vad_filter"])
+    transcribe["word_timestamps"] = parse_bool("transcribe.word_timestamps", transcribe["word_timestamps"])
+    if "condition_on_previous_text" in transcribe:
+        transcribe["condition_on_previous_text"] = parse_bool(
+            "transcribe.condition_on_previous_text", transcribe["condition_on_previous_text"]
+        )
 
     return _ensure_config_defaults(config)
 
 
+# 환경설정에서 누락된 값은 기본값으로 채워 코드 실행 안정성을 높인다.
 def _ensure_config_defaults(config: dict) -> dict:
     defaults = {
         "app": {
@@ -193,10 +217,10 @@ def _ensure_config_defaults(config: dict) -> dict:
             "stale_processing_hours": 6,
         },
         "paths": {
-            "watch_folder": "/Volumes/geonha/GH_archive/01_TUK/06_lecture_recordings/00_inbox",
-            "stable_audio_folder": "/Volumes/geonha/GH_archive/01_TUK/06_lecture_recordings/01_audio",
-            "transcript_folder": "/Volumes/geonha/GH_archive/01_TUK/06_lecture_recordings/02_transcripts",
-            "error_folder": "/Volumes/geonha/GH_archive/01_TUK/06_lecture_recordings/99_errors",
+            "watch_folder": "/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings/00_inbox",
+            "stable_audio_folder": "/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings/01_audio",
+            "transcript_folder": "/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings/02_transcripts",
+            "error_folder": "/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings/99_errors",
             "tmp_dir": "/Users/geonha/lecture_stt/tmp",
             "db_path": "/Users/geonha/lecture_stt/state/jobs.sqlite3",
         },
@@ -210,6 +234,7 @@ def _ensure_config_defaults(config: dict) -> dict:
             "beam_size": 5,
             "vad_filter": False,
             "word_timestamps": False,
+            "condition_on_previous_text": True,
         },
         "ffmpeg": {"binary_path": "/opt/homebrew/bin/ffmpeg"},
         "logging": {
@@ -235,6 +260,7 @@ def _ensure_config_defaults(config: dict) -> dict:
 
 
 class _JobLogFilter(logging.Filter):
+    # 로그 필드 기본값을 보강해 포맷 에러 없이 추적 정보를 일관되게 남긴다.
     def filter(self, record: logging.LogRecord) -> bool:
         if not hasattr(record, "job_id"):
             record.job_id = "-"
@@ -243,6 +269,7 @@ class _JobLogFilter(logging.Filter):
         return True
 
 
+# 실행 로그를 파일/콘솔로 동일 형식으로 남기고 핸들러 중복 등록을 방지한다.
 def setup_logging(log_file: str, max_bytes: int, backup_count: int) -> logging.Logger:
     logger = logging.getLogger("lecture_stt")
     logger.setLevel(logging.INFO)
@@ -272,6 +299,7 @@ def setup_logging(log_file: str, max_bytes: int, backup_count: int) -> logging.L
 
 
 class STTPipeline:
+    # 전체 전사 워크플로우의 오케스트레이션을 담당한다.
     def __init__(self, config: dict, logger: logging.Logger):
         self.config = _ensure_config_defaults(config)
         self.logger = logger
@@ -299,6 +327,13 @@ class STTPipeline:
             beam_size=int(trans["beam_size"]),
             vad_filter=bool(trans["vad_filter"]),
             word_timestamps=bool(trans["word_timestamps"]),
+            condition_on_previous_text=bool(trans["condition_on_previous_text"]),
+            # --- v2 추가 ---
+            repetition_penalty=float(trans.get("repetition_penalty", 1.15)),
+            no_repeat_ngram_size=int(trans.get("no_repeat_ngram_size", 4)),
+            vad_threshold=float(trans.get("vad_threshold", 0.55)),
+            min_silence_duration_ms=int(trans.get("min_silence_duration_ms", 1200)),
+            initial_prompt=str(trans.get("initial_prompt", "")),
         )
 
         self.worker = STTWorker(self.params, self.config["ffmpeg"]["binary_path"], str(self.tmp_dir))
@@ -318,6 +353,82 @@ class STTPipeline:
             state_dir=self.db_path.parent,
         )
 
+    @staticmethod
+    def _to_stage_progress(step: str) -> int:
+        """단계 이름 기반 기본 진행률 (시간 기반 계산 불가 시 폴백)."""
+        stage_progress = {
+            "파일 감지": 5,
+            "파일 이동": 10,
+            "중복 결과 재사용": 40,
+            "전사 시작/진행": 15,
+            "후처리(반복/노이즈 제거)": 75,
+            "품질 검사": 85,
+            "전사문 생성(TXT/JSON)": 90,
+            "전체 완료": 100,
+            "실패": 0,
+        }
+        return stage_progress.get(step, 5)
+
+    def _time_based_progress(self, job_id: int, eta_sec: int | None) -> int | None:
+        """started_at 기준 경과 시간 / 예상 총 시간으로 진행률을 계산한다."""
+        if eta_sec is None or eta_sec <= 0:
+            return None
+        try:
+            row = self.conn.execute(
+                "SELECT started_at FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            if not row or not row["started_at"]:
+                return None
+            from datetime import datetime
+            started = datetime.fromisoformat(row["started_at"])
+            now = datetime.now().astimezone()
+            elapsed = (now - started).total_seconds()
+            if elapsed < 0:
+                return None
+            pct = int((elapsed / eta_sec) * 100)
+            # 15~95% 범위로 제한 (시작/완료 단계는 별도 처리)
+            return max(15, min(95, pct))
+        except Exception:
+            return None
+
+    def _queue_status(self) -> dict[str, int]:
+        try:
+            return db.get_status_counts(self.conn)
+        except Exception:
+            return {"PENDING": 0, "PROCESSING": 0, "DONE": 0, "ERROR": 0}
+
+    def _update_progress(self, job_id: int, step: str, progress: int | None = None, eta_sec: int | None = None) -> None:
+        values = {"current_step": step}
+        if progress is not None:
+            values["progress_pct"] = max(0, min(100, int(progress)))
+        elif step == "전사 시작/진행":
+            # 전사 중에는 시간 기반 진행률을 우선 사용한다.
+            current_eta = eta_sec
+            if current_eta is None:
+                try:
+                    row = self.conn.execute("SELECT eta_sec FROM jobs WHERE id = ?", (job_id,)).fetchone()
+                    current_eta = row["eta_sec"] if row and row["eta_sec"] else None
+                except Exception:
+                    current_eta = None
+            time_pct = self._time_based_progress(job_id, current_eta)
+            values["progress_pct"] = time_pct if time_pct is not None else self._to_stage_progress(step)
+        else:
+            values["progress_pct"] = self._to_stage_progress(step)
+        if eta_sec is not None:
+            values["eta_sec"] = eta_sec
+        db.update_job(self.conn, job_id, **values)
+
+    def _estimate_eta_sec(self) -> int | None:
+        rows = self.conn.execute(
+            "SELECT total_sec FROM jobs WHERE status = ? AND total_sec IS NOT NULL ORDER BY ended_at DESC LIMIT 3",
+            (STATUS_DONE,),
+        ).fetchall()
+        samples = [float(row["total_sec"]) for row in rows if row["total_sec"] is not None]
+        if not samples:
+            return None
+        return max(1, int(sum(samples) / len(samples)))
+
+    # 시작 시 PROCESSING으로 남은 작업을 정리해 중복 처리/중단 상태를 회복한다.
     def startup_recovery(self) -> None:
         counts = db.recover_processing_jobs(self.conn, stale_processing_hours=self.stale_processing_hours)
         if any(counts.values()):
@@ -330,16 +441,29 @@ class STTPipeline:
                 counts["error"],
             )
 
+    # 공통 로그 헬퍼: 작업 컨텍스트를 함께 출력한다.
     def _log(self, level: int, message: str, job_ctx: Dict[str, str], *args: Any) -> None:
         self.logger.log(level, message, *args, extra=job_ctx)
 
+    # 소스 파일 기준으로 유일한 base와 경로들을 생성한다.
+    # 원본 파일명이 앞에 와서 전사물에서 원본을 쉽게 식별할 수 있다.
     def _job_paths(self, source_path: Path) -> Dict[str, Any]:
-        base = f"{utils.local_timestamp()}__{utils.sanitize_stem(source_path.stem)}__{utils.short_id(8)}"
+        safe_stem = utils.sanitize_stem(source_path.stem)
+
+        # 기본: 원본 파일명(sanitize만 적용) 그대로 사용
+        base_candidate = safe_stem
+
+        # 충돌 검사: audio 또는 transcript 폴더에 동명 파일이 이미 있으면 suffix 부착
+        audio_target = self.audio_dir / f"{base_candidate}{source_path.suffix.lower()}"
+        txt_target = self.transcript_dir / f"{base_candidate}.txt"
+        if audio_target.exists() or txt_target.exists():
+            base_candidate = f"{safe_stem}__{utils.local_timestamp()}__{utils.short_id(6)}"
+
         return {
-            "canonical_base": base,
-            "canonical_audio_path": self.audio_dir / f"{base}{source_path.suffix.lower()}",
-            "transcript_txt_path": self.transcript_dir / f"{base}.txt",
-            "transcript_json_path": self.transcript_dir / f"{base}.json",
+            "canonical_base": base_candidate,
+            "canonical_audio_path": self.audio_dir / f"{base_candidate}{source_path.suffix.lower()}",
+            "transcript_txt_path": self.transcript_dir / f"{base_candidate}.txt",
+            "transcript_json_path": self.transcript_dir / f"{base_candidate}.json",
         }
 
     def _metadata(self, canonical_base: str, started_at: str, ended_at: str, preprocess_sec: float,
@@ -348,6 +472,7 @@ class STTPipeline:
                   transcript_json_path: str, deduped: bool = False,
                   deduped_from_job_id: int | None = None,
                   source_sha256: str | None = None) -> Dict[str, Any]:
+        # 결과물과 처리 시간을 묶는 메타데이터를 한 곳에서 구성한다.
         payload = {
             "orig_name": orig_name,
             "orig_inbox_path": orig_inbox_path,
@@ -363,6 +488,7 @@ class STTPipeline:
             "beam_size": self.params.beam_size,
             "vad_filter": self.params.vad_filter,
             "word_timestamps": self.params.word_timestamps,
+            "condition_on_previous_text": self.params.condition_on_previous_text,
             "timings": {
                 "preprocess_sec": round(float(preprocess_sec), 6),
                 "transcribe_sec": round(float(transcribe_sec), 6),
@@ -381,10 +507,12 @@ class STTPipeline:
 
     def _write_output(self, txt_path: Path, json_path: Path, segments: list, text: str,
                       metadata: Dict[str, Any]) -> None:
+        # 텍스트와 JSON 결과를 원자적 쓰기로 저장한다.
         self.transcript_dir.mkdir(parents=True, exist_ok=True)
         utils.atomic_write(txt_path, text)
         utils.atomic_write(json_path, {"segments": segments, "metadata": metadata})
 
+    # 산출물 존재/구조를 최소 검증해 손상된 결과를 바로 감지한다.
     def _validate_output_files(self, txt_path: Path, json_path: Path) -> None:
         if not txt_path.exists() or not json_path.exists():
             raise FileNotFoundError("Missing transcript output file after write")
@@ -399,6 +527,7 @@ class STTPipeline:
     def _replay_existing_job(self, job_id: int, canonical_base: str, source_path: Path,
                             canonical_audio_path: Path, txt_path: Path, json_path: Path,
                             duplicate) -> bool:
+        # 동일 파일의 기존 결과를 복제해 처리 시간을 절약한다.
         prior_txt = Path(duplicate["transcript_txt_path"])
         prior_json = Path(duplicate["transcript_json_path"])
         try:
@@ -444,6 +573,7 @@ class STTPipeline:
 
             self._write_output(txt_path, json_path, segments, text, metadata)
             self._validate_output_files(txt_path, json_path)
+            self._update_progress(job_id, "전사문 생성(TXT/JSON)")
 
             db.update_job(
                 self.conn,
@@ -459,7 +589,18 @@ class STTPipeline:
                 canonical_audio_path=str(canonical_audio_path),
                 transcript_txt_path=str(txt_path),
                 transcript_json_path=str(json_path),
+                current_step="전체 완료",
+                progress_pct=100,
+                eta_sec=0,
             )
+            queue = self._queue_status()
+            self.notifier.notify_transcript_generated({
+                "job_id": job_id,
+                "orig_name": source_path.name,
+                "canonical_base": canonical_base,
+                "pending_count": queue.get("PENDING", 0),
+                "processing_count": queue.get("PROCESSING", 0),
+            })
             self.notifier.notify_success({
                 "job_id": job_id,
                 "orig_name": source_path.name,
@@ -469,7 +610,16 @@ class STTPipeline:
                 "transcript_txt_path": str(txt_path),
                 "transcript_json_path": str(json_path),
                 "elapsed_sec": 0.0,
+                "pending_count": queue.get("PENDING", 0),
+                "processing_count": queue.get("PROCESSING", 0),
                 "updated_at": utils.now_iso(),
+            })
+            self.notifier.notify_completed({
+                "job_id": job_id,
+                "orig_name": source_path.name,
+                "canonical_base": canonical_base,
+                "pending_count": queue.get("PENDING", 0),
+                "processing_count": queue.get("PROCESSING", 0),
             })
             return True
         except (OSError, json.JSONDecodeError, ValueError):
@@ -480,6 +630,7 @@ class STTPipeline:
                     pass
             return False
 
+    # 실패한 오디오를 에러 폴더로 이동시켜 후속 추적 대상만 남긴다.
     def _move_to_errors(self, canonical_audio: Path) -> Path:
         self.error_dir.mkdir(parents=True, exist_ok=True)
         target = self.error_dir / canonical_audio.name
@@ -488,6 +639,7 @@ class STTPipeline:
         utils.safe_move_file(canonical_audio, target)
         return target
 
+    # 하나의 파일에 대해 이동, 중복 처리, 전사, 저장, 알림까지 수행한다.
     def process_job(self, source_path: Path) -> None:
         paths = self._job_paths(source_path)
         canonical_base = paths["canonical_base"]
@@ -518,17 +670,37 @@ class STTPipeline:
                 "beam_size": self.params.beam_size,
                 "vad_filter": self.params.vad_filter,
                 "word_timestamps": self.params.word_timestamps,
+                "condition_on_previous_text": self.params.condition_on_previous_text,
             },
+            current_step="파일 감지",
+            progress_pct=10,
         )
         job_ctx["job_id"] = str(job_id)
+        self._update_progress(job_id, "파일 감지")
+        queue = self._queue_status()
+        self.notifier.notify_detected({
+            "job_id": job_id,
+            "orig_name": source_path.name,
+            "canonical_base": canonical_base,
+            "pending_count": queue.get("PENDING", 0),
+            "processing_count": queue.get("PROCESSING", 0),
+        })
 
         canonical_audio_final: Path | None = None
         tmp_wav: Path | None = None
+        # 실패 발생 시 어떤 단계에서 중단되었는지 추적해 장애 분석에 바로 활용한다.
+        fail_step = "파이프라인 시작"
 
         try:
             if not source_path.exists():
+                # 파일 이동 전에 원본이 존재하는지 먼저 확인한다. 없으면 즉시 실패 처리한다.
+                fail_step = "입력 파일 검증"
+                self._update_progress(job_id, "파일 감지")
                 raise FileNotFoundError(f"Source file disappeared before move: {source_path}")
 
+            # 안정적인 경로로 음원 파일을 옮겨 후속 처리를 시작한다.
+            fail_step = "파일 이동"
+            self._update_progress(job_id, "파일 이동", 20)
             utils.safe_move_file(source_path, canonical_audio)
             canonical_audio_final = canonical_audio
             sha256 = utils.compute_sha256(canonical_audio_final)
@@ -539,10 +711,23 @@ class STTPipeline:
                 sha256=sha256,
             )
 
+            queue = self._queue_status()
+            self.notifier.notify_moved({
+                "job_id": job_id,
+                "orig_name": source_path.name,
+                "canonical_base": canonical_base,
+                "pending_count": queue.get("PENDING", 0),
+                "processing_count": queue.get("PROCESSING", 0),
+            })
+
             self._log(logging.INFO, "moved to stable folder", job_ctx)
+            self._update_progress(job_id, "파일 이동", 30)
 
             duplicate = db.find_done_job_by_sha(self.conn, sha256)
             if duplicate and duplicate["id"] != job_id:
+                # 이미 변환 완료된 동일 파일이 있으면 결과를 재사용해 중복 작업 시간을 줄인다.
+                fail_step = "중복 결과 재사용"
+                self._update_progress(job_id, "중복 결과 재사용", 40)
                 if self._replay_existing_job(
                     job_id=job_id,
                     canonical_base=canonical_base,
@@ -556,16 +741,36 @@ class STTPipeline:
                     return
 
             if not db.claim_job_for_processing(self.conn, job_id):
+                # 상태를 PROCESSING으로 바꿔 다른 워커가 같은 작업을 중복 처리하지 않게 막는다.
+                fail_step = "처리 상태 전환"
                 raise RuntimeError(f"Failed to claim job {job_id} as PROCESSING")
             started_at = utils.now_iso()
+            eta = self._estimate_eta_sec()
+            self._update_progress(job_id, "전사 시작/진행", None, eta)
             self._log(logging.INFO, "transcription started", job_ctx)
 
+            # Whisper 전사 단계: 오디오에서 텍스트를 추출한다.
+            fail_step = "전사 실행"
             segments, transcript_text, preprocess_sec, transcribe_sec, tmp_wav = self.worker.transcribe_file(
                 canonical_audio_final,
                 canonical_base,
             )
             total_sec = preprocess_sec + transcribe_sec
             ended_at = utils.now_iso()
+
+            # ── v2: 후처리 + 품질 게이트 ──
+            fail_step = "후처리"
+            self._update_progress(job_id, "후처리(반복/노이즈 제거)", 70)
+            segments, transcript_text = postprocess(segments, transcript_text)
+
+            fail_step = "품질 검사"
+            quality_report = quality_evaluate(segments, transcript_text)
+            self._log(
+                logging.WARNING if quality_report.health != "good" else logging.INFO,
+                f"quality: {quality_report.summary}",
+                job_ctx,
+            )
+            # ── v2 끝 ──
 
             metadata = self._metadata(
                 canonical_base=canonical_base,
@@ -580,9 +785,24 @@ class STTPipeline:
                 transcript_txt_path=str(txt_path),
                 transcript_json_path=str(json_path),
             )
+            # v2: 품질 보고서를 metadata에 포함
+            metadata["quality"] = quality_report.to_dict()
+
+            # 생성된 텍스트/메타데이터를 디스크에 저장하고 구조를 검증한다.
+            fail_step = "산출물 저장/검증"
             self._write_output(txt_path, json_path, segments, transcript_text, metadata)
             self._validate_output_files(txt_path, json_path)
+            self._update_progress(job_id, "전사문 생성(TXT/JSON)", 85)
+            self.notifier.notify_transcript_generated({
+                "job_id": job_id,
+                "orig_name": source_path.name,
+                "canonical_base": canonical_base,
+                "pending_count": self._queue_status().get("PENDING", 0),
+                "processing_count": self._queue_status().get("PROCESSING", 0),
+            })
 
+            # DB 상태를 DONE으로 마무리하고 처리 시간을 기록한다.
+            fail_step = "최종 상태 갱신"
             db.update_job(
                 self.conn,
                 job_id,
@@ -592,7 +812,13 @@ class STTPipeline:
                 transcribe_sec=transcribe_sec,
                 total_sec=total_sec,
                 engine_params=json.dumps(metadata),
+                current_step="전체 완료",
+                progress_pct=100,
+                eta_sec=0,
             )
+            # 최종 산출물 생성이 완료되면 성공 알림을 전송한다.
+            fail_step = "알림 전송"
+            queue = self._queue_status()
             self.notifier.notify_success({
                 "job_id": job_id,
                 "orig_name": source_path.name,
@@ -602,13 +828,27 @@ class STTPipeline:
                 "transcript_txt_path": str(txt_path),
                 "transcript_json_path": str(json_path),
                 "elapsed_sec": total_sec,
+                "pending_count": queue.get("PENDING", 0),
+                "processing_count": queue.get("PROCESSING", 0),
                 "updated_at": ended_at,
+                # --- v2 추가 ---
+                "quality_health": quality_report.health,
+                "quality_summary": quality_report.summary,
+            })
+            self.notifier.notify_completed({
+                "job_id": job_id,
+                "orig_name": source_path.name,
+                "canonical_base": canonical_base,
+                "pending_count": queue.get("PENDING", 0),
+                "processing_count": queue.get("PROCESSING", 0),
             })
             self._log(logging.INFO, "done", job_ctx)
 
         except Exception as exc:
             tb = traceback.format_exc()
             self.logger.exception("job processing failed")
+            # 예상치 못한 예외는 방어적으로 Unknown으로 남겨 원인 분류가 누락되지 않게 한다.
+            fail_step = fail_step or "Unknown"
             error_audio = canonical_audio_final
             if canonical_audio_final and canonical_audio_final.exists():
                 error_audio = self._move_to_errors(canonical_audio_final)
@@ -621,7 +861,12 @@ class STTPipeline:
                 error_message=str(exc),
                 error_trace=tb,
                 canonical_audio_path=str(error_audio) if error_audio else str(canonical_audio),
+                current_step=f"실패: {fail_step}",
+                progress_pct=0,
+                eta_sec=None,
             )
+            self._update_progress(job_id, f"실패: {fail_step}", 0, None)
+            queue = self._queue_status()
 
             self.notifier.notify_error({
                 "job_id": job_id,
@@ -632,6 +877,9 @@ class STTPipeline:
                 "transcript_txt_path": str(txt_path),
                 "transcript_json_path": str(json_path),
                 "error_message": str(exc),
+                "error_step": fail_step,
+                "pending_count": queue.get("PENDING", 0),
+                "processing_count": queue.get("PROCESSING", 0),
             })
             self._log(logging.ERROR, "failed", job_ctx)
         finally:
@@ -639,6 +887,7 @@ class STTPipeline:
                 self.worker.cleanup_tmp(tmp_wav)
 
     def run(self, run_once: bool = False) -> None:
+        # 파이프라인을 루프 또는 한 번 처리 모드로 실행하고 pause 상태를 반영한다.
         self.startup_recovery()
         self._log(logging.INFO, "pipeline start", {"job_id": "-", "canonical_base": "-"})
 
@@ -683,8 +932,10 @@ class STTPipeline:
 
 
 def parse_args() -> argparse.Namespace:
+    # CLI 모드를 파싱해 제어 동작과 실행 모드를 구분한다.
     parser = argparse.ArgumentParser(description="Always-on lecture STT worker")
     parser.add_argument("--once", action="store_true", help="Process at most one stable file")
+    parser.add_argument("--watch-folder", dest="watch_folder", help="Override paths.watch_folder in runtime")
     control_group = parser.add_mutually_exclusive_group()
     control_group.add_argument("--pause", action="store_true", help="Pause scanning/processing")
     control_group.add_argument("--resume", action="store_true", help="Resume scanning/processing")
@@ -698,6 +949,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    # 진입점: 제어 커맨드를 우선 처리하고, 기본 실행은 파이프라인 시작이다.
     args = parse_args()
     load_dotenv("/Users/geonha/lecture_stt/.env", override=False)
 
@@ -717,7 +969,10 @@ def main() -> None:
         print(f"Pause flag: {utils.get_pause_flag_path()}")
         return
 
-    config = validate_config(args.config, load_config(args.config))
+    config = load_config(args.config)
+    if args.watch_folder:
+        config.setdefault("paths", {})["watch_folder"] = args.watch_folder
+    config = validate_config(args.config, config)
     logging_cfg = config["logging"]
     logger = setup_logging(
         logging_cfg["file"],
