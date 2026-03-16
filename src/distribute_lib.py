@@ -409,11 +409,39 @@ class DownstreamDistributor:
         json_hash = utils.compute_sha256(unit.json_path)
         txt_destination = origin_dir / unit.txt_path.name
         json_destination = origin_dir / unit.json_path.name
+        copied_destinations: list[Path] = []
 
         try:
             txt_outcome = self._sync_file(unit.txt_path, txt_destination, txt_hash)
+            if txt_outcome.status == "copied":
+                copied_destinations.append(txt_destination)
             json_outcome = self._sync_file(unit.json_path, json_destination, json_hash)
+            if json_outcome.status == "copied":
+                copied_destinations.append(json_destination)
         except FileConflictError as exc:
+            rollback_error = self._rollback_copied_files(copied_destinations)
+            if rollback_error is not None:
+                self._save_delivery(
+                    unit.logical_stem,
+                    **base_fields,
+                    correction_txt_path=str(unit.txt_path),
+                    correction_json_path=str(unit.json_path),
+                    correction_txt_sha256=txt_hash,
+                    correction_json_sha256=json_hash,
+                    tuk_origin_txt_path=str(txt_destination),
+                    tuk_origin_json_path=str(json_destination),
+                    correction_status=CORRECTION_STATUS_ERROR,
+                    tuk_origin_done=0,
+                    last_error_code="ROLLBACK_FAILED",
+                    last_error=f"{exc}; rollback failed: {rollback_error}",
+                )
+                self._log_event(
+                    "correction_rollback_failed",
+                    logical_stem=unit.logical_stem,
+                    conflict_destination=str(exc.dst),
+                    rollback_error=str(rollback_error),
+                )
+                return "errors"
             self._save_delivery(
                 unit.logical_stem,
                 **base_fields,
@@ -435,6 +463,9 @@ class DownstreamDistributor:
             )
             return "conflicts"
         except Exception as exc:
+            rollback_error = self._rollback_copied_files(copied_destinations)
+            if rollback_error is not None:
+                exc = RuntimeError(f"{exc}; rollback failed: {rollback_error}")
             self._save_delivery(
                 unit.logical_stem,
                 **base_fields,
@@ -456,7 +487,37 @@ class DownstreamDistributor:
             )
             return "errors"
 
-        self._correction_ready_stems.add(unit.logical_stem)
+        completed_at = None
+        if not self.dry_run:
+            completed_at = self._completed_at(
+                unit.logical_stem,
+                correction_status=CORRECTION_STATUS_DELIVERED,
+                tuk_origin_done=1,
+            )
+            try:
+                self._delete_sources([unit.txt_path, unit.json_path])
+            except Exception as exc:
+                self._save_delivery(
+                    unit.logical_stem,
+                    **base_fields,
+                    correction_txt_path=str(unit.txt_path),
+                    correction_json_path=str(unit.json_path),
+                    correction_txt_sha256=txt_hash,
+                    correction_json_sha256=json_hash,
+                    tuk_origin_txt_path=str(txt_destination),
+                    tuk_origin_json_path=str(json_destination),
+                    correction_status=CORRECTION_STATUS_ERROR,
+                    tuk_origin_done=1,
+                    last_error_code="SOURCE_CLEANUP_FAILED",
+                    last_error=str(exc),
+                )
+                self._log_event(
+                    "correction_cleanup_failed",
+                    logical_stem=unit.logical_stem,
+                    error=str(exc),
+                )
+                return "errors"
+
         self._save_delivery(
             unit.logical_stem,
             **base_fields,
@@ -468,12 +529,11 @@ class DownstreamDistributor:
             tuk_origin_json_path=str(json_destination),
             correction_status=CORRECTION_STATUS_DELIVERED,
             tuk_origin_done=1,
+            completed_at=completed_at,
             last_error_code=None,
             last_error=None,
         )
-
-        if not self.dry_run:
-            self._delete_sources([unit.txt_path, unit.json_path])
+        self._correction_ready_stems.add(unit.logical_stem)
 
         self._log_event(
             "correction_delivered",
@@ -514,13 +574,23 @@ class DownstreamDistributor:
             return "errors"
 
         if not self._correction_is_ready(unit.logical_stem, unit.subject_abbr):  # type: ignore[arg-type]
+            existing_row = db.get_delivery(self.conn, unit.logical_stem)
+            last_error_code = "CORRECTION_NOT_READY"
+            last_error = "Summary delivery requires a delivered correction pair"
+            if (
+                existing_row
+                and existing_row["correction_status"] not in {None, "", "MISSING", CORRECTION_STATUS_DELIVERED}
+                and existing_row["last_error_code"]
+            ):
+                last_error_code = existing_row["last_error_code"]
+                last_error = existing_row["last_error"]
             self._save_delivery(
                 unit.logical_stem,
                 **base_fields,
                 summary_md_path=str(unit.md_path),
                 summary_status=SUMMARY_STATUS_BLOCKED,
-                last_error_code="CORRECTION_NOT_READY",
-                last_error="Summary delivery requires a delivered correction pair",
+                last_error_code=last_error_code,
+                last_error=last_error,
             )
             self._log_event(
                 "summary_blocked",
@@ -533,10 +603,14 @@ class DownstreamDistributor:
         summary_hash = utils.compute_sha256(unit.md_path)
         tuk_destination = route.gh_summary_dir(self.config.gh_current_semester_root) / unit.md_path.name
         obsidian_destination = route.obsidian_summary_dir(self.config.obsidian_semester_root) / unit.md_path.name
+        tuk_summary_done = 0
+        obsidian_done = 0
 
         try:
             tuk_outcome = self._sync_file(unit.md_path, tuk_destination, summary_hash)
+            tuk_summary_done = 1
             obsidian_outcome = self._sync_file(unit.md_path, obsidian_destination, summary_hash)
+            obsidian_done = 1
         except FileConflictError as exc:
             self._save_delivery(
                 unit.logical_stem,
@@ -546,6 +620,8 @@ class DownstreamDistributor:
                 tuk_summary_path=str(tuk_destination),
                 obsidian_summary_path=str(obsidian_destination),
                 summary_status=SUMMARY_STATUS_CONFLICT,
+                tuk_summary_done=tuk_summary_done,
+                obsidian_done=obsidian_done,
                 last_error_code="CONFLICT",
                 last_error=str(exc),
             )
@@ -564,6 +640,8 @@ class DownstreamDistributor:
                 tuk_summary_path=str(tuk_destination),
                 obsidian_summary_path=str(obsidian_destination),
                 summary_status=SUMMARY_STATUS_ERROR,
+                tuk_summary_done=tuk_summary_done,
+                obsidian_done=obsidian_done,
                 last_error_code="UNEXPECTED_ERROR",
                 last_error=str(exc),
             )
@@ -576,7 +654,34 @@ class DownstreamDistributor:
 
         completed_at = None
         if not self.dry_run:
-            completed_at = self._completed_at(unit.logical_stem, tuk_summary_done=1, obsidian_done=1)
+            completed_at = self._completed_at(
+                unit.logical_stem,
+                summary_status=SUMMARY_STATUS_DELIVERED,
+                tuk_summary_done=1,
+                obsidian_done=1,
+            )
+            try:
+                self._delete_sources([unit.md_path])
+            except Exception as exc:
+                self._save_delivery(
+                    unit.logical_stem,
+                    **base_fields,
+                    summary_md_path=str(unit.md_path),
+                    summary_md_sha256=summary_hash,
+                    tuk_summary_path=str(tuk_destination),
+                    obsidian_summary_path=str(obsidian_destination),
+                    summary_status=SUMMARY_STATUS_ERROR,
+                    tuk_summary_done=1,
+                    obsidian_done=1,
+                    last_error_code="SOURCE_CLEANUP_FAILED",
+                    last_error=str(exc),
+                )
+                self._log_event(
+                    "summary_cleanup_failed",
+                    logical_stem=unit.logical_stem,
+                    error=str(exc),
+                )
+                return "errors"
         self._save_delivery(
             unit.logical_stem,
             **base_fields,
@@ -591,9 +696,6 @@ class DownstreamDistributor:
             last_error_code=None,
             last_error=None,
         )
-
-        if not self.dry_run:
-            self._delete_sources([unit.md_path])
 
         self._log_event(
             "summary_delivered",
@@ -632,24 +734,42 @@ class DownstreamDistributor:
             return True
 
         row = db.get_delivery(self.conn, logical_stem)
-        if row and int(row["tuk_origin_done"] or 0) == 1:
-            return True
+        if row:
+            if (
+                row["correction_status"] == CORRECTION_STATUS_DELIVERED
+                and int(row["tuk_origin_done"] or 0) == 1
+            ):
+                return True
+            if row["correction_status"] not in {None, "", "MISSING"}:
+                return False
 
         route = self.config.subjects[subject_abbr]
         origin_dir = route.gh_origin_dir(self.config.gh_current_semester_root)
         return (origin_dir / f"{logical_stem}.txt").exists() and (origin_dir / f"{logical_stem}.json").exists()
 
-    def _completed_at(self, logical_stem: str, **overrides: int) -> Optional[str]:
+    def _completed_at(self, logical_stem: str, **overrides: object) -> Optional[str]:
         row = db.get_delivery(self.conn, logical_stem)
         flags = {
             "tuk_origin_done": int(row["tuk_origin_done"] or 0) if row else 0,
             "tuk_summary_done": int(row["tuk_summary_done"] or 0) if row else 0,
             "obsidian_done": int(row["obsidian_done"] or 0) if row else 0,
         }
+        correction_status = row["correction_status"] if row else None
+        summary_status = row["summary_status"] if row else None
         for key, value in overrides.items():
             if key in flags:
                 flags[key] = int(value)
-        if all(value == 1 for value in flags.values()):
+                continue
+            if key == "correction_status":
+                correction_status = str(value)
+                continue
+            if key == "summary_status":
+                summary_status = str(value)
+        if (
+            correction_status == CORRECTION_STATUS_DELIVERED
+            and summary_status == SUMMARY_STATUS_DELIVERED
+            and all(value == 1 for value in flags.values())
+        ):
             return utils.now_iso()
         return row["completed_at"] if row and row["completed_at"] else None
 
@@ -669,6 +789,17 @@ class DownstreamDistributor:
     def _delete_sources(self, sources: Iterable[Path]) -> None:
         for source in sources:
             source.unlink(missing_ok=True)
+
+    def _rollback_copied_files(self, destinations: Iterable[Path]) -> Optional[OSError]:
+        rollback_error: Optional[OSError] = None
+        for destination in reversed(list(destinations)):
+            try:
+                destination.unlink(missing_ok=True)
+            except OSError as exc:
+                if rollback_error is None:
+                    rollback_error = exc
+                logger.warning("Failed to roll back copied destination %s", destination, exc_info=True)
+        return rollback_error
 
     def _log_event(self, event: str, **payload: object) -> None:
         logger.info("%s %s", event, payload)

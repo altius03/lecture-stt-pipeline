@@ -4,6 +4,7 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import sys
 
@@ -170,6 +171,56 @@ class DownstreamDistributorTests(unittest.TestCase):
         row = db.get_delivery(self.conn, stem)
         self.assertEqual(row["summary_status"], SUMMARY_STATUS_CONFLICT)
 
+    def test_correction_conflict_rolls_back_first_copy(self) -> None:
+        stem = "260316LC_3"
+        self._write_text(self.correction_dir / f"{stem}.txt", "new correction text")
+        self._write_json(self.correction_dir / f"{stem}.json", '{"segments":[{"text":"new correction text"}]}')
+
+        route = self._route("LC")
+        json_destination = route.gh_origin_dir(self.gh_root) / f"{stem}.json"
+        self._write_json(json_destination, '{"segments":[{"text":"old correction text"}]}')
+
+        distributor = self._make_distributor()
+        stats = distributor.scan_once()
+        distributor.close()
+
+        txt_destination = route.gh_origin_dir(self.gh_root) / f"{stem}.txt"
+        self.assertEqual(stats["conflicts"], 1)
+        self.assertFalse(txt_destination.exists())
+        self.assertEqual(json_destination.read_text(encoding="utf-8"), '{"segments":[{"text":"old correction text"}]}')
+        self.assertTrue((self.correction_dir / f"{stem}.txt").exists())
+        self.assertTrue((self.correction_dir / f"{stem}.json").exists())
+
+        row = db.get_delivery(self.conn, stem)
+        self.assertEqual(row["correction_status"], CORRECTION_STATUS_CONFLICT)
+        self.assertEqual(int(row["tuk_origin_done"]), 0)
+
+    def test_summary_partial_success_is_persisted_when_obsidian_conflicts(self) -> None:
+        stem = "260316DStr_3"
+        self._write_text(self.correction_dir / f"{stem}.txt", "correction")
+        self._write_json(self.correction_dir / f"{stem}.json", '{"segments":[{"text":"correction"}]}')
+        self._write_text(self.summary_dir / f"{stem}.md", "# summary")
+
+        route = self._route("DStr")
+        obsidian_destination = route.obsidian_summary_dir(self.obsidian_root) / f"{stem}.md"
+        self._write_text(obsidian_destination, "# existing conflict")
+
+        distributor = self._make_distributor()
+        stats = distributor.scan_once()
+        distributor.close()
+
+        tuk_destination = route.gh_summary_dir(self.gh_root) / f"{stem}.md"
+        self.assertEqual(stats["correction_delivered"], 1)
+        self.assertEqual(stats["conflicts"], 1)
+        self.assertTrue(tuk_destination.exists())
+        self.assertEqual(obsidian_destination.read_text(encoding="utf-8"), "# existing conflict")
+        self.assertTrue((self.summary_dir / f"{stem}.md").exists())
+
+        row = db.get_delivery(self.conn, stem)
+        self.assertEqual(row["summary_status"], SUMMARY_STATUS_CONFLICT)
+        self.assertEqual(int(row["tuk_summary_done"]), 1)
+        self.assertEqual(int(row["obsidian_done"]), 0)
+
     def test_incomplete_correction_pair_is_not_distributed(self) -> None:
         stem = "260316DS_1"
         self._write_text(self.correction_dir / f"{stem}.txt", "only txt exists")
@@ -211,6 +262,33 @@ class DownstreamDistributorTests(unittest.TestCase):
         row = db.get_delivery(self.conn, stem)
         self.assertEqual(row["summary_status"], SUMMARY_STATUS_BLOCKED)
 
+    def test_summary_unblocks_after_legacy_correction_backfill(self) -> None:
+        stem = "260316LA_2"
+        self._write_text(self.summary_dir / f"{stem}.md", "# summary only")
+
+        distributor = self._make_distributor()
+        first_stats = distributor.scan_once()
+        distributor.close()
+
+        route = self._route("LA")
+        self._write_text(route.gh_origin_dir(self.gh_root) / f"{stem}.txt", "legacy correction")
+        self._write_json(route.gh_origin_dir(self.gh_root) / f"{stem}.json", '{"segments":[{"text":"legacy correction"}]}')
+
+        distributor = self._make_distributor()
+        second_stats = distributor.scan_once()
+        distributor.close()
+
+        self.assertEqual(first_stats["blocked"], 1)
+        self.assertEqual(second_stats["summary_delivered"], 1)
+        self.assertFalse((self.summary_dir / f"{stem}.md").exists())
+        self.assertTrue((route.gh_summary_dir(self.gh_root) / f"{stem}.md").exists())
+        self.assertTrue((route.obsidian_summary_dir(self.obsidian_root) / f"{stem}.md").exists())
+
+        row = db.get_delivery(self.conn, stem)
+        self.assertEqual(row["summary_status"], SUMMARY_STATUS_DELIVERED)
+        self.assertEqual(int(row["tuk_summary_done"]), 1)
+        self.assertEqual(int(row["obsidian_done"]), 1)
+
     def test_dry_run_does_not_mutate_sources_or_destinations(self) -> None:
         stem = "260316LC_2"
         txt_source = self.correction_dir / f"{stem}.txt"
@@ -237,6 +315,33 @@ class DownstreamDistributorTests(unittest.TestCase):
 
         count = self.conn.execute("SELECT COUNT(*) FROM deliveries").fetchone()[0]
         self.assertEqual(count, 0)
+
+    def test_cleanup_failure_does_not_mark_correction_delivered(self) -> None:
+        stem = "260316Unix_2"
+        self._write_text(self.correction_dir / f"{stem}.txt", "cleanup correction")
+        self._write_json(self.correction_dir / f"{stem}.json", '{"segments":[{"text":"cleanup correction"}]}')
+        self._write_text(self.summary_dir / f"{stem}.md", "# cleanup summary")
+
+        distributor = self._make_distributor()
+        with mock.patch.object(
+            distributor,
+            "_delete_sources",
+            side_effect=PermissionError("simulated cleanup failure"),
+        ):
+            stats = distributor.scan_once()
+        distributor.close()
+
+        self.assertEqual(stats["errors"], 1)
+        self.assertEqual(stats["blocked"], 1)
+        self.assertTrue((self.correction_dir / f"{stem}.txt").exists())
+        self.assertTrue((self.correction_dir / f"{stem}.json").exists())
+        self.assertTrue((self.summary_dir / f"{stem}.md").exists())
+
+        row = db.get_delivery(self.conn, stem)
+        self.assertEqual(row["correction_status"], CORRECTION_STATUS_ERROR)
+        self.assertEqual(row["last_error_code"], "SOURCE_CLEANUP_FAILED")
+        self.assertEqual(int(row["tuk_origin_done"]), 1)
+        self.assertEqual(row["summary_status"], SUMMARY_STATUS_BLOCKED)
 
 
 if __name__ == "__main__":
