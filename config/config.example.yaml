@@ -35,3 +35,44 @@ logging:
 cleanup:
   retain_days: 7
   retain_min_transcripts: 5
+
+downstream:
+  scan_interval_sec: 30
+  stable_for_sec: 60
+  correction_folder: "/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings/03_correction"
+  summary_folder: "/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings/04_summarize"
+  gh_current_semester_root: "/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/GH_archive/01_TUK/01_current_semester"
+  obsidian_semester_root: "/Users/geonha/Library/Mobile Documents/iCloud~md~obsidian/Documents/99_obsidian/StudyVaults/2-1"
+  log_jsonl_path: "/Users/geonha/lecture_stt/state/logs/downstream.jsonl"
+  lock_path: "/Users/geonha/lecture_stt/state/downstream.lock"
+  subjects:
+    LC:
+      gh_course_dir: "01_logic_circuits"
+      obsidian_course_dir: "01_logic_circuits"
+      display_name: "논리회로"
+      obsidian_note_dir: "강의록"
+    DStr:
+      gh_course_dir: "02_data_structures"
+      obsidian_course_dir: "02_data_structures"
+      display_name: "자료구조"
+      obsidian_note_dir: "강의록"
+    DS:
+      gh_course_dir: "03_data_science"
+      obsidian_course_dir: "03_data_science"
+      display_name: "데이터사이언스"
+      obsidian_note_dir: "강의록"
+    LA:
+      gh_course_dir: "04_linear_algebra"
+      obsidian_course_dir: "04_linear_algebra"
+      display_name: "선형대수학"
+      obsidian_note_dir: "강의록"
+    OOP:
+      gh_course_dir: "05_object_oriented_programming"
+      obsidian_course_dir: "05_object_oriented_programming"
+      display_name: "객체지향언어"
+      obsidian_note_dir: "강의록"
+    Unix:
+      gh_course_dir: "06_unix_fundamentals"
+      obsidian_course_dir: "06_unix_fundamentals"
+      display_name: "유닉스 기초"
+      obsidian_note_dir: "강의록"

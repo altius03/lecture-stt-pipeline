@@ -15,6 +15,31 @@ STATUS_PROCESSING = "PROCESSING"
 STATUS_DONE = "DONE"
 STATUS_ERROR = "ERROR"
 
+DELIVERY_COLUMN_DEFS = {
+    "source_job_id": "INTEGER",
+    "subject_abbr": "TEXT NOT NULL DEFAULT 'UNKNOWN'",
+    "correction_txt_path": "TEXT",
+    "correction_json_path": "TEXT",
+    "summary_md_path": "TEXT",
+    "correction_txt_sha256": "TEXT",
+    "correction_json_sha256": "TEXT",
+    "summary_md_sha256": "TEXT",
+    "tuk_origin_txt_path": "TEXT",
+    "tuk_origin_json_path": "TEXT",
+    "tuk_summary_path": "TEXT",
+    "obsidian_summary_path": "TEXT",
+    "correction_status": "TEXT NOT NULL DEFAULT 'MISSING'",
+    "summary_status": "TEXT NOT NULL DEFAULT 'MISSING'",
+    "tuk_origin_done": "INTEGER NOT NULL DEFAULT 0",
+    "tuk_summary_done": "INTEGER NOT NULL DEFAULT 0",
+    "obsidian_done": "INTEGER NOT NULL DEFAULT 0",
+    "last_error_code": "TEXT",
+    "last_error": "TEXT",
+    "last_attempted_at": "TEXT",
+    "completed_at": "TEXT",
+    "updated_at": "TEXT NOT NULL",
+}
+
 
 # DB 파일 연결과 기본 PRAGMA 설정을 한 번에 수행한다.
 def _connect(db_path: str) -> sqlite3.Connection:
@@ -26,6 +51,10 @@ def _connect(db_path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA synchronous = NORMAL")
     return conn
+
+
+def connect_db(db_path: str) -> sqlite3.Connection:
+    return _connect(db_path)
 
 
 # 테이블/인덱스를 준비하고 최초 커넥션을 반환한다.
@@ -63,23 +92,65 @@ def init_db(db_path: str) -> sqlite3.Connection:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_sha256 ON jobs (sha256)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs (created_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_updated_at ON jobs (updated_at)")
+    init_deliveries_table(conn)
     conn.commit()
     return conn
 
 
-def _existing_columns(conn: sqlite3.Connection) -> set[str]:
-    rows = conn.execute("PRAGMA table_info(jobs)").fetchall()
+def _existing_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
+    rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
     return {str(row["name"]) for row in rows}
 
 
 def _ensure_job_columns(conn: sqlite3.Connection, required: set[str]) -> None:
-    existing = _existing_columns(conn)
+    existing = _existing_columns(conn, "jobs")
     if "current_step" not in existing:
         conn.execute("ALTER TABLE jobs ADD COLUMN current_step TEXT")
     if "progress_pct" not in existing:
         conn.execute("ALTER TABLE jobs ADD COLUMN progress_pct INTEGER DEFAULT 0")
     if "eta_sec" not in existing:
         conn.execute("ALTER TABLE jobs ADD COLUMN eta_sec INTEGER")
+    conn.commit()
+
+
+def init_deliveries_table(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS deliveries (
+            logical_stem TEXT PRIMARY KEY,
+            source_job_id INTEGER,
+            subject_abbr TEXT NOT NULL DEFAULT 'UNKNOWN',
+            correction_txt_path TEXT,
+            correction_json_path TEXT,
+            summary_md_path TEXT,
+            correction_txt_sha256 TEXT,
+            correction_json_sha256 TEXT,
+            summary_md_sha256 TEXT,
+            tuk_origin_txt_path TEXT,
+            tuk_origin_json_path TEXT,
+            tuk_summary_path TEXT,
+            obsidian_summary_path TEXT,
+            correction_status TEXT NOT NULL DEFAULT 'MISSING',
+            summary_status TEXT NOT NULL DEFAULT 'MISSING',
+            tuk_origin_done INTEGER NOT NULL DEFAULT 0,
+            tuk_summary_done INTEGER NOT NULL DEFAULT 0,
+            obsidian_done INTEGER NOT NULL DEFAULT 0,
+            last_error_code TEXT,
+            last_error TEXT,
+            last_attempted_at TEXT,
+            completed_at TEXT,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    existing = _existing_columns(conn, "deliveries")
+    for column_name, column_def in DELIVERY_COLUMN_DEFS.items():
+        if column_name not in existing:
+            conn.execute(f"ALTER TABLE deliveries ADD COLUMN {column_name} {column_def}")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_deliveries_subject ON deliveries (subject_abbr)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_deliveries_updated_at ON deliveries (updated_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_deliveries_correction_status ON deliveries (correction_status)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_deliveries_summary_status ON deliveries (summary_status)")
     conn.commit()
 
 
@@ -95,6 +166,44 @@ def _clean_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
             value = str(value)
         result[key] = value
     return result
+
+
+def get_delivery(conn: sqlite3.Connection, logical_stem: str) -> Optional[sqlite3.Row]:
+    try:
+        return conn.execute(
+            "SELECT * FROM deliveries WHERE logical_stem = ?",
+            (logical_stem,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+
+
+def upsert_delivery(conn: sqlite3.Connection, logical_stem: str, **fields: Any) -> None:
+    payload = _clean_payload(fields)
+    payload["logical_stem"] = logical_stem
+    payload["updated_at"] = _now()
+
+    columns = ", ".join(payload.keys())
+    placeholders = ", ".join([":" + key for key in payload.keys()])
+    update_clause = ", ".join(
+        [f"{key} = excluded.{key}" for key in payload.keys() if key != "logical_stem"]
+    )
+    conn.execute(
+        f"INSERT INTO deliveries ({columns}) VALUES ({placeholders}) "
+        f"ON CONFLICT(logical_stem) DO UPDATE SET {update_clause}",
+        payload,
+    )
+    conn.commit()
+
+
+def find_latest_job_by_canonical_base(conn: sqlite3.Connection, canonical_base: str) -> Optional[sqlite3.Row]:
+    try:
+        return conn.execute(
+            "SELECT * FROM jobs WHERE canonical_base = ? ORDER BY id DESC LIMIT 1",
+            (canonical_base,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
 
 
 def create_job(

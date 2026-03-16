@@ -1,0 +1,203 @@
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+import sqlite3
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+from distribute_lib import (
+    DownstreamConfig,
+    DownstreamDistributor,
+    SubjectRoute,
+    default_subject_routes,
+)
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - macOS worker path uses fcntl.
+    fcntl = None  # type: ignore[assignment]
+
+
+logger = logging.getLogger("lecture_stt.downstream")
+
+
+class SingleInstanceLock:
+    def __init__(self, path: Path):
+        self.path = path
+        self._handle = None
+
+    def __enter__(self) -> "SingleInstanceLock":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._handle = self.path.open("a+", encoding="utf-8")
+        if fcntl is not None:
+            fcntl.flock(self._handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self._handle is None:
+            return
+        if fcntl is not None:
+            fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
+        self._handle.close()
+
+
+def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _default_config() -> dict[str, Any]:
+    default_subjects = default_subject_routes()
+    return {
+        "paths": {
+            "db_path": "/Users/geonha/lecture_stt/state/jobs.sqlite3",
+        },
+        "downstream": {
+            "scan_interval_sec": 30,
+            "stable_for_sec": 60,
+            "correction_folder": "/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings/03_correction",
+            "summary_folder": "/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings/04_summarize",
+            "gh_current_semester_root": "/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/GH_archive/01_TUK/01_current_semester",
+            "obsidian_semester_root": "/Users/geonha/Library/Mobile Documents/iCloud~md~obsidian/Documents/99_obsidian/StudyVaults/2-1",
+            "log_jsonl_path": "/Users/geonha/lecture_stt/state/logs/downstream.jsonl",
+            "lock_path": "/Users/geonha/lecture_stt/state/downstream.lock",
+            "subjects": {
+                abbr: {
+                    "gh_course_dir": route.gh_course_dir,
+                    "obsidian_course_dir": route.obsidian_course_dir,
+                    "display_name": route.display_name,
+                    "obsidian_note_dir": route.obsidian_note_dir,
+                }
+                for abbr, route in default_subjects.items()
+            },
+        },
+    }
+
+
+def load_worker_config(config_path: str = "config/config.yaml") -> DownstreamConfig:
+    repo_root = Path(__file__).resolve().parents[1]
+    path = Path(config_path)
+    if not path.is_absolute():
+        path = repo_root / path
+    if not path.exists():
+        raise FileNotFoundError(f"Missing required config file: {path}")
+
+    with path.open("r", encoding="utf-8") as handle:
+        loaded = yaml.safe_load(handle) or {}
+    if not isinstance(loaded, dict):
+        raise ValueError(f"Config must be a YAML mapping in {path}")
+
+    merged = _deep_merge(_default_config(), loaded)
+    paths_cfg = merged.get("paths") or {}
+    downstream_cfg = merged.get("downstream") or {}
+
+    db_path = Path(paths_cfg.get("db_path", "/Users/geonha/lecture_stt/state/jobs.sqlite3")).expanduser()
+    correction_dir = Path(downstream_cfg["correction_folder"]).expanduser()
+    summary_dir = Path(downstream_cfg["summary_folder"]).expanduser()
+    gh_root = Path(downstream_cfg["gh_current_semester_root"]).expanduser()
+    obsidian_root = Path(downstream_cfg["obsidian_semester_root"]).expanduser()
+    log_jsonl_path = Path(downstream_cfg["log_jsonl_path"]).expanduser()
+    lock_path = Path(downstream_cfg["lock_path"]).expanduser()
+
+    scan_interval_sec = int(downstream_cfg["scan_interval_sec"])
+    stable_for_sec = int(downstream_cfg["stable_for_sec"])
+    if scan_interval_sec <= 0:
+        raise ValueError("downstream.scan_interval_sec must be greater than 0")
+    if stable_for_sec <= 0:
+        raise ValueError("downstream.stable_for_sec must be greater than 0")
+
+    subjects_cfg = downstream_cfg.get("subjects") or {}
+    if not isinstance(subjects_cfg, dict) or not subjects_cfg:
+        raise ValueError("downstream.subjects must be a non-empty mapping")
+
+    subjects: dict[str, SubjectRoute] = {}
+    for abbr, payload in subjects_cfg.items():
+        if not isinstance(payload, dict):
+            raise ValueError(f"downstream.subjects.{abbr} must be a mapping")
+        subjects[abbr] = SubjectRoute(
+            gh_course_dir=str(payload["gh_course_dir"]),
+            obsidian_course_dir=str(payload["obsidian_course_dir"]),
+            display_name=str(payload.get("display_name", abbr)),
+            obsidian_note_dir=str(payload.get("obsidian_note_dir", "강의록")),
+        )
+
+    return DownstreamConfig(
+        correction_dir=correction_dir,
+        summary_dir=summary_dir,
+        gh_current_semester_root=gh_root,
+        obsidian_semester_root=obsidian_root,
+        db_path=db_path,
+        log_jsonl_path=log_jsonl_path,
+        lock_path=lock_path,
+        scan_interval_sec=scan_interval_sec,
+        stable_for_sec=stable_for_sec,
+        subjects=subjects,
+    )
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Lecture downstream distribution worker")
+    parser.add_argument("--once", action="store_true", help="Run one scan and exit")
+    parser.add_argument("--dry-run", action="store_true", help="Plan actions without mutating files or DB")
+    parser.add_argument("--config", default="config/config.yaml", help="Path to config.yaml")
+    return parser.parse_args()
+
+
+def setup_logging() -> logging.Logger:
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    if logger.handlers:
+        return logger
+
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(handler)
+    return logger
+
+
+def run_worker(config: DownstreamConfig, *, dry_run: bool, run_once: bool) -> None:
+    with SingleInstanceLock(config.lock_path):
+        distributor = DownstreamDistributor(config, dry_run=dry_run)
+        try:
+            while True:
+                stats = distributor.scan_once()
+                logger.info("downstream scan stats=%s dry_run=%s", stats, dry_run)
+                if run_once:
+                    return
+                time.sleep(config.scan_interval_sec)
+        finally:
+            distributor.close()
+
+
+def main() -> None:
+    args = parse_args()
+    setup_logging()
+    config = load_worker_config(args.config)
+    try:
+        run_worker(config, dry_run=args.dry_run, run_once=args.once)
+    except BlockingIOError:
+        logger.error("Another downstream worker is already running")
+        raise SystemExit(1)
+    except sqlite3.Error as exc:
+        logger.error("Downstream DB error: %s", exc)
+        raise SystemExit(1)
+    except KeyboardInterrupt:
+        logger.info("Downstream worker interrupted")
+    except Exception as exc:
+        logger.exception("Downstream worker failed: %s", exc)
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()

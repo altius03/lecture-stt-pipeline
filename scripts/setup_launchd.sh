@@ -45,7 +45,7 @@ print_ok "모델 준비 완료"
 # ── 5. iCloud 폴더 생성 ──────────────────────────────────────
 print_step "iCloud 녹음 폴더 생성"
 ICLOUD_BASE="$HOME/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings"
-for dir in 00_inbox 01_audio 02_transcripts 99_errors; do
+for dir in 00_inbox 01_audio 02_transcripts 03_correction 04_summarize 05_prompt 99_errors; do
   mkdir -p "$ICLOUD_BASE/$dir"
   print_ok "$dir"
 done
@@ -62,6 +62,7 @@ mkdir -p "$LAUNCH_AGENTS"
 PLISTS=(
   "com.geonha.lecture-stt"
   "com.geonha.lecture-stt-cleanup"
+  "com.geonha.lecture-stt-distribute"
   "com.geonha.lecture-stt-webpanel"
 )
 

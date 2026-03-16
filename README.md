@@ -7,6 +7,8 @@
 - 실패 폴더: `99_errors`
 - 관리 폴더
   - `01_audio`: 변환 전 임시 원본 보관
+  - `03_correction`: LLM 교정 결과
+  - `04_summarize`: LLM 요약 결과
   - `state/jobs.sqlite3`: 처리 이력 DB
   - `logs/app.log`: 실행 로그
 
@@ -15,6 +17,8 @@
 - 인박스: `/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings/00_inbox`
 - 오디오 임시 보관: `/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings/01_audio`
 - 텍스트: `/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings/02_transcripts`
+- 교정: `/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings/03_correction`
+- 요약: `/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings/04_summarize`
 - 오류: `/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings/99_errors`
 - 임시 폴더: `/Users/geonha/lecture_stt/tmp`
 - DB: `/Users/geonha/lecture_stt/state/jobs.sqlite3`
@@ -103,6 +107,32 @@ WEB_PANEL_HOST=127.0.0.1 WEB_PANEL_PORT=8765 bash /Users/geonha/lecture_stt/scri
 ```
 
 - 원격 사용은 SSH 터널을 권장합니다.
+
+### 5.4 Stage 5 downstream 배포 worker
+- 1회 실행
+```bash
+bash /Users/geonha/lecture_stt/scripts/distribute_once.sh
+```
+
+- dry-run
+```bash
+bash /Users/geonha/lecture_stt/scripts/distribute_once.sh --dry-run
+```
+
+- 상시 실행
+```bash
+bash /Users/geonha/lecture_stt/scripts/run_distribute.sh
+```
+
+- launchd 등록 시
+  - `/Users/geonha/lecture_stt/launchd/com.geonha.lecture-stt-distribute.plist`
+  - `bash /Users/geonha/lecture_stt/scripts/setup_launchd.sh` 실행 시 함께 등록됩니다.
+
+- 동작 규칙
+  - correction은 `{stem}.txt` + `{stem}.json` pair 단위로만 배포됩니다.
+  - summary는 correction 이력이 확인될 때만 TUK/Obsidian으로 배포됩니다.
+  - overwrite는 하지 않으며, 동일 파일은 hash 비교 후 idempotent하게 처리합니다.
+  - 구조화 로그는 `/Users/geonha/lecture_stt/state/logs/downstream.jsonl`에 기록됩니다.
 
 ## 6. 운영 확인
 1. 폴더 파일 수 확인
