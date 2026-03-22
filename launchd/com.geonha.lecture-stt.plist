@@ -12,8 +12,8 @@
     <string>/Users/geonha/lecture_stt</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/geonha/lecture_stt/.venv/bin/python</string>
-        <string>/Users/geonha/lecture_stt/src/main.py</string>
+        <string>/bin/bash</string>
+        <string>/Users/geonha/lecture_stt/scripts/run_worker.sh</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>

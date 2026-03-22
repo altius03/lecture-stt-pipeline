@@ -14,6 +14,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Union
 
+from lecture_stt.shared.paths import pause_flag_path
+
 
 logger = logging.getLogger(__name__)
 
@@ -205,7 +207,7 @@ def get_pause_flag_path(config: dict | None = None) -> Path:
             except Exception:
                 pass
 
-    return Path("/Users/geonha/lecture_stt/state/paused")
+    return pause_flag_path()
 
 
 def is_paused(config: dict | None = None) -> bool:

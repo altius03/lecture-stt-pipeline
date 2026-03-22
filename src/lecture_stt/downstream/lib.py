@@ -12,8 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, Optional
 
-import db
-import utils
+from lecture_stt.shared import db, utils
 
 
 logger = logging.getLogger(__name__)

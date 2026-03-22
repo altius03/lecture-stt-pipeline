@@ -1,17 +1,47 @@
 #!/usr/bin/env bash
 # ============================================================
 # lecture-stt 원클릭 설치 스크립트
-# 사용법: bash /Users/geonha/lecture_stt/scripts/setup_launchd.sh
+# 사용법: bash <repo>/scripts/setup_launchd.sh
 # ============================================================
 set -euo pipefail
 
-REPO="/Users/geonha/lecture_stt"
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LAUNCH_AGENTS="$HOME/Library/LaunchAgents"
 uid=$(id -u)
 
 print_step() { echo ""; echo "▶ $1"; }
 print_ok()   { echo "  ✅ $1"; }
 print_fail() { echo "  ❌ $1"; }
+
+render_plist() {
+  local src="$1"
+  local dst="$2"
+  /usr/bin/python3 - "$src" "$dst" "$REPO" <<'PY'
+import plistlib
+import sys
+from pathlib import Path
+
+src = Path(sys.argv[1])
+dst = Path(sys.argv[2])
+repo = sys.argv[3]
+legacy_root = "/Users/geonha/lecture_stt"
+
+def rewrite(value):
+    if isinstance(value, dict):
+        return {key: rewrite(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [rewrite(item) for item in value]
+    if isinstance(value, str):
+        return value.replace(legacy_root, repo)
+    return value
+
+with src.open("rb") as handle:
+    payload = plistlib.load(handle)
+
+with dst.open("wb") as handle:
+    plistlib.dump(rewrite(payload), handle, sort_keys=False)
+PY
+}
 
 # ── 1. 가상환경 ──────────────────────────────────────────────
 print_step "가상환경 확인"
@@ -73,7 +103,7 @@ for label in "${PLISTS[@]}"; do
   # 기존 등록 해제 (오류 무시)
   launchctl bootout "gui/$uid" "$dst" 2>/dev/null || true
 
-  cp "$src" "$dst"
+  render_plist "$src" "$dst"
   launchctl bootstrap "gui/$uid" "$dst"
   launchctl kickstart -k "gui/$uid/$label"
   print_ok "$label 등록 완료"

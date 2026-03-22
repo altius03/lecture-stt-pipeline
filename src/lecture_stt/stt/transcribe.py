@@ -10,7 +10,7 @@ from typing import List, Tuple
 
 from faster_whisper import WhisperModel
 
-from utils import ensure_dir
+from lecture_stt.shared.utils import ensure_dir
 
 logger = logging.getLogger(__name__)
 

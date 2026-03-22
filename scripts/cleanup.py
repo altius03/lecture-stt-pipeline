@@ -10,14 +10,16 @@ import yaml
 from dotenv import load_dotenv
 
 
-def _load_config(config_path: str = "/Users/geonha/lecture_stt/config/config.yaml") -> dict:
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _load_config(config_path: str = str(REPO_ROOT / "config" / "config.yaml")) -> dict:
     # 실행에 필요한 설정을 읽고 없으면 기본 예시를 fallback으로 사용한다.
-    repo_root = Path("/Users/geonha/lecture_stt")
     config_path = Path(config_path)
     if not config_path.is_absolute():
-        config_path = repo_root / config_path
+        config_path = REPO_ROOT / config_path
 
-    example_path = repo_root / "config" / "config.example.yaml"
+    example_path = REPO_ROOT / "config" / "config.example.yaml"
     if not config_path.exists():
         if example_path.exists():
             config_path = example_path
@@ -33,7 +35,7 @@ def _ensure_config_defaults(config: dict) -> dict:
         "paths": {
             "stable_audio_folder": "/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings/01_audio",
             "transcript_folder": "/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings/02_transcripts",
-            "tmp_dir": "/Users/geonha/lecture_stt/tmp",
+            "tmp_dir": str(REPO_ROOT / "tmp"),
         },
         "cleanup": {
             "retain_days": 7,
@@ -147,7 +149,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Cleanup old lecture STT artifacts")
     parser.add_argument(
         "--config",
-        default="/Users/geonha/lecture_stt/config/config.yaml",
+        default=str(REPO_ROOT / "config" / "config.yaml"),
         help="Path to config.yaml",
     )
     parser.add_argument(
@@ -164,7 +166,7 @@ def main() -> None:
 
     dry_run = args.dry_run and not args.apply
 
-    load_dotenv("/Users/geonha/lecture_stt/.env", override=False)
+    load_dotenv(str(REPO_ROOT / ".env"), override=False)
     cfg = _ensure_config_defaults(_load_config(args.config))
 
     audio_dir = Path(cfg["paths"]["stable_audio_folder"])

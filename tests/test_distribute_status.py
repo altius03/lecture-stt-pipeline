@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout, redirect_stderr
 from pathlib import Path
+from unittest import mock
 
 import sys
 
@@ -13,8 +14,8 @@ SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-import db  # noqa: E402
-import distribute_status  # noqa: E402
+from lecture_stt.downstream import status as distribute_status  # noqa: E402
+from lecture_stt.shared import db  # noqa: E402
 
 
 class DistributeStatusCliTests(unittest.TestCase):
@@ -70,6 +71,16 @@ class DistributeStatusCliTests(unittest.TestCase):
         with redirect_stdout(stdout), redirect_stderr(stderr):
             code = distribute_status.main(["--db-path", str(self.db_path), *args])
         return code, stdout.getvalue(), stderr.getvalue()
+
+    def test_resolve_db_path_override_skips_worker_config_import(self) -> None:
+        args = distribute_status.parse_args(["--db-path", str(self.db_path), "summary"])
+        with mock.patch.object(
+            distribute_status,
+            "_load_worker_config_from_module",
+            side_effect=AssertionError("worker config import should be skipped"),
+        ):
+            resolved = distribute_status.resolve_db_path(args)
+        self.assertEqual(resolved, self.db_path)
 
     def test_summary_shows_aggregate_counts_and_problem_rows(self) -> None:
         code, stdout, _ = self._run("summary", "--limit", "5")

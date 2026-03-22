@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-import utils as utils
+from lecture_stt.shared import utils
 
 
 STATUS_PENDING = "PENDING"

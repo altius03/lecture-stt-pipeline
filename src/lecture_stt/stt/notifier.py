@@ -6,6 +6,8 @@ from typing import Any, Dict
 
 import requests
 
+from lecture_stt.shared.paths import state_dir as default_state_dir
+
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +19,7 @@ class DiscordNotifier:
     def __init__(self, webhook_url: str | None, state_dir: str | Path | None = None):
         # 웹훅 URL이 없으면 조용히 스킵한다.
         self.webhook_url = webhook_url
-        root = Path(state_dir) if state_dir else Path("/Users/geonha/lecture_stt/state")
+        root = Path(state_dir) if state_dir else default_state_dir()
         self.state_dir = root
         self._marker_dir = Path(self.state_dir) / "notified"
         if self.is_enabled():

@@ -10,6 +10,8 @@ from collections import deque
 from datetime import datetime
 from pathlib import Path
 
+from lecture_stt.shared.paths import package_env, repo_root, venv_python
+
 _YAML_IMPORT_ERROR: Exception | None = None
 try:
     import yaml
@@ -46,8 +48,8 @@ class STTControlPanel(tk.Tk):
         super().__init__()
         self.repo_root = repo_root
         self.config_path = self.repo_root / "config" / "config.yaml"
-        self.main_script = self.repo_root / "src" / "main.py"
-        self.python_bin = self.repo_root / ".venv" / "bin" / "python"
+        self.worker_module = "lecture_stt.stt.main"
+        self.python_bin = venv_python()
         if not self.python_bin.exists():
             self.python_bin = Path(sys.executable)
 
@@ -125,6 +127,8 @@ class STTControlPanel(tk.Tk):
                     text=True,
                     timeout=15,
                     check=False,
+                    env=package_env(),
+                    cwd=str(self.repo_root),
                 )
             except Exception as exc:
                 errors.append(f"{candidate}: {exc}")
@@ -264,14 +268,22 @@ class STTControlPanel(tk.Tk):
         self.jobs_tree.tag_configure("ERROR", foreground="#9f1d1d")
 
     def _worker_cmd(self, *extra: str) -> list[str]:
-        cmd = [str(self.python_bin), str(self.main_script)]
+        cmd = [str(self.python_bin), "-m", self.worker_module]
         cmd.extend(extra)
         return cmd
 
     def _run_main_cmd(self, *extra: str) -> str:
         # pause/resume/status 같은 제어 커맨드를 동기 호출한다.
         cmd = self._worker_cmd(*extra, "--config", str(self.config_path))
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=20, check=False)
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+            env=package_env(),
+            cwd=str(self.repo_root),
+        )
         if result.returncode != 0:
             stderr = (result.stderr or "").strip()
             stdout = (result.stdout or "").strip()
@@ -280,10 +292,10 @@ class STTControlPanel(tk.Tk):
         return (result.stdout or "").strip()
 
     def _find_worker_pids(self) -> list[int]:
-        # 외부에서 실행된 워커도 감지할 수 있도록 process 목록에서 main.py를 찾는다.
+        # 외부에서 실행된 워커도 감지할 수 있도록 process 목록에서 STT 모듈을 찾는다.
         try:
             result = subprocess.run(
-                ["pgrep", "-f", str(self.main_script)],
+                ["pgrep", "-f", self.worker_module],
                 capture_output=True,
                 text=True,
                 check=False,
@@ -320,6 +332,7 @@ class STTControlPanel(tk.Tk):
             self.worker_proc = subprocess.Popen(
                 cmd,
                 cwd=str(self.repo_root),
+                env=package_env(),
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
@@ -513,9 +526,9 @@ def main() -> None:
             "Use a Python build with tkinter support."
         ) from _TK_IMPORT_ERROR
 
-    repo_root = Path("/Users/geonha/lecture_stt")
+    root = repo_root()
     try:
-        app = STTControlPanel(repo_root=repo_root)
+        app = STTControlPanel(repo_root=root)
     except Exception as exc:
         raise RuntimeError(f"Failed to initialize GUI: {exc}") from exc
     app.mainloop()

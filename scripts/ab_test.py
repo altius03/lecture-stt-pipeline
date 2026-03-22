@@ -20,9 +20,9 @@ from pathlib import Path
 # 프로젝트 src를 import 경로에 추가
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from transcribe import EngineParams, STTWorker
-from postprocess import postprocess
-from quality_gate import evaluate as quality_evaluate
+from lecture_stt.stt.postprocess import postprocess
+from lecture_stt.stt.quality_gate import evaluate as quality_evaluate
+from lecture_stt.stt.transcribe import EngineParams, STTWorker
 
 
 def build_params(
@@ -85,7 +85,7 @@ def main():
     parser = argparse.ArgumentParser(description="A/B 테스트")
     parser.add_argument("--audio", required=True, help="테스트할 오디오 파일 경로")
     parser.add_argument("--ffmpeg", default="/opt/homebrew/bin/ffmpeg")
-    parser.add_argument("--tmp", default="/Users/geonha/lecture_stt/tmp")
+    parser.add_argument("--tmp", default=str(Path(__file__).resolve().parents[1] / "tmp"))
     args = parser.parse_args()
 
     audio_path = Path(args.audio)

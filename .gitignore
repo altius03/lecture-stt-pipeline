@@ -29,3 +29,8 @@ tmp/
 .venv/
 .idea/
 .DS_Store
+frontend/web-panel/node_modules/
+frontend/web-panel/dist/
+frontend/web-panel/*.tsbuildinfo
+frontend/web-panel/vite.config.js
+frontend/web-panel/vite.config.d.ts

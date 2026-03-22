@@ -13,8 +13,7 @@ SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-import db  # noqa: E402
-from distribute_lib import (  # noqa: E402
+from lecture_stt.downstream.lib import (  # noqa: E402
     CORRECTION_STATUS_CONFLICT,
     CORRECTION_STATUS_DELIVERED,
     CORRECTION_STATUS_ERROR,
@@ -26,6 +25,7 @@ from distribute_lib import (  # noqa: E402
     DownstreamDistributor,
     default_subject_routes,
 )
+from lecture_stt.shared import db  # noqa: E402
 
 
 class DownstreamDistributorTests(unittest.TestCase):

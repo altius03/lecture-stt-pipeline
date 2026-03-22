@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List
 
-import utils as utils
+from lecture_stt.shared import utils
 
 
 @dataclass

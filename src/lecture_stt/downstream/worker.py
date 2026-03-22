@@ -11,12 +11,13 @@ from typing import Any
 
 import yaml
 
-from distribute_lib import (
+from lecture_stt.downstream.lib import (
     DownstreamConfig,
     DownstreamDistributor,
     SubjectRoute,
     default_subject_routes,
 )
+from lecture_stt.shared.paths import default_db_path, repo_root, state_dir
 
 try:
     import fcntl
@@ -59,9 +60,10 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
 
 def _default_config() -> dict[str, Any]:
     default_subjects = default_subject_routes()
+    state_root = state_dir()
     return {
         "paths": {
-            "db_path": "/Users/geonha/lecture_stt/state/jobs.sqlite3",
+            "db_path": str(default_db_path()),
         },
         "downstream": {
             "scan_interval_sec": 30,
@@ -70,8 +72,8 @@ def _default_config() -> dict[str, Any]:
             "summary_folder": "/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings/04_summarize",
             "gh_current_semester_root": "/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/GH_archive/01_TUK/01_current_semester",
             "obsidian_semester_root": "/Users/geonha/Library/Mobile Documents/iCloud~md~obsidian/Documents/99_obsidian/StudyVaults/2-1",
-            "log_jsonl_path": "/Users/geonha/lecture_stt/state/logs/downstream.jsonl",
-            "lock_path": "/Users/geonha/lecture_stt/state/downstream.lock",
+            "log_jsonl_path": str(state_root / "logs" / "downstream.jsonl"),
+            "lock_path": str(state_root / "downstream.lock"),
             "subjects": {
                 abbr: {
                     "gh_course_dir": route.gh_course_dir,
@@ -86,10 +88,10 @@ def _default_config() -> dict[str, Any]:
 
 
 def load_worker_config(config_path: str = "config/config.yaml") -> DownstreamConfig:
-    repo_root = Path(__file__).resolve().parents[1]
+    root = repo_root()
     path = Path(config_path)
     if not path.is_absolute():
-        path = repo_root / path
+        path = root / path
     if not path.exists():
         raise FileNotFoundError(f"Missing required config file: {path}")
 
@@ -102,7 +104,7 @@ def load_worker_config(config_path: str = "config/config.yaml") -> DownstreamCon
     paths_cfg = merged.get("paths") or {}
     downstream_cfg = merged.get("downstream") or {}
 
-    db_path = Path(paths_cfg.get("db_path", "/Users/geonha/lecture_stt/state/jobs.sqlite3")).expanduser()
+    db_path = Path(paths_cfg.get("db_path", str(default_db_path()))).expanduser()
     correction_dir = Path(downstream_cfg["correction_folder"]).expanduser()
     summary_dir = Path(downstream_cfg["summary_folder"]).expanduser()
     gh_root = Path(downstream_cfg["gh_current_semester_root"]).expanduser()

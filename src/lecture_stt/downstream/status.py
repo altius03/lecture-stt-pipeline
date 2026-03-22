@@ -1,18 +1,25 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import sqlite3
 import sys
 from pathlib import Path
 from typing import Iterable, Sequence
 
-import db
+from lecture_stt.shared import db
+from lecture_stt.shared.paths import default_db_path
 
 
-DEFAULT_DB_PATH = Path("/Users/geonha/lecture_stt/state/jobs.sqlite3")
+DEFAULT_DB_PATH = default_db_path()
 PROBLEM_CORRECTION_STATUSES = {"INCOMPLETE", "CONFLICT", "ERROR"}
 PROBLEM_SUMMARY_STATUSES = {"BLOCKED", "CONFLICT", "ERROR"}
+
+
+def _load_worker_config_from_module(config_path: str):
+    worker = importlib.import_module("lecture_stt.downstream.worker")
+    return worker.load_worker_config(config_path)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -47,9 +54,7 @@ def resolve_db_path(args: argparse.Namespace) -> Path:
     if args.db_path:
         return Path(args.db_path).expanduser()
     try:
-        from distribute_worker import load_worker_config
-
-        return load_worker_config(args.config).db_path
+        return _load_worker_config_from_module(args.config).db_path
     except FileNotFoundError:
         return DEFAULT_DB_PATH
 

@@ -14,27 +14,27 @@ from typing import Any, Dict
 from dotenv import load_dotenv
 import yaml
 
-import db as db
-from db import (
+from lecture_stt.shared import db, utils
+from lecture_stt.shared.db import (
     STATUS_DONE,
     STATUS_ERROR,
     STATUS_PENDING,
     STATUS_PROCESSING,
 )
-from notifier import DiscordNotifier
-from postprocess import postprocess
-from quality_gate import evaluate as quality_evaluate
-from transcribe import EngineParams, STTWorker
-from watcher import PollingWatcher
-import utils
+from lecture_stt.shared.paths import default_db_path, env_file, repo_root
+from lecture_stt.stt.notifier import DiscordNotifier
+from lecture_stt.stt.postprocess import postprocess
+from lecture_stt.stt.quality_gate import evaluate as quality_evaluate
+from lecture_stt.stt.transcribe import EngineParams, STTWorker
+from lecture_stt.stt.watcher import PollingWatcher
 
 
 # 설정 파일을 읽고 기본 형식 유효성을 검사한다.
 def load_config(config_path: str = "config/config.yaml") -> dict:
-    repo_root = Path(__file__).resolve().parents[1]
+    root = repo_root()
     explicit = Path(config_path)
     if not explicit.is_absolute():
-        explicit = repo_root / explicit
+        explicit = root / explicit
     if not explicit.exists():
         raise FileNotFoundError(f"Missing required config file: {explicit}")
     if explicit.stat().st_size == 0:
@@ -210,6 +210,7 @@ def validate_config(config_path: str, config: dict) -> dict:
 
 # 환경설정에서 누락된 값은 기본값으로 채워 코드 실행 안정성을 높인다.
 def _ensure_config_defaults(config: dict) -> dict:
+    root = repo_root()
     defaults = {
         "app": {
             "polling_interval_sec": 10,
@@ -221,8 +222,8 @@ def _ensure_config_defaults(config: dict) -> dict:
             "stable_audio_folder": "/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings/01_audio",
             "transcript_folder": "/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings/02_transcripts",
             "error_folder": "/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings/99_errors",
-            "tmp_dir": "/Users/geonha/lecture_stt/tmp",
-            "db_path": "/Users/geonha/lecture_stt/state/jobs.sqlite3",
+            "tmp_dir": str(root / "tmp"),
+            "db_path": str(default_db_path()),
         },
         "engine": {"engine": "faster-whisper"},
         "transcribe": {
@@ -951,22 +952,23 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     # 진입점: 제어 커맨드를 우선 처리하고, 기본 실행은 파이프라인 시작이다.
     args = parse_args()
-    load_dotenv("/Users/geonha/lecture_stt/.env", override=False)
+    load_dotenv(str(env_file()), override=False)
 
     if args.pause or args.resume or args.status:
+        control_config = _ensure_config_defaults(load_config(args.config))
         if args.pause:
-            utils.set_paused(True)
-            print(f"Paused: pause flag created at {utils.get_pause_flag_path()}")
+            utils.set_paused(True, control_config)
+            print(f"Paused: pause flag created at {utils.get_pause_flag_path(control_config)}")
             return
         if args.resume:
-            utils.set_paused(False)
-            print(f"Resumed: pause flag removed at {utils.get_pause_flag_path()}")
+            utils.set_paused(False, control_config)
+            print(f"Resumed: pause flag removed at {utils.get_pause_flag_path(control_config)}")
             return
 
-        paused = utils.is_paused()
+        paused = utils.is_paused(control_config)
         state = "PAUSED" if paused else "RESUMED"
         print(f"Pipeline status: {state}")
-        print(f"Pause flag: {utils.get_pause_flag_path()}")
+        print(f"Pause flag: {utils.get_pause_flag_path(control_config)}")
         return
 
     config = load_config(args.config)
