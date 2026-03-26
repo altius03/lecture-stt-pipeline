@@ -18,7 +18,8 @@ def react_dist_dir(root: Path | None = None) -> Path:
     return base_root / "frontend" / "web-panel" / "dist"
 
 
-def render_react_placeholder() -> str:
+def render_react_placeholder(root: Path | None = None) -> str:
+    frontend_root = (root or repo_root()) / "frontend" / "web-panel"
     return """<!doctype html>
 <html lang="ko">
 <head>
@@ -77,7 +78,7 @@ def render_react_placeholder() -> str:
       <p>React 웹 패널 골격은 저장소에 추가됐지만, 현재는 빌드 산출물 <code>frontend/web-panel/dist</code>가 없어서 레거시 패널만 바로 열립니다.</p>
       <p>지금은 기존 패널을 <code>/</code>에서 계속 사용할 수 있고, React 패널은 빌드 후 <code>/app</code>에서 열립니다.</p>
       <ol class="steps">
-        <li><code>cd /Users/geonha/lecture_stt/frontend/web-panel</code></li>
+        <li><code>cd __FRONTEND_ROOT__</code></li>
         <li><code>npm install</code></li>
         <li><code>npm run build</code></li>
         <li>브라우저에서 <code>http://127.0.0.1:8765/app</code> 접속</li>
@@ -85,7 +86,7 @@ def render_react_placeholder() -> str:
     </section>
   </main>
 </body>
-</html>"""
+</html>""".replace("__FRONTEND_ROOT__", html.escape(str(frontend_root)))
 
 
 def _resolve_react_asset(request_path: str) -> Path | None:

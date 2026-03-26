@@ -50,6 +50,10 @@ class WebPanelRequestHandlerTests(unittest.TestCase):
         self.assertEqual(args[0], 200)
         self.assertIn("React 패널 빌드가 아직 없습니다", args[1])
 
+    def test_placeholder_uses_runtime_repo_root_in_instructions(self) -> None:
+        rendered = web_panel.render_react_placeholder(Path("/tmp/lecture-stt-alt"))
+        self.assertIn("/tmp/lecture-stt-alt/frontend/web-panel", rendered)
+
     def test_api_post_routes_dispatch_to_expected_handlers(self) -> None:
         routes = {
             "/api/start": "_action_start",
