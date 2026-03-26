@@ -1,5 +1,4 @@
-import { JobsTableCard } from "./components/panel/JobsTableCard"
-import { LogPanelCard } from "./components/panel/LogPanelCard"
+import { ActivityPanel } from "./components/panel/ActivityPanel"
 import { PanelHero } from "./components/panel/PanelHero"
 import { ProcessingCard } from "./components/panel/ProcessingCard"
 import { RuntimeCard } from "./components/panel/RuntimeCard"
@@ -15,7 +14,19 @@ import { FALLBACK_PANEL_ENDPOINTS } from "./lib/panelApi"
 
 export default function App() {
   const { theme, setThemeMode } = useThemeMode()
-  const { state, isLoading, error, pendingAction, runAction, retry, logResetKey, realtimeConnected } = usePanelState()
+  const {
+    state,
+    isLoading,
+    error,
+    pendingAction,
+    pendingNotificationSelection,
+    pendingNotificationApplyNow,
+    runAction,
+    saveNotificationSelection,
+    retry,
+    logResetKey,
+    realtimeConnected,
+  } = usePanelState()
   const {
     logs,
     error: logsError,
@@ -83,7 +94,13 @@ export default function App() {
         runtimeState={state.runtime_state}
         summary={state.summary}
         realtimeConnected={realtimeConnected}
+        notification={state.notification}
+        pendingNotificationSelection={pendingNotificationSelection}
+        pendingNotificationApplyNow={pendingNotificationApplyNow}
         theme={theme}
+        onNotificationSave={(selection, applyNow) => {
+          void saveNotificationSelection(selection, applyNow)
+        }}
         onThemeChange={setThemeMode}
       />
 
@@ -112,24 +129,22 @@ export default function App() {
         <ProcessingCard jobs={state.processing_v2} />
       </section>
 
-      <section className="content-layout">
-        <JobsTableCard jobs={state.jobs_v2} />
-        <div className="side-stack">
-          <LogPanelCard
-            logs={logs}
-            error={logsError}
-            logRef={logRef}
-            autoFollow={autoFollow}
-            hasUnread={hasUnread}
-            pendingAction={pendingAction}
-            onLogScroll={handleLogScroll}
-            onToggleAutoFollow={setAutoFollow}
-            onJumpToLatest={jumpToLatest}
-            onAction={(action) => {
-              void runAction(action)
-            }}
-          />
-        </div>
+      <section className="content-layout single-column">
+        <ActivityPanel
+          jobs={state.jobs_v2}
+          logs={logs}
+          error={logsError}
+          logRef={logRef}
+          autoFollow={autoFollow}
+          hasUnread={hasUnread}
+          pendingAction={pendingAction}
+          onLogScroll={handleLogScroll}
+          onToggleAutoFollow={setAutoFollow}
+          onJumpToLatest={jumpToLatest}
+          onAction={(action) => {
+            void runAction(action)
+          }}
+        />
       </section>
     </main>
   )

@@ -17,7 +17,14 @@ from lecture_stt.downstream.lib import (
     SubjectRoute,
     default_subject_routes,
 )
-from lecture_stt.shared.paths import default_db_path, repo_root, state_dir
+from lecture_stt.shared.paths import (
+    default_db_path,
+    env_file,
+    repo_root,
+    resolve_config_path,
+    runtime_env,
+    state_dir,
+)
 
 try:
     import fcntl
@@ -68,10 +75,6 @@ def _default_config() -> dict[str, Any]:
         "downstream": {
             "scan_interval_sec": 30,
             "stable_for_sec": 60,
-            "correction_folder": "/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings/03_correction",
-            "summary_folder": "/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings/04_summarize",
-            "gh_current_semester_root": "/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/GH_archive/01_TUK/01_current_semester",
-            "obsidian_semester_root": "/Users/geonha/Library/Mobile Documents/iCloud~md~obsidian/Documents/99_obsidian/StudyVaults/2-1",
             "log_jsonl_path": str(state_root / "logs" / "downstream.jsonl"),
             "lock_path": str(state_root / "downstream.lock"),
             "subjects": {
@@ -104,13 +107,26 @@ def load_worker_config(config_path: str = "config/config.yaml") -> DownstreamCon
     paths_cfg = merged.get("paths") or {}
     downstream_cfg = merged.get("downstream") or {}
 
-    db_path = Path(paths_cfg.get("db_path", str(default_db_path()))).expanduser()
-    correction_dir = Path(downstream_cfg["correction_folder"]).expanduser()
-    summary_dir = Path(downstream_cfg["summary_folder"]).expanduser()
-    gh_root = Path(downstream_cfg["gh_current_semester_root"]).expanduser()
-    obsidian_root = Path(downstream_cfg["obsidian_semester_root"]).expanduser()
-    log_jsonl_path = Path(downstream_cfg["log_jsonl_path"]).expanduser()
-    lock_path = Path(downstream_cfg["lock_path"]).expanduser()
+    env = runtime_env(dotenv_path=env_file())
+
+    required_path_keys = [
+        "correction_folder",
+        "summary_folder",
+        "gh_current_semester_root",
+        "obsidian_semester_root",
+    ]
+    for key in required_path_keys:
+        value = downstream_cfg.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"downstream.{key} must be a non-empty path string")
+
+    db_path = resolve_config_path(str(paths_cfg.get("db_path", str(default_db_path()))), env=env)
+    correction_dir = resolve_config_path(str(downstream_cfg["correction_folder"]), env=env)
+    summary_dir = resolve_config_path(str(downstream_cfg["summary_folder"]), env=env)
+    gh_root = resolve_config_path(str(downstream_cfg["gh_current_semester_root"]), env=env)
+    obsidian_root = resolve_config_path(str(downstream_cfg["obsidian_semester_root"]), env=env)
+    log_jsonl_path = resolve_config_path(str(downstream_cfg["log_jsonl_path"]), env=env)
+    lock_path = resolve_config_path(str(downstream_cfg["lock_path"]), env=env)
 
     scan_interval_sec = int(downstream_cfg["scan_interval_sec"])
     stable_for_sec = int(downstream_cfg["stable_for_sec"])

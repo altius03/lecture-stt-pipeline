@@ -10,10 +10,14 @@ import time
 from collections import deque
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from lecture_stt.shared import db
-from lecture_stt.shared.paths import package_env, venv_python
+from lecture_stt.shared.paths import env_file, package_env, resolve_config_path, runtime_env, venv_python
 import yaml
+
+
+NOTIFICATION_SELECTIONS = ("telegram", "discord", "both", "disabled")
 
 
 class ControlState:
@@ -37,16 +41,22 @@ class ControlState:
         self.notice = "대기중"
         self._shutdown_handler = None
         self._poll_boost_until = 0.0
+        self._notification_restart_required = False
 
         self.config_data = self._load_config()
         paths = self.config_data.get("paths", {})
-        self.db_path = Path(paths.get("db_path", self.repo_root / "state" / "jobs.sqlite3"))
+        resolved_env = runtime_env(dotenv_path=env_file(self.repo_root))
+        self.db_path = resolve_config_path(
+            str(paths.get("db_path", "state/jobs.sqlite3")),
+            base_dir=self.repo_root,
+            env=resolved_env,
+        )
         self.pause_flag = self.db_path.parent / "paused"
         self.log_path = self._resolve_log_path()
-        self.watch_folder = Path(paths.get("watch_folder", ""))
-        self.audio_folder = Path(paths.get("stable_audio_folder", ""))
-        self.transcript_folder = Path(paths.get("transcript_folder", ""))
-        self.error_folder = Path(paths.get("error_folder", ""))
+        self.watch_folder = self._resolve_optional_path(paths.get("watch_folder"))
+        self.audio_folder = self._resolve_optional_path(paths.get("stable_audio_folder"))
+        self.transcript_folder = self._resolve_optional_path(paths.get("transcript_folder"))
+        self.error_folder = self._resolve_optional_path(paths.get("error_folder"))
         self._ensure_db_schema()
 
     def _ensure_db_schema(self) -> None:
@@ -108,13 +118,210 @@ class ControlState:
             raise ValueError(f"Invalid config format: {self.config_path}")
         return loaded
 
+    def _save_config(self, config_data: dict[str, Any]) -> None:
+        with self.config_path.open("w", encoding="utf-8") as handle:
+            yaml.safe_dump(config_data, handle, allow_unicode=True, sort_keys=False)
+        self.config_data = config_data
+
+    def _runtime_env(self) -> dict[str, str]:
+        return runtime_env(dotenv_path=env_file(self.repo_root))
+
+    @staticmethod
+    def _notification_defaults() -> dict[str, Any]:
+        return {
+            "provider": "auto",
+            "enabled": True,
+            "send_start": True,
+            "send_success": True,
+            "send_failure": True,
+            "dual_send_providers": [],
+        }
+
+    def _notification_config(self) -> dict[str, Any]:
+        current = self.config_data.get("notification")
+        merged = self._notification_defaults()
+        if isinstance(current, dict):
+            merged.update(current)
+        return merged
+
+    def _notification_availability(self) -> dict[str, bool]:
+        runtime_env = self._runtime_env()
+        return {
+            "telegram": bool(runtime_env.get("TELEGRAM_BOT_TOKEN") and runtime_env.get("TELEGRAM_CHAT_ID")),
+            "discord": bool(runtime_env.get("DISCORD_WEBHOOK_URL")),
+        }
+
+    @staticmethod
+    def _normalize_dual_send(value: Any) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            items = [item.strip().lower() for item in value.split(",")]
+            return [item for item in items if item]
+        if isinstance(value, list):
+            return [str(item).strip().lower() for item in value if str(item).strip()]
+        return []
+
+    def _notification_selection(self) -> str:
+        notification_cfg = self._notification_config()
+        if not bool(notification_cfg.get("enabled", True)):
+            return "disabled"
+
+        provider = str(notification_cfg.get("provider", "auto") or "auto").strip().lower()
+        dual_send = set(self._normalize_dual_send(notification_cfg.get("dual_send_providers")))
+        availability = self._notification_availability()
+
+        if provider == "noop":
+            return "disabled"
+        if {"telegram", "discord"}.issubset(dual_send | {provider}):
+            return "both"
+        if provider == "telegram":
+            return "telegram"
+        if provider == "discord":
+            return "discord"
+        if provider == "auto":
+            if availability["telegram"]:
+                return "telegram"
+            if availability["discord"]:
+                return "discord"
+        return "disabled"
+
+    @staticmethod
+    def _notification_label(selection: str) -> str:
+        labels = {
+            "telegram": "텔레그램만",
+            "discord": "디스코드만",
+            "both": "둘 다",
+            "disabled": "끄기",
+        }
+        return labels.get(selection, "끄기")
+
+    def _notification_options(self) -> list[dict[str, object]]:
+        availability = self._notification_availability()
+        return [
+            {
+                "id": "telegram",
+                "label": "텔레그램만",
+                "description": "TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID가 필요합니다.",
+                "available": availability["telegram"],
+            },
+            {
+                "id": "discord",
+                "label": "디스코드만",
+                "description": "DISCORD_WEBHOOK_URL이 필요합니다.",
+                "available": availability["discord"],
+            },
+            {
+                "id": "both",
+                "label": "둘 다",
+                "description": "텔레그램과 디스코드 secret이 모두 필요합니다.",
+                "available": availability["telegram"] and availability["discord"],
+            },
+            {
+                "id": "disabled",
+                "label": "끄기",
+                "description": "알림 전송을 중단합니다.",
+                "available": True,
+            },
+        ]
+
+    def _notification_state(self, managed_running: bool, external_pids: list[int]) -> dict[str, object]:
+        selection = self._notification_selection()
+        can_apply_now = bool(managed_running or external_pids)
+        apply_label = (
+            "변경하면 실행 중 워커에 즉시 적용됩니다."
+            if can_apply_now
+            else "다음 시작부터 적용됩니다."
+        )
+        return {
+            "selection": selection,
+            "selected_label": self._notification_label(selection),
+            "apply_label": apply_label,
+            "restart_required": self._notification_restart_required,
+            "can_apply_now": can_apply_now,
+            "options": self._notification_options(),
+        }
+
+    def update_notification_selection(self, selection: str) -> None:
+        normalized = str(selection or "").strip().lower()
+        if normalized not in NOTIFICATION_SELECTIONS:
+            raise RuntimeError("지원하지 않는 알림 채널 선택입니다.")
+
+        availability = self._notification_availability()
+        if normalized == "telegram" and not availability["telegram"]:
+            raise RuntimeError("텔레그램 secret이 없어 선택할 수 없습니다.")
+        if normalized == "discord" and not availability["discord"]:
+            raise RuntimeError("디스코드 webhook이 없어 선택할 수 없습니다.")
+        if normalized == "both" and not (availability["telegram"] and availability["discord"]):
+            raise RuntimeError("둘 다를 선택하려면 텔레그램과 디스코드 설정이 모두 필요합니다.")
+
+        config_data = self._load_config()
+        notification_cfg = self._notification_defaults()
+        current_notification = config_data.get("notification")
+        if isinstance(current_notification, dict):
+            notification_cfg.update(current_notification)
+
+        if normalized == "telegram":
+            notification_cfg.update({"provider": "telegram", "enabled": True, "dual_send_providers": []})
+        elif normalized == "discord":
+            notification_cfg.update({"provider": "discord", "enabled": True, "dual_send_providers": []})
+        elif normalized == "both":
+            notification_cfg.update({"provider": "telegram", "enabled": True, "dual_send_providers": ["discord"]})
+        else:
+            notification_cfg.update({"provider": "noop", "enabled": False, "dual_send_providers": []})
+
+        config_data["notification"] = notification_cfg
+        self._save_config(config_data)
+
+        if self._is_managed_running() or self._find_worker_pids():
+            self._notification_restart_required = True
+            self.notice = "알림 채널이 저장되었습니다. 실행 중 워커에 즉시 적용합니다."
+        else:
+            self._notification_restart_required = False
+            self.notice = "알림 채널이 저장되었습니다. 다음 시작부터 적용됩니다."
+        self._set_poll_boost()
+
+    def _wait_for_worker_shutdown(self, timeout_sec: float = 8.0) -> bool:
+        deadline = time.monotonic() + max(0.0, timeout_sec)
+        while time.monotonic() < deadline:
+            if not self._is_managed_running() and not self._find_worker_pids():
+                return True
+            time.sleep(0.2)
+        return not self._is_managed_running() and not self._find_worker_pids()
+
+    def restart_worker_for_notification(self) -> None:
+        if not self._notification_restart_required:
+            self.notice = "재시작이 필요한 알림 변경이 없습니다."
+            self._set_poll_boost()
+            return
+
+        if not (self._is_managed_running() or self._find_worker_pids()):
+            self._notification_restart_required = False
+            self.notice = "실행 중 워커가 없어 재시작은 건너뛰었습니다. 다음 시작부터 적용됩니다."
+            self._set_poll_boost()
+            return
+
+        self.stop()
+        if "실패" in self.notice:
+            return
+        if not self._wait_for_worker_shutdown():
+            self.notice = "알림 채널은 저장했지만 기존 워커 종료가 지연되어 즉시 적용하지 못했습니다."
+            self._set_poll_boost()
+            return
+        self.start()
+        if self._is_managed_running():
+            self._notification_restart_required = False
+            self.notice = "알림 채널 변경을 즉시 적용했습니다."
+
     def _resolve_log_path(self) -> Path:
         logging_cfg = self.config_data.get("logging", {})
-        configured = logging_cfg.get("file", "logs/app.log")
-        path = Path(configured)
-        if not path.is_absolute():
-            path = self.repo_root / path
-        return path
+        configured = str(logging_cfg.get("file", "logs/app.log"))
+        return resolve_config_path(configured, base_dir=self.repo_root, env=self._runtime_env())
+
+    def _resolve_optional_path(self, configured: Any) -> Path:
+        if not isinstance(configured, str) or not configured.strip():
+            return Path()
+        return resolve_config_path(configured, base_dir=self.repo_root, env=self._runtime_env())
 
     def _worker_cmd(self, *extra: str) -> list[str]:
         cmd = [str(self.python_bin), "-m", self.worker_module]
@@ -250,6 +457,7 @@ class ControlState:
                     self.worker_proc = None
                     return
 
+                self._notification_restart_required = False
                 self.notice = "파이프라인이 실행중입니다."
                 self._set_poll_boost()
             except Exception as exc:
@@ -685,6 +893,7 @@ class ControlState:
             poll_interval_sec = self._poll_interval_sec(bool(processing), bool(managed_running or pids))
             updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             refresh_hint = "활성 구간은 1초, 유휴 구간은 2초로 동기화됩니다. 작업 상태에서 즉시 반영이 필요하면 '상태 동기화'를 눌러주세요."
+            notification_state = self._notification_state(managed_running=managed_running, external_pids=pids)
 
             return {
                 "schema_version": 2,
@@ -712,12 +921,14 @@ class ControlState:
                     "label": runtime,
                     "description": runtime_desc,
                 },
+                "notification": notification_state,
                 "actions": {
                     "pause_action": "resume" if paused else "pause",
                     "pause_label": "재개" if paused else "일시정지",
                     "endpoints": {
                         "state": "/api/state",
                         "logs": "/api/logs",
+                        "notification": "/api/notification",
                         "start": "/api/start",
                         "pause": "/api/pause",
                         "resume": "/api/resume",

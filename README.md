@@ -42,12 +42,18 @@ python3 -m venv .venv
 cp /Users/geonha/lecture_stt/config/config.example.yaml /Users/geonha/lecture_stt/config/config.yaml
 ```
 
-3. Discord 알림 사용 시(선택)
+3. Telegram 알림 사용 시(선택, 권장)
 ```bash
 cat > /Users/geonha/lecture_stt/.env <<'EOF'
-DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
+TELEGRAM_BOT_TOKEN=123456789:telegram-bot-token
+TELEGRAM_CHAT_ID=-1001234567890
+# TELEGRAM_MESSAGE_THREAD_ID=10
 EOF
 ```
+
+- `config/config.yaml`의 `notification.provider`를 `telegram`으로 두면 텔레그램으로 전송합니다.
+- 전환 기간에 디스코드도 같이 보내려면 `dual_send_providers: [discord]`를 사용합니다.
+- 기존 디스코드 webhook을 계속 쓰려면 `.env`에 `DISCORD_WEBHOOK_URL=...`를 두고 `notification.provider: discord`로 설정합니다.
 
 4. 폴더 접근 권한 확인
 ```bash
@@ -108,6 +114,8 @@ bash /Users/geonha/lecture_stt/scripts/run_gui.sh
   - 레거시 패널: `http://127.0.0.1:8765`
   - React 패널 빌드가 있으면: `http://127.0.0.1:8765/app`
 - 기본 동작: 시작 / 일시정지(재개) / 중지 / 새로고침
+- React 패널 상단 알림 토글에서 `텔레그램만 / 디스코드만 / 둘 다 / 끄기`를 순환 선택할 수 있습니다.
+- 이 변경은 `config/config.yaml`의 `notification` 섹션에 반영되며, 실행 중 워커가 있으면 즉시 재시작 적용됩니다.
 - 포트 변경
 ```bash
 WEB_PANEL_HOST=127.0.0.1 WEB_PANEL_PORT=8765 bash /Users/geonha/lecture_stt/scripts/run_gui.sh

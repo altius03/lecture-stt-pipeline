@@ -27,12 +27,46 @@ function createStatePayload() {
       transcripts: "/tmp/transcripts",
       errors: "/tmp/errors",
     },
+    notification: {
+      selection: "telegram",
+      selected_label: "텔레그램만",
+      apply_label: "다음 시작부터 적용됩니다.",
+      restart_required: false,
+      can_apply_now: false,
+      options: [
+        {
+          id: "telegram",
+          label: "텔레그램만",
+          description: "TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID가 필요합니다.",
+          available: true,
+        },
+        {
+          id: "discord",
+          label: "디스코드만",
+          description: "DISCORD_WEBHOOK_URL이 필요합니다.",
+          available: true,
+        },
+        {
+          id: "both",
+          label: "둘 다",
+          description: "텔레그램과 디스코드 secret이 모두 필요합니다.",
+          available: true,
+        },
+        {
+          id: "disabled",
+          label: "끄기",
+          description: "알림 전송을 중단합니다.",
+          available: true,
+        },
+      ],
+    },
     actions: {
       pause_action: "pause",
       pause_label: "일시정지",
       endpoints: {
         state: "/api/custom-state",
         logs: "/api/custom-logs",
+        notification: "/api/custom-notification",
         start: "/api/start",
         pause: "/api/pause",
         resume: "/api/resume",
@@ -89,6 +123,7 @@ describe("decodePanelState", () => {
     expect(state.schema_version).toBe(2)
     expect(state.runtime_state.status).toBe("running")
     expect(state.actions.endpoints.logs).toBe("/api/custom-logs")
+    expect(state.notification.selection).toBe("telegram")
     expect(state.summary.current_job?.eta_sec).toBe(120)
     expect(state.jobs_v2[0]?.status).toBe("PROCESSING")
   })
@@ -115,5 +150,18 @@ describe("decodePanelState", () => {
         },
       }),
     ).toThrow("actions.endpoints.logs")
+  })
+
+  it("falls back when legacy backend omits notification fields", () => {
+    const payload = createStatePayload()
+    delete (payload as { notification?: unknown }).notification
+    delete (payload.actions.endpoints as { notification?: string }).notification
+
+    const state = decodePanelState(payload)
+
+    expect(state.actions.endpoints.notification).toBe("/api/notification")
+    expect(state.notification.selected_label).toBe("미지원 백엔드")
+    expect(state.notification.options[0]?.available).toBe(false)
+    expect(state.notification.options[3]?.available).toBe(true)
   })
 })

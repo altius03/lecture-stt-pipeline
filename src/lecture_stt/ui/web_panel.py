@@ -113,6 +113,7 @@ def _state_stream_signature(snapshot: dict) -> str:
     summary = snapshot.get("summary", {})
     stable_payload = {
         "runtime_state": snapshot.get("runtime_state"),
+        "notification": snapshot.get("notification"),
         "counts": snapshot.get("counts"),
         "folders": snapshot.get("folders"),
         "actions": snapshot.get("actions"),
@@ -533,6 +534,18 @@ window.onload = () => {
 
 
 class RequestHandler(BaseHTTPRequestHandler):
+    def _read_form_fields(self) -> dict[str, str]:
+        raw_length = self.headers.get("Content-Length", "0")
+        try:
+            length = max(0, int(raw_length))
+        except (TypeError, ValueError):
+            length = 0
+        if length <= 0:
+            return {}
+        body = self.rfile.read(length).decode("utf-8", errors="replace")
+        parsed = parse_qs(body, keep_blank_values=True)
+        return {key: values[-1] if values else "" for key, values in parsed.items()}
+
     protocol_version = "HTTP/1.1"
 
     def _write_bytes(self, code: int, body: bytes, content_type: str) -> None:
@@ -612,6 +625,23 @@ class RequestHandler(BaseHTTPRequestHandler):
     def _action_clear_history(self, api_mode: bool = False) -> None:
         assert STATE is not None
         STATE.clear_history()
+        if api_mode:
+            self._write_json(200, {"ok": True, "notice": STATE.notice})
+        else:
+            self._redirect_home()
+
+    def _action_notification_update(self, selection: str, apply_now: bool = True, api_mode: bool = False) -> None:
+        assert STATE is not None
+        try:
+            STATE.update_notification_selection(selection)
+            if apply_now:
+                STATE.restart_worker_for_notification()
+        except RuntimeError as exc:
+            if api_mode:
+                self._api_error(400, str(exc))
+            else:
+                self._write(400, str(exc), "text/plain; charset=utf-8")
+            return
         if api_mode:
             self._write_json(200, {"ok": True, "notice": STATE.notice})
         else:
@@ -758,6 +788,16 @@ class RequestHandler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/api/clear_history":
                 self._action_clear_history(api_mode=True)
+                return
+            if parsed.path == "/api/notification":
+                fields = self._read_form_fields()
+                selection = fields.get("selection", "")
+                apply_now_raw = fields.get("apply_now")
+                if apply_now_raw is None or apply_now_raw == "":
+                    apply_now = True
+                else:
+                    apply_now = apply_now_raw.strip().lower() in {"1", "true", "yes", "on"}
+                self._action_notification_update(selection, apply_now=apply_now, api_mode=True)
                 return
             self._api_error(404, "Not Found")
             return

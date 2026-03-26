@@ -1,5 +1,11 @@
 import { decodeLogPayload, decodePanelActionResponse, decodePanelState } from "./decodePanelState"
-import type { LogPayload, PanelActionResponse, PanelEndpoints, PanelState } from "../types"
+import type {
+  LogPayload,
+  NotificationSelection,
+  PanelActionResponse,
+  PanelEndpoints,
+  PanelState,
+} from "../types"
 
 const FORM_HEADERS = {
   "Content-Type": "application/x-www-form-urlencoded",
@@ -8,6 +14,7 @@ const FORM_HEADERS = {
 export const FALLBACK_PANEL_ENDPOINTS: PanelEndpoints = {
   state: "/api/state",
   logs: "/api/logs",
+  notification: "/api/notification",
   start: "/api/start",
   pause: "/api/pause",
   resume: "/api/resume",
@@ -67,6 +74,34 @@ export async function postPanelAction(endpoint: string): Promise<PanelActionResp
       throw new Error(decoded.error)
     }
     throw new Error(`Failed to run panel action: ${response.status}`)
+  }
+  if (!decoded.ok) {
+    throw new Error(decoded.error)
+  }
+  return decoded
+}
+
+export async function postNotificationSelection(
+  endpoint: string,
+  selection: NotificationSelection,
+  options?: { applyNow?: boolean },
+): Promise<PanelActionResponse> {
+  const body = new URLSearchParams({
+    selection,
+    ...(options?.applyNow ? { apply_now: "1" } : {}),
+  }).toString()
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: FORM_HEADERS,
+    body,
+  })
+  const payload = await readJson(response)
+  const decoded = decodePanelActionResponse(payload)
+  if (!response.ok) {
+    if (!decoded.ok) {
+      throw new Error(decoded.error)
+    }
+    throw new Error(`Failed to save notification selection: ${response.status}`)
   }
   if (!decoded.ok) {
     throw new Error(decoded.error)

@@ -1,14 +1,19 @@
 import { useEffect, useState } from "react"
 
+import { NotificationToggle } from "./NotificationToggle"
 import { StatusBadge } from "../ui/StatusBadge"
-import type { PanelSummary, RuntimeState } from "../../types"
+import type { NotificationSelection, NotificationState, PanelSummary, RuntimeState } from "../../types"
 import type { ThemeMode } from "../../hooks/useThemeMode"
 
 interface PanelHeroProps {
   runtimeState: RuntimeState
   summary: PanelSummary
   realtimeConnected: boolean
+  notification: NotificationState
+  pendingNotificationSelection: NotificationSelection | null
+  pendingNotificationApplyNow: boolean
   theme: ThemeMode
+  onNotificationSave: (selection: NotificationSelection, applyNow?: boolean) => void
   onThemeChange: (nextTheme: ThemeMode) => void
 }
 
@@ -21,7 +26,17 @@ function formatCurrentTime(now: Date): string {
   })
 }
 
-export function PanelHero({ runtimeState, summary, realtimeConnected, theme, onThemeChange }: PanelHeroProps) {
+export function PanelHero({
+  runtimeState,
+  summary,
+  realtimeConnected,
+  notification,
+  pendingNotificationSelection,
+  pendingNotificationApplyNow,
+  theme,
+  onNotificationSave,
+  onThemeChange,
+}: PanelHeroProps) {
   const [currentTime, setCurrentTime] = useState(() => formatCurrentTime(new Date()))
   const nextTheme = theme === "dark" ? "light" : "dark"
 
@@ -45,6 +60,12 @@ export function PanelHero({ runtimeState, summary, realtimeConnected, theme, onT
             <p className="hero-description">워커 상태, 큐, 최근 작업, 로그를 한 화면에서 확인하고 제어합니다.</p>
           </div>
           <div className="hero-actions">
+            <NotificationToggle
+              notification={notification}
+              pendingSelection={pendingNotificationSelection}
+              pendingApplyNow={pendingNotificationApplyNow}
+              onSave={onNotificationSave}
+            />
             <button
               className="theme-switch"
               data-theme={theme}

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import os
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -61,3 +62,18 @@ class SttMainControlCommandTests(unittest.TestCase):
         self.assertFalse(self.pause_path.exists())
         self.assertFalse(self.fallback_pause.exists())
         self.assertIn(f"Resumed: pause flag removed at {self.pause_path}", resume_output)
+
+    def test_status_resolves_env_backed_db_path(self) -> None:
+        env_db_path = self.root / "env-state" / "jobs.sqlite3"
+        self.config_path.write_text(
+            (
+                "paths:\n"
+                "  db_path: ${STATE_ROOT}/jobs.sqlite3\n"
+            ),
+            encoding="utf-8",
+        )
+
+        with mock.patch.dict(os.environ, {"STATE_ROOT": str(env_db_path.parent)}, clear=False):
+            output = self._run_main("--status", "--config", str(self.config_path))
+
+        self.assertIn(f"Pause flag: {env_db_path.parent / 'paused'}", output)

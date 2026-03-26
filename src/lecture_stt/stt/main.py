@@ -21,8 +21,14 @@ from lecture_stt.shared.db import (
     STATUS_PENDING,
     STATUS_PROCESSING,
 )
-from lecture_stt.shared.paths import default_db_path, env_file, repo_root
-from lecture_stt.stt.notifier import DiscordNotifier
+from lecture_stt.shared.paths import (
+    default_db_path,
+    env_file,
+    repo_root,
+    resolve_config_path,
+    resolve_executable,
+)
+from lecture_stt.stt.notifier import SUPPORTED_PROVIDERS, build_notifier
 from lecture_stt.stt.postprocess import postprocess
 from lecture_stt.stt.quality_gate import evaluate as quality_evaluate
 from lecture_stt.stt.transcribe import EngineParams, STTWorker
@@ -55,6 +61,7 @@ def load_config(config_path: str = "config/config.yaml") -> dict:
 
 def validate_config(config_path: str, config: dict) -> dict:
     # 설정 섹션/타입/값 범위를 검증해 실행 시 실패를 앞당긴다.
+    config = _normalize_config_paths(config)
     config_path_obj = Path(config_path)
 
     def require_section(name: str) -> Dict[str, Any]:
@@ -81,6 +88,9 @@ def validate_config(config_path: str, config: dict) -> dict:
     paths = require_section("paths")
     ffmpeg_cfg = require_section("ffmpeg")
     transcribe = require_section("transcribe")
+    notification = config.get("notification") or {}
+    if notification and not isinstance(notification, dict):
+        raise ValueError(f"Config error in {config_path_obj}: invalid section 'notification'")
 
     required_app = ["polling_interval_sec", "stable_for_sec", "stale_processing_hours"]
     for key in required_app:
@@ -205,7 +215,39 @@ def validate_config(config_path: str, config: dict) -> dict:
             "transcribe.condition_on_previous_text", transcribe["condition_on_previous_text"]
         )
 
-    return _ensure_config_defaults(config)
+    if notification:
+        provider = str(notification.get("provider", "auto") or "auto").strip().lower()
+        if provider not in SUPPORTED_PROVIDERS:
+            raise ValueError(
+                f"Config error: notification.provider must be one of {sorted(SUPPORTED_PROVIDERS)}"
+            )
+
+        for key in ["enabled", "send_start", "send_success", "send_failure"]:
+            if key in notification:
+                notification[key] = parse_bool(f"notification.{key}", notification[key])
+
+        dual_send = notification.get("dual_send_providers", [])
+        if dual_send is None:
+            dual_send = []
+        if isinstance(dual_send, str):
+            dual_send = [item.strip() for item in dual_send.split(",") if item.strip()]
+        if not isinstance(dual_send, list):
+            raise ValueError("Config error: notification.dual_send_providers must be a list or string")
+
+        normalized_dual: list[str] = []
+        for item in dual_send:
+            value = str(item).strip().lower()
+            if not value:
+                continue
+            if value not in SUPPORTED_PROVIDERS or value == "auto":
+                raise ValueError(
+                    "Config error: notification.dual_send_providers contains unsupported provider"
+                )
+            normalized_dual.append(value)
+        notification["provider"] = provider
+        notification["dual_send_providers"] = normalized_dual
+
+    return config
 
 
 # 환경설정에서 누락된 값은 기본값으로 채워 코드 실행 안정성을 높인다.
@@ -218,10 +260,6 @@ def _ensure_config_defaults(config: dict) -> dict:
             "stale_processing_hours": 6,
         },
         "paths": {
-            "watch_folder": "/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings/00_inbox",
-            "stable_audio_folder": "/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings/01_audio",
-            "transcript_folder": "/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings/02_transcripts",
-            "error_folder": "/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings/99_errors",
             "tmp_dir": str(root / "tmp"),
             "db_path": str(default_db_path()),
         },
@@ -237,7 +275,7 @@ def _ensure_config_defaults(config: dict) -> dict:
             "word_timestamps": False,
             "condition_on_previous_text": True,
         },
-        "ffmpeg": {"binary_path": "/opt/homebrew/bin/ffmpeg"},
+        "ffmpeg": {"binary_path": "ffmpeg"},
         "logging": {
             "file": "logs/app.log",
             "max_bytes": 5 * 1024 * 1024,
@@ -246,6 +284,14 @@ def _ensure_config_defaults(config: dict) -> dict:
         "cleanup": {
             "retain_days": 7,
             "retain_min_transcripts": 5,
+        },
+        "notification": {
+            "provider": "auto",
+            "enabled": True,
+            "send_start": True,
+            "send_success": True,
+            "send_failure": True,
+            "dual_send_providers": [],
         },
     }
 
@@ -258,6 +304,35 @@ def _ensure_config_defaults(config: dict) -> dict:
             merged[section] = defaults[section]
 
     return merged
+
+
+def _normalize_config_paths(config: dict) -> dict:
+    root = repo_root()
+    normalized = _ensure_config_defaults(config)
+    paths = normalized.setdefault("paths", {})
+    for key in [
+        "watch_folder",
+        "stable_audio_folder",
+        "transcript_folder",
+        "error_folder",
+        "tmp_dir",
+        "db_path",
+    ]:
+        value = paths.get(key)
+        if isinstance(value, str) and value.strip():
+            paths[key] = str(resolve_config_path(value, base_dir=root, env=os.environ))
+
+    ffmpeg_cfg = normalized.setdefault("ffmpeg", {})
+    binary_path = ffmpeg_cfg.get("binary_path")
+    if isinstance(binary_path, str) and binary_path.strip():
+        ffmpeg_cfg["binary_path"] = str(resolve_executable(binary_path, base_dir=root, env=os.environ))
+
+    logging_cfg = normalized.setdefault("logging", {})
+    log_file = logging_cfg.get("file")
+    if isinstance(log_file, str) and log_file.strip():
+        logging_cfg["file"] = str(resolve_config_path(log_file, base_dir=root, env=os.environ))
+
+    return normalized
 
 
 class _JobLogFilter(logging.Filter):
@@ -302,7 +377,7 @@ def setup_logging(log_file: str, max_bytes: int, backup_count: int) -> logging.L
 class STTPipeline:
     # 전체 전사 워크플로우의 오케스트레이션을 담당한다.
     def __init__(self, config: dict, logger: logging.Logger):
-        self.config = _ensure_config_defaults(config)
+        self.config = _normalize_config_paths(config)
         self.logger = logger
 
         paths = self.config["paths"]
@@ -349,8 +424,9 @@ class STTPipeline:
         self._last_pause_log_at = 0.0
 
         self.conn = db.init_db(str(self.db_path))
-        self.notifier = DiscordNotifier(
-            os.getenv("DISCORD_WEBHOOK_URL"),
+        self.notifier = build_notifier(
+            self.config,
+            env=os.environ,
             state_dir=self.db_path.parent,
         )
 
@@ -359,16 +435,23 @@ class STTPipeline:
         """단계 이름 기반 기본 진행률 (시간 기반 계산 불가 시 폴백)."""
         stage_progress = {
             "파일 감지": 5,
-            "파일 이동": 10,
-            "중복 결과 재사용": 40,
-            "전사 시작/진행": 15,
-            "후처리(반복/노이즈 제거)": 75,
-            "품질 검사": 85,
-            "전사문 생성(TXT/JSON)": 90,
+            "파일 이동": 12,
+            "중복 결과 재사용": 35,
+            "전사 시작/진행": 18,
+            "후처리(반복/노이즈 제거)": 78,
+            "품질 검사": 88,
+            "전사문 생성(TXT/JSON)": 94,
             "전체 완료": 100,
             "실패": 0,
         }
         return stage_progress.get(step, 5)
+
+    @staticmethod
+    def _transcription_progress_pct(processed_audio_sec: float, audio_duration_sec: float | None) -> int:
+        if audio_duration_sec is None or audio_duration_sec <= 0:
+            return 18
+        ratio = max(0.0, min(1.0, processed_audio_sec / audio_duration_sec))
+        return max(18, min(72, int(round(18 + ratio * 54))))
 
     def _time_based_progress(self, job_id: int, eta_sec: int | None) -> int | None:
         """started_at 기준 경과 시간 / 예상 총 시간으로 진행률을 계산한다."""
@@ -398,7 +481,14 @@ class STTPipeline:
         except Exception:
             return {"PENDING": 0, "PROCESSING": 0, "DONE": 0, "ERROR": 0}
 
-    def _update_progress(self, job_id: int, step: str, progress: int | None = None, eta_sec: int | None = None) -> None:
+    def _update_progress(
+        self,
+        job_id: int,
+        step: str,
+        progress: int | None = None,
+        eta_sec: int | None = None,
+        clear_eta: bool = False,
+    ) -> None:
         values = {"current_step": step}
         if progress is not None:
             values["progress_pct"] = max(0, min(100, int(progress)))
@@ -417,6 +507,8 @@ class STTPipeline:
             values["progress_pct"] = self._to_stage_progress(step)
         if eta_sec is not None:
             values["eta_sec"] = eta_sec
+        elif clear_eta:
+            values["eta_sec"] = None
         db.update_job(self.conn, job_id, **values)
 
     def _estimate_eta_sec(self) -> int | None:
@@ -752,19 +844,59 @@ class STTPipeline:
 
             # Whisper 전사 단계: 오디오에서 텍스트를 추출한다.
             fail_step = "전사 실행"
+            last_transcription_update_at = 0.0
+            last_transcription_progress = 0
+            last_transcription_eta: int | None = eta
+
+            def handle_transcription_progress(
+                processed_audio_sec: float,
+                audio_duration_sec: float | None,
+                eta_remaining_sec: int | None,
+            ) -> None:
+                nonlocal last_transcription_update_at, last_transcription_progress, last_transcription_eta
+
+                progress_pct = self._transcription_progress_pct(processed_audio_sec, audio_duration_sec)
+                now_mono = time.monotonic()
+                eta_changed = (
+                    eta_remaining_sec is not None
+                    and (
+                        last_transcription_eta is None
+                        or abs(eta_remaining_sec - last_transcription_eta) >= 15
+                    )
+                )
+                should_update = (
+                    progress_pct >= last_transcription_progress + 2
+                    or eta_changed
+                    or now_mono - last_transcription_update_at >= 3.0
+                )
+                if not should_update:
+                    return
+
+                self._update_progress(
+                    job_id,
+                    "전사 시작/진행",
+                    progress=progress_pct,
+                    eta_sec=eta_remaining_sec,
+                )
+                last_transcription_update_at = now_mono
+                last_transcription_progress = progress_pct
+                last_transcription_eta = eta_remaining_sec
+
             segments, transcript_text, preprocess_sec, transcribe_sec, tmp_wav = self.worker.transcribe_file(
                 canonical_audio_final,
                 canonical_base,
+                progress_callback=handle_transcription_progress,
             )
             total_sec = preprocess_sec + transcribe_sec
             ended_at = utils.now_iso()
 
             # ── v2: 후처리 + 품질 게이트 ──
             fail_step = "후처리"
-            self._update_progress(job_id, "후처리(반복/노이즈 제거)", 70)
+            self._update_progress(job_id, "후처리(반복/노이즈 제거)", 78, 12)
             segments, transcript_text = postprocess(segments, transcript_text)
 
             fail_step = "품질 검사"
+            self._update_progress(job_id, "품질 검사", 88, 6)
             quality_report = quality_evaluate(segments, transcript_text)
             self._log(
                 logging.WARNING if quality_report.health != "good" else logging.INFO,
@@ -791,9 +923,9 @@ class STTPipeline:
 
             # 생성된 텍스트/메타데이터를 디스크에 저장하고 구조를 검증한다.
             fail_step = "산출물 저장/검증"
+            self._update_progress(job_id, "전사문 생성(TXT/JSON)", 94, 3)
             self._write_output(txt_path, json_path, segments, transcript_text, metadata)
             self._validate_output_files(txt_path, json_path)
-            self._update_progress(job_id, "전사문 생성(TXT/JSON)", 85)
             self.notifier.notify_transcript_generated({
                 "job_id": job_id,
                 "orig_name": source_path.name,
@@ -955,7 +1087,7 @@ def main() -> None:
     load_dotenv(str(env_file()), override=False)
 
     if args.pause or args.resume or args.status:
-        control_config = _ensure_config_defaults(load_config(args.config))
+        control_config = _normalize_config_paths(load_config(args.config))
         if args.pause:
             utils.set_paused(True, control_config)
             print(f"Paused: pause flag created at {utils.get_pause_flag_path(control_config)}")

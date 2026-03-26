@@ -1,5 +1,6 @@
 export type RuntimeStatus = "running" | "paused" | "stopped"
 export type RuntimeSource = "web" | "external" | "none"
+export type NotificationSelection = "telegram" | "discord" | "both" | "disabled"
 export const PANEL_ACTIONS = [
   "start",
   "pause",
@@ -11,7 +12,7 @@ export const PANEL_ACTIONS = [
 ] as const
 
 export type PanelAction = (typeof PANEL_ACTIONS)[number]
-export type PanelEndpointKey = "state" | "logs" | PanelAction
+export type PanelEndpointKey = "state" | "logs" | "notification" | PanelAction
 export type KnownJobStatus = "PENDING" | "PROCESSING" | "DONE" | "ERROR"
 export type JobStatus = KnownJobStatus | (string & {})
 
@@ -62,6 +63,7 @@ export interface ProcessingJob {
 export interface PanelEndpoints {
   state: string
   logs: string
+  notification: string
   start: string
   pause: string
   resume: string
@@ -77,6 +79,22 @@ export interface ActionSummary {
   endpoints: PanelEndpoints
 }
 
+export interface NotificationOption {
+  id: NotificationSelection
+  label: string
+  description: string
+  available: boolean
+}
+
+export interface NotificationState {
+  selection: NotificationSelection
+  selected_label: string
+  apply_label: string
+  restart_required: boolean
+  can_apply_now: boolean
+  options: NotificationOption[]
+}
+
 export interface PanelSummary {
   current_job: ProcessingJob | null
   progress_label: string
@@ -90,6 +108,7 @@ export interface PanelSummary {
 export interface PanelState {
   schema_version: 2
   runtime_state: RuntimeState
+  notification: NotificationState
   counts: CountSummary
   folders: FolderSummary
   actions: ActionSummary

@@ -4,6 +4,9 @@ import type {
   CountSummary,
   FolderSummary,
   LogPayload,
+  NotificationOption,
+  NotificationSelection,
+  NotificationState,
   PanelAction,
   PanelActionResponse,
   PanelEndpoints,
@@ -19,6 +22,7 @@ import type {
 const RUNTIME_STATUSES = ["running", "paused", "stopped"] as const satisfies readonly RuntimeStatus[]
 const RUNTIME_SOURCES = ["web", "external", "none"] as const satisfies readonly RuntimeSource[]
 const PAUSE_ACTIONS = ["pause", "resume"] as const
+const NOTIFICATION_SELECTIONS = ["telegram", "discord", "both", "disabled"] as const satisfies readonly NotificationSelection[]
 
 function asRecord(input: unknown, label: string): Record<string, unknown> {
   if (!input || typeof input !== "object" || Array.isArray(input)) {
@@ -33,6 +37,11 @@ function readString(record: Record<string, unknown>, key: string, label: string)
     throw new Error(`${label}.${key} 값이 문자열이 아닙니다.`)
   }
   return value
+}
+
+function readOptionalString(record: Record<string, unknown>, key: string): string | null {
+  const value = record[key]
+  return typeof value === "string" ? value : null
 }
 
 function readNumber(record: Record<string, unknown>, key: string, label: string): number {
@@ -152,6 +161,7 @@ function decodeEndpoints(input: unknown): PanelEndpoints {
   return {
     state: readString(record, "state", "actions.endpoints"),
     logs: readString(record, "logs", "actions.endpoints"),
+    notification: readOptionalString(record, "notification") ?? "/api/notification",
     start: readString(record, "start", "actions.endpoints"),
     pause: readString(record, "pause", "actions.endpoints"),
     resume: readString(record, "resume", "actions.endpoints"),
@@ -169,6 +179,67 @@ function decodeActions(input: unknown): ActionSummary {
     pause_label: readString(record, "pause_label", "actions"),
     endpoints: decodeEndpoints(record.endpoints),
   }
+}
+
+function decodeNotificationOption(input: unknown): NotificationOption {
+  const record = asRecord(input, "notification.options[]")
+  return {
+    id: readLiteral(record, "id", NOTIFICATION_SELECTIONS, "notification.options[]"),
+    label: readString(record, "label", "notification.options[]"),
+    description: readString(record, "description", "notification.options[]"),
+    available: readBoolean(record, "available", "notification.options[]"),
+  }
+}
+
+function decodeNotificationState(input: unknown): NotificationState {
+  const record = asRecord(input, "notification")
+  return {
+    selection: readLiteral(record, "selection", NOTIFICATION_SELECTIONS, "notification"),
+    selected_label: readString(record, "selected_label", "notification"),
+    apply_label: readString(record, "apply_label", "notification"),
+    restart_required: readBoolean(record, "restart_required", "notification"),
+    can_apply_now: readBoolean(record, "can_apply_now", "notification"),
+    options: readArray(record, "options", "notification").map(decodeNotificationOption),
+  }
+}
+
+function decodeNotificationStateOrFallback(input: unknown): NotificationState {
+  if (input === undefined) {
+    return {
+      selection: "disabled",
+      selected_label: "미지원 백엔드",
+      apply_label: "웹 패널 백엔드를 재시작하면 알림 설정을 사용할 수 있습니다.",
+      restart_required: false,
+      can_apply_now: false,
+      options: [
+        {
+          id: "telegram",
+          label: "텔레그램만",
+          description: "현재 실행 중인 패널 백엔드는 이 설정을 아직 제공하지 않습니다.",
+          available: false,
+        },
+        {
+          id: "discord",
+          label: "디스코드만",
+          description: "현재 실행 중인 패널 백엔드는 이 설정을 아직 제공하지 않습니다.",
+          available: false,
+        },
+        {
+          id: "both",
+          label: "둘 다",
+          description: "현재 실행 중인 패널 백엔드는 이 설정을 아직 제공하지 않습니다.",
+          available: false,
+        },
+        {
+          id: "disabled",
+          label: "끄기",
+          description: "웹 패널 백엔드 재시작 전까지는 읽기 전용 상태입니다.",
+          available: true,
+        },
+      ],
+    }
+  }
+  return decodeNotificationState(input)
 }
 
 function decodeSummary(input: unknown): PanelSummary {
@@ -193,6 +264,7 @@ export function decodePanelState(input: unknown): PanelState {
   return {
     schema_version: 2,
     runtime_state: decodeRuntimeState(record.runtime_state),
+    notification: decodeNotificationStateOrFallback(record.notification),
     counts: decodeCounts(record.counts),
     folders: decodeFolders(record.folders),
     actions: decodeActions(record.actions),

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import threading
 import unittest
@@ -21,6 +22,9 @@ class WebPanelStateSnapshotTests(unittest.TestCase):
         state = object.__new__(web_panel_state.ControlState)
         state.lock = threading.Lock()
         state.notice = "정상 동작 중"
+        state.config_data = {"notification": {"provider": "telegram", "enabled": True, "dual_send_providers": []}}
+        state._notification_restart_required = False
+        state._notification_availability = mock.Mock(return_value={"telegram": True, "discord": False})
         state._is_managed_running = mock.Mock(return_value=True)
         state._find_worker_pids = mock.Mock(return_value=[4321])
         state._is_paused = mock.Mock(return_value=False)
@@ -63,8 +67,12 @@ class WebPanelStateSnapshotTests(unittest.TestCase):
         self.assertEqual(snapshot["schema_version"], 2)
         self.assertEqual(snapshot["runtime_state"]["status"], "running")
         self.assertEqual(snapshot["runtime_state"]["source"], "web")
+        self.assertEqual(snapshot["notification"]["selection"], "telegram")
+        self.assertFalse(snapshot["notification"]["restart_required"])
+        self.assertTrue(snapshot["notification"]["can_apply_now"])
         self.assertEqual(snapshot["actions"]["pause_action"], "pause")
         self.assertEqual(snapshot["actions"]["endpoints"]["state"], "/api/state")
+        self.assertEqual(snapshot["actions"]["endpoints"]["notification"], "/api/notification")
         self.assertEqual(snapshot["jobs_v2"][0]["id"], 7)
         self.assertEqual(snapshot["jobs_v2"][0]["file_name"], "lecture.m4a")
         self.assertEqual(snapshot["processing_v2"][0]["eta_sec"], 120)
@@ -78,8 +86,106 @@ class WebPanelStateSnapshotTests(unittest.TestCase):
         self.assertEqual(snapshot["processing"][0][0], snapshot["processing_v2"][0]["id"])
         self.assertEqual(
             set(snapshot["actions"]["endpoints"].keys()),
-            {"state", "logs", "start", "pause", "resume", "stop", "refresh", "exit", "clear_history"},
+            {
+                "state",
+                "logs",
+                "notification",
+                "start",
+                "pause",
+                "resume",
+                "stop",
+                "refresh",
+                "exit",
+                "clear_history",
+            },
         )
+
+    def test_update_notification_selection_writes_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config_dir = root / "config"
+            config_dir.mkdir(parents=True, exist_ok=True)
+            (config_dir / "config.yaml").write_text(
+                "paths:\n"
+                f"  db_path: {root / 'state' / 'jobs.sqlite3'}\n"
+                "logging:\n"
+                "  file: logs/app.log\n",
+                encoding="utf-8",
+            )
+            state = web_panel_state.ControlState(repo_root=root)
+            state._is_managed_running = mock.Mock(return_value=False)
+            state._find_worker_pids = mock.Mock(return_value=[])
+            state._set_poll_boost = mock.Mock()
+
+            with mock.patch.object(
+                state,
+                "_notification_availability",
+                return_value={"telegram": True, "discord": True},
+            ):
+                state.update_notification_selection("both")
+
+            saved = state._load_config()
+            self.assertEqual(saved["notification"]["provider"], "telegram")
+            self.assertEqual(saved["notification"]["dual_send_providers"], ["discord"])
+            self.assertTrue(saved["notification"]["enabled"])
+            self.assertIn("다음 시작부터 적용", state.notice)
+
+    def test_control_state_resolves_env_backed_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            state_root = root / "runtime-state"
+            recordings_root = root / "recordings"
+            config_dir = root / "config"
+            config_dir.mkdir(parents=True, exist_ok=True)
+            (root / ".env").write_text(
+                (
+                    f"STATE_ROOT={state_root}\n"
+                    f"LECTURE_RECORDINGS_ROOT={recordings_root}\n"
+                ),
+                encoding="utf-8",
+            )
+            (config_dir / "config.yaml").write_text(
+                (
+                    "paths:\n"
+                    "  db_path: ${STATE_ROOT}/jobs.sqlite3\n"
+                    "  watch_folder: ${LECTURE_RECORDINGS_ROOT}/00_inbox\n"
+                    "logging:\n"
+                    "  file: logs/app.log\n"
+                ),
+                encoding="utf-8",
+            )
+
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "STATE_ROOT": str(state_root),
+                    "LECTURE_RECORDINGS_ROOT": str(recordings_root),
+                },
+                clear=False,
+            ):
+                state = web_panel_state.ControlState(repo_root=root)
+
+            self.assertEqual(state.db_path, state_root / "jobs.sqlite3")
+            self.assertEqual(state.watch_folder, recordings_root / "00_inbox")
+
+    def test_restart_worker_for_notification_restarts_and_clears_flag(self) -> None:
+        state = object.__new__(web_panel_state.ControlState)
+        state._notification_restart_required = True
+        state.notice = "대기중"
+        state.start = mock.Mock(side_effect=lambda: setattr(state, "_notification_restart_required", False))
+        state.stop = mock.Mock()
+        state._is_managed_running = mock.Mock(return_value=True)
+        state._find_worker_pids = mock.Mock(return_value=[1234])
+        state._wait_for_worker_shutdown = mock.Mock(return_value=True)
+        state._set_poll_boost = mock.Mock()
+
+        state.restart_worker_for_notification()
+
+        state.stop.assert_called_once_with()
+        state.start.assert_called_once_with()
+        state._wait_for_worker_shutdown.assert_called_once_with()
+        self.assertFalse(state._notification_restart_required)
+        self.assertIn("즉시 적용", state.notice)
 
     def test_log_stream_delta_marks_reset_after_truncate(self) -> None:
         state = object.__new__(web_panel_state.ControlState)

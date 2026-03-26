@@ -10,11 +10,11 @@
   <key>KeepAlive</key>
   <true/>
   <key>WorkingDirectory</key>
-  <string>/Users/geonha/lecture_stt</string>
+  <string>__REPO_ROOT__</string>
   <key>ProgramArguments</key>
   <array>
     <string>/bin/bash</string>
-    <string>/Users/geonha/lecture_stt/scripts/run_gui.sh</string>
+    <string>__REPO_ROOT__/scripts/run_gui.sh</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
@@ -26,9 +26,9 @@
     <string>8765</string>
   </dict>
   <key>StandardOutPath</key>
-  <string>/Users/geonha/lecture_stt/state/logs/webpanel.out.log</string>
+  <string>__REPO_ROOT__/state/logs/webpanel.out.log</string>
   <key>StandardErrorPath</key>
-  <string>/Users/geonha/lecture_stt/state/logs/webpanel.err.log</string>
+  <string>__REPO_ROOT__/state/logs/webpanel.err.log</string>
   <key>ThrottleInterval</key>
   <integer>10</integer>
 </dict>

@@ -5,13 +5,19 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 
 import { usePanelState } from "../src/hooks/usePanelState"
 import { subscribePanelEvents } from "../src/lib/panelEvents"
-import { FALLBACK_PANEL_ENDPOINTS, fetchPanelState, postPanelAction } from "../src/lib/panelApi"
+import {
+  FALLBACK_PANEL_ENDPOINTS,
+  fetchPanelState,
+  postNotificationSelection,
+  postPanelAction,
+} from "../src/lib/panelApi"
 import type { PanelState } from "../src/types"
 
 vi.mock("../src/lib/panelApi", () => ({
   FALLBACK_PANEL_ENDPOINTS: {
     state: "/api/state",
     logs: "/api/logs",
+    notification: "/api/notification",
     start: "/api/start",
     pause: "/api/pause",
     resume: "/api/resume",
@@ -21,6 +27,7 @@ vi.mock("../src/lib/panelApi", () => ({
     clear_history: "/api/clear_history",
   },
   fetchPanelState: vi.fn(),
+  postNotificationSelection: vi.fn(),
   postPanelAction: vi.fn(),
 }))
 
@@ -29,6 +36,7 @@ vi.mock("../src/lib/panelEvents", () => ({
 }))
 
 const fetchPanelStateMock = vi.mocked(fetchPanelState)
+const postNotificationSelectionMock = vi.mocked(postNotificationSelection)
 const postPanelActionMock = vi.mocked(postPanelAction)
 const subscribePanelEventsMock = vi.mocked(subscribePanelEvents)
 
@@ -57,12 +65,46 @@ function createPanelState(): PanelState {
       transcripts: "/tmp/transcripts",
       errors: "/tmp/errors",
     },
+    notification: {
+      selection: "telegram",
+      selected_label: "텔레그램만",
+      apply_label: "다음 시작부터 적용됩니다.",
+      restart_required: false,
+      can_apply_now: false,
+      options: [
+        {
+          id: "telegram",
+          label: "텔레그램만",
+          description: "TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID가 필요합니다.",
+          available: true,
+        },
+        {
+          id: "discord",
+          label: "디스코드만",
+          description: "DISCORD_WEBHOOK_URL이 필요합니다.",
+          available: true,
+        },
+        {
+          id: "both",
+          label: "둘 다",
+          description: "텔레그램과 디스코드 secret이 모두 필요합니다.",
+          available: true,
+        },
+        {
+          id: "disabled",
+          label: "끄기",
+          description: "알림 전송을 중단합니다.",
+          available: true,
+        },
+      ],
+    },
     actions: {
       pause_action: "pause",
       pause_label: "일시정지",
       endpoints: {
         state: "/api/runtime/state",
         logs: "/api/runtime/logs",
+        notification: "/api/runtime/notification",
         start: "/api/runtime/start",
         pause: "/api/runtime/pause",
         resume: "/api/runtime/resume",
@@ -106,6 +148,7 @@ function createWrapper() {
 describe("usePanelState", () => {
   beforeEach(() => {
     fetchPanelStateMock.mockReset()
+    postNotificationSelectionMock.mockReset()
     postPanelActionMock.mockReset()
     subscribePanelEventsMock.mockReset()
     subscribePanelEventsMock.mockReturnValue(() => {})
@@ -200,5 +243,51 @@ describe("usePanelState", () => {
     })
 
     expect(fetchPanelStateMock).toHaveBeenCalledTimes(1)
+  })
+
+  it("uses the notification endpoint when saving a selection", async () => {
+    fetchPanelStateMock.mockResolvedValue(createPanelState())
+    postNotificationSelectionMock.mockResolvedValue({ ok: true, notice: "saved" })
+
+    const { result } = renderHook(() => usePanelState(), {
+      wrapper: createWrapper(),
+    })
+
+    await waitFor(() => {
+      expect(result.current.state?.actions.endpoints.notification).toBe("/api/runtime/notification")
+    })
+
+    await act(async () => {
+      await result.current.saveNotificationSelection("both")
+    })
+
+    await waitFor(() => {
+      expect(postNotificationSelectionMock).toHaveBeenCalledWith("/api/runtime/notification", "both", { applyNow: false })
+      expect(result.current.pendingNotificationSelection).toBeNull()
+    })
+  })
+
+  it("passes applyNow when saving and restarting notification settings", async () => {
+    fetchPanelStateMock.mockResolvedValue(createPanelState())
+    postNotificationSelectionMock.mockResolvedValue({ ok: true, notice: "restarted" })
+
+    const { result } = renderHook(() => usePanelState(), {
+      wrapper: createWrapper(),
+    })
+
+    await waitFor(() => {
+      expect(result.current.state?.actions.endpoints.notification).toBe("/api/runtime/notification")
+    })
+
+    await act(async () => {
+      await result.current.saveNotificationSelection("discord", true)
+    })
+
+    await waitFor(() => {
+      expect(postNotificationSelectionMock).toHaveBeenCalledWith("/api/runtime/notification", "discord", {
+        applyNow: true,
+      })
+      expect(result.current.pendingNotificationApplyNow).toBe(false)
+    })
   })
 })

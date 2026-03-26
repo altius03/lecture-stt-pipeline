@@ -23,6 +23,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from lecture_stt.stt.postprocess import postprocess
 from lecture_stt.stt.quality_gate import evaluate as quality_evaluate
 from lecture_stt.stt.transcribe import EngineParams, STTWorker
+from lecture_stt.shared.paths import resolve_executable
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def resolve_ffmpeg_path(configured: str) -> str:
+    return str(resolve_executable(configured, base_dir=REPO_ROOT))
 
 
 def build_params(
@@ -84,14 +92,15 @@ def run_test(label: str, worker: STTWorker, wav_path: Path) -> dict:
 def main():
     parser = argparse.ArgumentParser(description="A/B 테스트")
     parser.add_argument("--audio", required=True, help="테스트할 오디오 파일 경로")
-    parser.add_argument("--ffmpeg", default="/opt/homebrew/bin/ffmpeg")
-    parser.add_argument("--tmp", default=str(Path(__file__).resolve().parents[1] / "tmp"))
+    parser.add_argument("--ffmpeg", default="ffmpeg")
+    parser.add_argument("--tmp", default=str(REPO_ROOT / "tmp"))
     args = parser.parse_args()
 
     audio_path = Path(args.audio)
     if not audio_path.exists():
         print(f"파일 없음: {audio_path}")
         sys.exit(1)
+    ffmpeg_path = resolve_ffmpeg_path(args.ffmpeg)
 
     # A: 기존 설정 (baseline)
     params_a = build_params(
@@ -99,7 +108,7 @@ def main():
         no_repeat_ngram_size=0,
         vad_filter=False,
     )
-    worker_a = STTWorker(params_a, args.ffmpeg, args.tmp)
+    worker_a = STTWorker(params_a, ffmpeg_path, args.tmp)
 
     # B: v2 설정
     params_b = build_params(
@@ -110,7 +119,7 @@ def main():
         min_silence_duration_ms=1200,
         initial_prompt="이 강의는 컴퓨터공학 전공 수업입니다.",
     )
-    worker_b = STTWorker(params_b, args.ffmpeg, args.tmp)
+    worker_b = STTWorker(params_b, ffmpeg_path, args.tmp)
 
     # 전처리는 1회만
     canonical_base = "ab_test"

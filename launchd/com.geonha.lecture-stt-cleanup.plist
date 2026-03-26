@@ -6,11 +6,11 @@
     <string>com.geonha.lecture-stt-cleanup</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/geonha/lecture_stt/.venv/bin/python</string>
-        <string>/Users/geonha/lecture_stt/scripts/cleanup.py</string>
+        <string>__REPO_ROOT__/.venv/bin/python</string>
+        <string>__REPO_ROOT__/scripts/cleanup.py</string>
     </array>
     <key>WorkingDirectory</key>
-    <string>/Users/geonha/lecture_stt</string>
+    <string>__REPO_ROOT__</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
@@ -26,8 +26,8 @@
         </dict>
     </array>
     <key>StandardOutPath</key>
-    <string>/Users/geonha/lecture_stt/state/logs/cleanup.out.log</string>
+    <string>__REPO_ROOT__/state/logs/cleanup.out.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/geonha/lecture_stt/state/logs/cleanup.err.log</string>
+    <string>__REPO_ROOT__/state/logs/cleanup.err.log</string>
 </dict>
 </plist>

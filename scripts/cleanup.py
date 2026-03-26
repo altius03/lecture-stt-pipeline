@@ -5,26 +5,25 @@ import argparse
 from datetime import datetime
 from pathlib import Path
 import shutil
+import sys
 
 import yaml
 from dotenv import load_dotenv
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+SRC_ROOT = REPO_ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+
+from lecture_stt.shared.paths import env_file, resolve_config_path
 
 
 def _load_config(config_path: str = str(REPO_ROOT / "config" / "config.yaml")) -> dict:
-    # 실행에 필요한 설정을 읽고 없으면 기본 예시를 fallback으로 사용한다.
-    config_path = Path(config_path)
-    if not config_path.is_absolute():
-        config_path = REPO_ROOT / config_path
-
-    example_path = REPO_ROOT / "config" / "config.example.yaml"
+    # 실행에 필요한 설정을 읽는다.
+    config_path = resolve_config_path(config_path, base_dir=REPO_ROOT)
     if not config_path.exists():
-        if example_path.exists():
-            config_path = example_path
-        else:
-            raise FileNotFoundError("Missing config/config.yaml and config/config.example.yaml")
+        raise FileNotFoundError(f"Missing config file: {config_path}")
 
     return yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
 
@@ -33,8 +32,6 @@ def _ensure_config_defaults(config: dict) -> dict:
     # 누락 값은 기본값으로 채워 정리 작업이 중단되지 않게 한다.
     defaults = {
         "paths": {
-            "stable_audio_folder": "/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings/01_audio",
-            "transcript_folder": "/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings/02_transcripts",
             "tmp_dir": str(REPO_ROOT / "tmp"),
         },
         "cleanup": {
@@ -166,12 +163,18 @@ def main() -> None:
 
     dry_run = args.dry_run and not args.apply
 
-    load_dotenv(str(REPO_ROOT / ".env"), override=False)
+    load_dotenv(str(env_file(REPO_ROOT)), override=False)
     cfg = _ensure_config_defaults(_load_config(args.config))
+    paths_cfg = cfg.get("paths") or {}
 
-    audio_dir = Path(cfg["paths"]["stable_audio_folder"])
-    transcript_dir = Path(cfg["paths"]["transcript_folder"])
-    tmp_dir = Path(cfg["paths"]["tmp_dir"])
+    for key in ["stable_audio_folder", "transcript_folder"]:
+        value = paths_cfg.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"paths.{key} must be configured for cleanup")
+
+    audio_dir = resolve_config_path(str(paths_cfg["stable_audio_folder"]), base_dir=REPO_ROOT)
+    transcript_dir = resolve_config_path(str(paths_cfg["transcript_folder"]), base_dir=REPO_ROOT)
+    tmp_dir = resolve_config_path(str(paths_cfg["tmp_dir"]), base_dir=REPO_ROOT)
     retain_days = int(cfg["cleanup"]["retain_days"])
     min_transcripts = int(cfg.get("cleanup", {}).get("retain_min_transcripts", 5))
 

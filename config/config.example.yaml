@@ -1,15 +1,17 @@
+# Copy to config/config.yaml and replace env-backed external paths for your machine.
+# Repo-internal paths stay repo-relative.
 app:
   polling_interval_sec: 10
   stable_for_sec: 90
   stale_processing_hours: 6
 
 paths:
-  watch_folder: "/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings/00_inbox"
-  stable_audio_folder: "/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings/01_audio"
-  transcript_folder: "/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings/02_transcripts"
-  error_folder: "/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings/99_errors"
-  tmp_dir: /Users/geonha/lecture_stt/tmp
-  db_path: /Users/geonha/lecture_stt/state/jobs.sqlite3
+  watch_folder: "${LECTURE_RECORDINGS_ROOT}/00_inbox"
+  stable_audio_folder: "${LECTURE_RECORDINGS_ROOT}/01_audio"
+  transcript_folder: "${LECTURE_RECORDINGS_ROOT}/02_transcripts"
+  error_folder: "${LECTURE_RECORDINGS_ROOT}/99_errors"
+  tmp_dir: tmp
+  db_path: state/jobs.sqlite3
 
 engine:
   engine: faster-whisper
@@ -25,7 +27,7 @@ transcribe:
   word_timestamps: false
 
 ffmpeg:
-  binary_path: /opt/homebrew/bin/ffmpeg
+  binary_path: ffmpeg
 
 logging:
   file: logs/app.log
@@ -36,15 +38,23 @@ cleanup:
   retain_days: 7
   retain_min_transcripts: 5
 
+notification:
+  provider: telegram
+  enabled: true
+  send_start: true
+  send_success: true
+  send_failure: true
+  dual_send_providers: []
+
 downstream:
   scan_interval_sec: 30
   stable_for_sec: 60
-  correction_folder: "/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings/03_correction"
-  summary_folder: "/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings/04_summarize"
-  gh_current_semester_root: "/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/GH_archive/01_TUK/01_current_semester"
-  obsidian_semester_root: "/Users/geonha/Library/Mobile Documents/iCloud~md~obsidian/Documents/99_obsidian/StudyVaults/2-1"
-  log_jsonl_path: "/Users/geonha/lecture_stt/state/logs/downstream.jsonl"
-  lock_path: "/Users/geonha/lecture_stt/state/downstream.lock"
+  correction_folder: "${LECTURE_RECORDINGS_ROOT}/03_correction"
+  summary_folder: "${LECTURE_RECORDINGS_ROOT}/04_summarize"
+  gh_current_semester_root: "${GH_CURRENT_SEMESTER_ROOT}"
+  obsidian_semester_root: "${OBSIDIAN_SEMESTER_ROOT}"
+  log_jsonl_path: state/logs/downstream.jsonl
+  lock_path: state/downstream.lock
   subjects:
     LC:
       gh_course_dir: "01_logic_circuits"

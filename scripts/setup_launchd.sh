@@ -24,7 +24,7 @@ from pathlib import Path
 src = Path(sys.argv[1])
 dst = Path(sys.argv[2])
 repo = sys.argv[3]
-legacy_root = "/Users/geonha/lecture_stt"
+repo_placeholder = "__REPO_ROOT__"
 
 def rewrite(value):
     if isinstance(value, dict):
@@ -32,7 +32,7 @@ def rewrite(value):
     if isinstance(value, list):
         return [rewrite(item) for item in value]
     if isinstance(value, str):
-        return value.replace(legacy_root, repo)
+        return value.replace(repo_placeholder, repo)
     return value
 
 with src.open("rb") as handle:
@@ -41,6 +41,48 @@ with src.open("rb") as handle:
 with dst.open("wb") as handle:
     plistlib.dump(rewrite(payload), handle, sort_keys=False)
 PY
+}
+
+resolve_ffmpeg() {
+  local config_path="${LECTURE_STT_CONFIG:-$REPO/config/config.yaml}"
+  local config_candidate=""
+  if [ -f "$config_path" ]; then
+    config_candidate="$("$REPO/.venv/bin/python" - "$config_path" <<'PY' 2>/dev/null || true
+import sys
+from pathlib import Path
+
+import yaml
+
+config_path = Path(sys.argv[1])
+loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+ffmpeg = loaded.get("ffmpeg") or {}
+value = ffmpeg.get("binary_path", "")
+if value:
+    print(str(value).strip())
+PY
+)"
+  fi
+
+  local candidates=(
+    "${FFMPEG_BINARY:-}"
+    "$config_candidate"
+    "ffmpeg"
+  )
+
+  local candidate=""
+  for candidate in "${candidates[@]}"; do
+    if [ -z "$candidate" ]; then
+      continue
+    fi
+    if [[ "$candidate" != */* ]]; then
+      candidate="$(command -v "$candidate" 2>/dev/null || true)"
+    fi
+    if [ -n "$candidate" ] && [ -x "$candidate" ] && "$candidate" -version &>/dev/null; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  return 1
 }
 
 # ── 1. 가상환경 ──────────────────────────────────────────────
@@ -60,10 +102,10 @@ print_ok "패키지 설치 완료"
 
 # ── 3. ffmpeg 확인 ───────────────────────────────────────────
 print_step "ffmpeg 확인"
-if /opt/homebrew/bin/ffmpeg -version &>/dev/null; then
-  print_ok "ffmpeg 정상 (/opt/homebrew/bin/ffmpeg)"
+if FFMPEG_BIN="$(resolve_ffmpeg)"; then
+  print_ok "ffmpeg 정상 ($FFMPEG_BIN)"
 else
-  print_fail "ffmpeg 없음 → brew install ffmpeg 실행 필요"
+  print_fail "ffmpeg 없음 → config.ffmpeg.binary_path, FFMPEG_BINARY, 또는 PATH를 확인하세요"
   exit 1
 fi
 

@@ -10,7 +10,7 @@ from collections import deque
 from datetime import datetime
 from pathlib import Path
 
-from lecture_stt.shared.paths import package_env, repo_root, venv_python
+from lecture_stt.shared.paths import env_file, package_env, repo_root, resolve_config_path, runtime_env, venv_python
 
 _YAML_IMPORT_ERROR: Exception | None = None
 try:
@@ -74,7 +74,11 @@ class STTControlPanel(tk.Tk):
 
         self.config_data = self._load_config()
         self.paths = self.config_data.get("paths", {})
-        self.db_path = Path(self.paths.get("db_path", self.repo_root / "state" / "jobs.sqlite3"))
+        self.db_path = resolve_config_path(
+            str(self.paths.get("db_path", "state/jobs.sqlite3")),
+            base_dir=self.repo_root,
+            env=runtime_env(dotenv_path=env_file(self.repo_root)),
+        )
         self.log_path = self._resolve_log_path()
         self.pause_flag = self.db_path.parent / "paused"
 
@@ -157,11 +161,12 @@ class STTControlPanel(tk.Tk):
     def _resolve_log_path(self) -> Path:
         # 로그 파일 경로는 config.logging.file을 우선 사용하고 상대경로면 repo 기준으로 해석한다.
         logging_cfg = self.config_data.get("logging", {})
-        configured = logging_cfg.get("file", "logs/app.log")
-        path = Path(configured)
-        if not path.is_absolute():
-            path = self.repo_root / path
-        return path
+        configured = str(logging_cfg.get("file", "logs/app.log"))
+        return resolve_config_path(
+            configured,
+            base_dir=self.repo_root,
+            env=runtime_env(dotenv_path=env_file(self.repo_root)),
+        )
 
     def _build_ui(self) -> None:
         container = ttk.Frame(self, padding=12)

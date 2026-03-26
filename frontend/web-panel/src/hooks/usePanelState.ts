@@ -1,9 +1,14 @@
 import { useEffect, useRef, useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 
-import { FALLBACK_PANEL_ENDPOINTS, fetchPanelState, postPanelAction } from "../lib/panelApi"
+import {
+  FALLBACK_PANEL_ENDPOINTS,
+  fetchPanelState,
+  postNotificationSelection,
+  postPanelAction,
+} from "../lib/panelApi"
 import { subscribePanelEvents } from "../lib/panelEvents"
-import type { PanelAction, PanelState } from "../types"
+import type { NotificationSelection, PanelAction, PanelState } from "../types"
 
 const PANEL_STATE_QUERY_KEY = ["panel", "state"] as const
 
@@ -15,6 +20,8 @@ export function usePanelState() {
   const queryClient = useQueryClient()
   const pollTimerRef = useRef<number | null>(null)
   const [pendingAction, setPendingAction] = useState<PanelAction | null>(null)
+  const [pendingNotificationSelection, setPendingNotificationSelection] = useState<NotificationSelection | null>(null)
+  const [pendingNotificationApplyNow, setPendingNotificationApplyNow] = useState(false)
   const [logResetKey, setLogResetKey] = useState(0)
   const [realtimeConnected, setRealtimeConnected] = useState(false)
   const [streamError, setStreamError] = useState<string | null>(null)
@@ -92,6 +99,25 @@ export function usePanelState() {
     },
   })
 
+  const notificationMutation = useMutation({
+    mutationFn: async ({ selection, applyNow }: { selection: NotificationSelection; applyNow: boolean }) => {
+      const cachedState = queryClient.getQueryData<PanelState>(PANEL_STATE_QUERY_KEY)
+      const endpoints = cachedState?.actions.endpoints ?? stateQuery.data?.actions.endpoints ?? FALLBACK_PANEL_ENDPOINTS
+      return postNotificationSelection(endpoints.notification, selection, { applyNow })
+    },
+    onMutate: async ({ selection, applyNow }) => {
+      setPendingNotificationSelection(selection)
+      setPendingNotificationApplyNow(applyNow)
+    },
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: PANEL_STATE_QUERY_KEY })
+    },
+    onSettled: async () => {
+      setPendingNotificationSelection(null)
+      setPendingNotificationApplyNow(false)
+    },
+  })
+
   const error =
     streamError ||
     (actionMutation.error && toErrorMessage(actionMutation.error, "패널 작업 요청에 실패했습니다.")) ||
@@ -103,10 +129,15 @@ export function usePanelState() {
     isLoading: stateQuery.status === "pending" && stateQuery.data == null,
     error,
     pendingAction,
+    pendingNotificationSelection,
+    pendingNotificationApplyNow,
     logResetKey,
     realtimeConnected,
     runAction: async (action: PanelAction) => {
       await actionMutation.mutateAsync(action)
+    },
+    saveNotificationSelection: async (selection: NotificationSelection, applyNow: boolean = false) => {
+      await notificationMutation.mutateAsync({ selection, applyNow })
     },
     retry: async () => {
       await stateQuery.refetch()

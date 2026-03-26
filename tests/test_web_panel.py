@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import unittest
 from unittest import mock
 
@@ -95,3 +96,30 @@ class WebPanelRequestHandlerTests(unittest.TestCase):
         handler.do_POST()
 
         handler._api_error.assert_called_once_with(404, "Not Found")
+
+    def test_api_notification_route_dispatches_with_form_selection(self) -> None:
+        handler = object.__new__(web_panel.RequestHandler)
+        handler.path = "/api/notification"
+        handler.headers = {"Content-Length": "14"}
+        handler.rfile = io.BytesIO(b"selection=both")
+        handler._action_notification_update = mock.Mock()
+        handler._api_error = mock.Mock()
+
+        handler.do_POST()
+
+        handler._action_notification_update.assert_called_once_with("both", apply_now=True, api_mode=True)
+        handler._api_error.assert_not_called()
+
+    def test_api_notification_route_passes_apply_now_flag(self) -> None:
+        body = b"selection=discord&apply_now=1"
+        handler = object.__new__(web_panel.RequestHandler)
+        handler.path = "/api/notification"
+        handler.headers = {"Content-Length": str(len(body))}
+        handler.rfile = io.BytesIO(body)
+        handler._action_notification_update = mock.Mock()
+        handler._api_error = mock.Mock()
+
+        handler.do_POST()
+
+        handler._action_notification_update.assert_called_once_with("discord", apply_now=True, api_mode=True)
+        handler._api_error.assert_not_called()

@@ -58,12 +58,46 @@ function createPanelState(): PanelState {
       transcripts: "/tmp/transcripts",
       errors: "/tmp/errors",
     },
+    notification: {
+      selection: "telegram",
+      selected_label: "텔레그램만",
+      apply_label: "다음 시작부터 적용됩니다.",
+      restart_required: false,
+      can_apply_now: false,
+      options: [
+        {
+          id: "telegram",
+          label: "텔레그램만",
+          description: "TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID가 필요합니다.",
+          available: true,
+        },
+        {
+          id: "discord",
+          label: "디스코드만",
+          description: "DISCORD_WEBHOOK_URL이 필요합니다.",
+          available: true,
+        },
+        {
+          id: "both",
+          label: "둘 다",
+          description: "텔레그램과 디스코드 secret이 모두 필요합니다.",
+          available: true,
+        },
+        {
+          id: "disabled",
+          label: "끄기",
+          description: "알림 전송을 중단합니다.",
+          available: true,
+        },
+      ],
+    },
     actions: {
       pause_action: "pause",
       pause_label: "일시정지",
       endpoints: {
         state: "/api/state",
         logs: "/api/logs",
+        notification: "/api/notification",
         start: "/api/start",
         pause: "/api/pause",
         resume: "/api/resume",
