@@ -34,6 +34,31 @@ from lecture_stt.stt.quality_gate import evaluate as quality_evaluate
 from lecture_stt.stt.transcribe import EngineParams, STTWorker
 from lecture_stt.stt.watcher import PollingWatcher
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - macOS worker path uses fcntl.
+    fcntl = None  # type: ignore[assignment]
+
+
+class SingleInstanceLock:
+    def __init__(self, path: Path):
+        self.path = path
+        self._handle = None
+
+    def __enter__(self) -> "SingleInstanceLock":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._handle = self.path.open("a+", encoding="utf-8")
+        if fcntl is not None:
+            fcntl.flock(self._handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self._handle is None:
+            return
+        if fcntl is not None:
+            fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
+        self._handle.close()
+
 
 # 설정 파일을 읽고 기본 형식 유효성을 검사한다.
 def load_config(config_path: str = "config/config.yaml") -> dict:
@@ -387,6 +412,8 @@ class STTPipeline:
         self.error_dir = Path(paths["error_folder"])
         self.tmp_dir = Path(paths["tmp_dir"])
         self.db_path = Path(paths["db_path"])
+        self.staging_dir = self.tmp_dir / "inbox_staging"
+        self.worker_lock_path = self.db_path.parent / "stt.lock"
 
         app_cfg = self.config["app"]
         self.polling_interval_sec = int(app_cfg["polling_interval_sec"])
@@ -438,6 +465,7 @@ class STTPipeline:
             "파일 이동": 12,
             "중복 결과 재사용": 35,
             "전사 시작/진행": 18,
+            "로컬 staging": 12,
             "후처리(반복/노이즈 제거)": 78,
             "품질 검사": 88,
             "전사문 생성(TXT/JSON)": 94,
@@ -523,6 +551,24 @@ class STTPipeline:
 
     # 시작 시 PROCESSING으로 남은 작업을 정리해 중복 처리/중단 상태를 회복한다.
     def startup_recovery(self) -> None:
+        restored_staged, cleared_jobs = self._recover_staged_claims()
+        if restored_staged or cleared_jobs:
+            self._log(
+                logging.INFO,
+                "Recovered staged inputs: restored=%s cleared_jobs=%s",
+                {"job_id": "-", "canonical_base": "-"},
+                restored_staged,
+                cleared_jobs,
+            )
+        restored_pending, cleared_pending_jobs = self._recover_pending_canonical_claims()
+        if restored_pending or cleared_pending_jobs:
+            self._log(
+                logging.INFO,
+                "Recovered pending canonical claims: restored=%s cleared_jobs=%s",
+                {"job_id": "-", "canonical_base": "-"},
+                restored_pending,
+                cleared_pending_jobs,
+            )
         counts = db.recover_processing_jobs(self.conn, stale_processing_hours=self.stale_processing_hours)
         if any(counts.values()):
             self._log(
@@ -558,6 +604,109 @@ class STTPipeline:
             "transcript_txt_path": self.transcript_dir / f"{base_candidate}.txt",
             "transcript_json_path": self.transcript_dir / f"{base_candidate}.json",
         }
+
+    def _staging_path(self, source_path: Path) -> Path:
+        target = self.staging_dir / source_path.name
+        if target.exists():
+            safe_stem = utils.sanitize_stem(source_path.stem)
+            target = self.staging_dir / (
+                f"{safe_stem}__stage__{utils.local_timestamp()}__{utils.short_id(6)}{source_path.suffix.lower()}"
+            )
+        return target
+
+    def _skip_disappeared_source(
+        self,
+        *,
+        job_ctx: dict[str, str],
+        source_path: Path,
+        staging_path: Path,
+        canonical_audio: Path,
+    ) -> None:
+        already_claimed = canonical_audio.exists() or staging_path.exists()
+        if already_claimed:
+            message = f"source disappeared before claim; skipped duplicate race: {source_path}"
+        else:
+            message = f"source disappeared before claim; likely renamed or removed externally: {source_path}"
+
+        self._log(logging.WARNING, message, job_ctx)
+
+    def _requeue_target_for_staged(self, staged_path: Path, orig_inbox_path: str | None) -> Path:
+        if orig_inbox_path:
+            candidate = Path(orig_inbox_path)
+        else:
+            candidate = self.watch_dir / staged_path.name
+
+        try:
+            if not candidate.is_relative_to(self.watch_dir):
+                candidate = self.watch_dir / staged_path.name
+        except ValueError:
+            candidate = self.watch_dir / staged_path.name
+
+        if candidate.exists():
+            safe_stem = utils.sanitize_stem(candidate.stem)
+            candidate = self.watch_dir / (
+                f"{safe_stem}__requeued__{utils.local_timestamp()}__{utils.short_id(6)}{candidate.suffix.lower()}"
+            )
+        return candidate
+
+    def _recover_staged_claims(self) -> tuple[int, int]:
+        restored = 0
+        cleared_jobs = 0
+
+        if self.staging_dir.exists() and self.staging_dir.is_dir():
+            for item in sorted(self.staging_dir.iterdir()):
+                if not item.is_file():
+                    continue
+                target = self._requeue_target_for_staged(item, None)
+                utils.safe_move_file(item, target)
+                restored += 1
+
+        rows = self.conn.execute(
+            "SELECT id, canonical_audio_path, current_step FROM jobs "
+            "WHERE status IN (?, ?) ORDER BY id ASC",
+            (STATUS_PENDING, STATUS_PROCESSING),
+        ).fetchall()
+        for row in rows:
+            audio_path_raw = str(row["canonical_audio_path"] or "")
+            if not audio_path_raw:
+                continue
+            try:
+                audio_path = Path(audio_path_raw)
+                in_staging = audio_path.is_relative_to(self.staging_dir)
+            except ValueError:
+                in_staging = False
+            if not in_staging and str(row["current_step"] or "") != "로컬 staging":
+                continue
+            db.delete_job(self.conn, int(row["id"]))
+            cleared_jobs += 1
+
+        return restored, cleared_jobs
+
+    def _recover_pending_canonical_claims(self) -> tuple[int, int]:
+        restored = 0
+        cleared_jobs = 0
+
+        rows = self.conn.execute(
+            "SELECT id, orig_inbox_path, canonical_audio_path, transcript_txt_path, transcript_json_path "
+            "FROM jobs WHERE status = ? ORDER BY id ASC",
+            (STATUS_PENDING,),
+        ).fetchall()
+        for row in rows:
+            canonical_audio_raw = str(row["canonical_audio_path"] or "")
+            if not canonical_audio_raw:
+                continue
+            canonical_audio = Path(canonical_audio_raw)
+            if not canonical_audio.exists():
+                continue
+            if db._has_complete_transcripts(row["transcript_txt_path"], row["transcript_json_path"]):
+                continue
+            target = self._requeue_target_for_staged(canonical_audio, row["orig_inbox_path"])
+            utils.safe_move_file(canonical_audio, target)
+            db.delete_job(self.conn, int(row["id"]))
+            restored += 1
+            cleared_jobs += 1
+
+        return restored, cleared_jobs
 
     def _metadata(self, canonical_base: str, started_at: str, ended_at: str, preprocess_sec: float,
                   transcribe_sec: float, total_sec: float, orig_inbox_path: str,
@@ -739,46 +888,15 @@ class STTPipeline:
         canonical_audio = paths["canonical_audio_path"]
         txt_path = paths["transcript_txt_path"]
         json_path = paths["transcript_json_path"]
+        staging_source = self._staging_path(source_path)
         job_ctx = {"job_id": "-", "canonical_base": canonical_base}
 
         utils.ensure_dir(self.audio_dir)
         utils.ensure_dir(self.transcript_dir)
+        utils.ensure_dir(self.staging_dir)
 
-        job_id = db.create_job(
-            self.conn,
-            status=STATUS_PENDING,
-            orig_inbox_path=str(source_path),
-            orig_name=source_path.name,
-            canonical_base=canonical_base,
-            canonical_audio_path=str(canonical_audio),
-            transcript_txt_path=str(txt_path),
-            transcript_json_path=str(json_path),
-            engine_params={
-                "engine": "faster-whisper",
-                "model_size": self.params.model_size,
-                "device": self.params.device,
-                "compute_type": self.params.compute_type,
-                "language": self.params.language,
-                "task": self.params.task,
-                "beam_size": self.params.beam_size,
-                "vad_filter": self.params.vad_filter,
-                "word_timestamps": self.params.word_timestamps,
-                "condition_on_previous_text": self.params.condition_on_previous_text,
-            },
-            current_step="파일 감지",
-            progress_pct=10,
-        )
-        job_ctx["job_id"] = str(job_id)
-        self._update_progress(job_id, "파일 감지")
-        queue = self._queue_status()
-        self.notifier.notify_detected({
-            "job_id": job_id,
-            "orig_name": source_path.name,
-            "canonical_base": canonical_base,
-            "pending_count": queue.get("PENDING", 0),
-            "processing_count": queue.get("PROCESSING", 0),
-        })
-
+        job_id: int | None = None
+        source_claim_path: Path | None = None
         canonical_audio_final: Path | None = None
         tmp_wav: Path | None = None
         # 실패 발생 시 어떤 단계에서 중단되었는지 추적해 장애 분석에 바로 활용한다.
@@ -786,16 +904,70 @@ class STTPipeline:
 
         try:
             if not source_path.exists():
-                # 파일 이동 전에 원본이 존재하는지 먼저 확인한다. 없으면 즉시 실패 처리한다.
-                fail_step = "입력 파일 검증"
-                self._update_progress(job_id, "파일 감지")
-                raise FileNotFoundError(f"Source file disappeared before move: {source_path}")
+                self._skip_disappeared_source(
+                    job_ctx=job_ctx,
+                    source_path=source_path,
+                    staging_path=staging_source,
+                    canonical_audio=canonical_audio,
+                )
+                return
 
-            # 안정적인 경로로 음원 파일을 옮겨 후속 처리를 시작한다.
+            # iCloud inbox 원본은 먼저 로컬 staging으로 옮겨 이후 처리에서 rename/sync 영향을 줄인다.
+            fail_step = "로컬 staging"
+            self._update_progress(job_id, "로컬 staging", 15)
+            try:
+                utils.safe_move_file(source_path, staging_source)
+            except FileNotFoundError:
+                self._skip_disappeared_source(
+                    job_ctx=job_ctx,
+                    source_path=source_path,
+                    staging_path=staging_source,
+                    canonical_audio=canonical_audio,
+                )
+                return
+            source_claim_path = staging_source
+
+            job_id = db.create_job(
+                self.conn,
+                status=STATUS_PENDING,
+                orig_inbox_path=str(source_path),
+                orig_name=source_path.name,
+                canonical_base=canonical_base,
+                canonical_audio_path=str(staging_source),
+                transcript_txt_path=str(txt_path),
+                transcript_json_path=str(json_path),
+                engine_params={
+                    "engine": "faster-whisper",
+                    "model_size": self.params.model_size,
+                    "device": self.params.device,
+                    "compute_type": self.params.compute_type,
+                    "language": self.params.language,
+                    "task": self.params.task,
+                    "beam_size": self.params.beam_size,
+                    "vad_filter": self.params.vad_filter,
+                    "word_timestamps": self.params.word_timestamps,
+                    "condition_on_previous_text": self.params.condition_on_previous_text,
+                },
+                current_step="로컬 staging",
+                progress_pct=15,
+            )
+            job_ctx["job_id"] = str(job_id)
+
+            queue = self._queue_status()
+            self.notifier.notify_detected({
+                "job_id": job_id,
+                "orig_name": source_path.name,
+                "canonical_base": canonical_base,
+                "pending_count": queue.get("PENDING", 0),
+                "processing_count": queue.get("PROCESSING", 0),
+            })
+
+            # 안정적인 로컬 staging에서 canonical audio 경로로 옮겨 후속 처리를 시작한다.
             fail_step = "파일 이동"
             self._update_progress(job_id, "파일 이동", 20)
-            utils.safe_move_file(source_path, canonical_audio)
+            utils.safe_move_file(staging_source, canonical_audio)
             canonical_audio_final = canonical_audio
+            source_claim_path = canonical_audio_final
             sha256 = utils.compute_sha256(canonical_audio_final)
             db.update_job(
                 self.conn,
@@ -982,38 +1154,39 @@ class STTPipeline:
             self.logger.exception("job processing failed")
             # 예상치 못한 예외는 방어적으로 Unknown으로 남겨 원인 분류가 누락되지 않게 한다.
             fail_step = fail_step or "Unknown"
-            error_audio = canonical_audio_final
-            if canonical_audio_final and canonical_audio_final.exists():
-                error_audio = self._move_to_errors(canonical_audio_final)
+            error_audio = source_claim_path
+            if source_claim_path and source_claim_path.exists():
+                error_audio = self._move_to_errors(source_claim_path)
 
-            db.update_job(
-                self.conn,
-                job_id,
-                status=STATUS_ERROR,
-                ended_at=utils.now_iso(),
-                error_message=str(exc),
-                error_trace=tb,
-                canonical_audio_path=str(error_audio) if error_audio else str(canonical_audio),
-                current_step=f"실패: {fail_step}",
-                progress_pct=0,
-                eta_sec=None,
-            )
-            self._update_progress(job_id, f"실패: {fail_step}", 0, None)
-            queue = self._queue_status()
+            if job_id is not None:
+                db.update_job(
+                    self.conn,
+                    job_id,
+                    status=STATUS_ERROR,
+                    ended_at=utils.now_iso(),
+                    error_message=str(exc),
+                    error_trace=tb,
+                    canonical_audio_path=str(error_audio) if error_audio else str(canonical_audio),
+                    current_step=f"실패: {fail_step}",
+                    progress_pct=0,
+                    eta_sec=None,
+                )
+                self._update_progress(job_id, f"실패: {fail_step}", 0, None)
+                queue = self._queue_status()
 
-            self.notifier.notify_error({
-                "job_id": job_id,
-                "orig_name": source_path.name,
-                "canonical_base": canonical_base,
-                "orig_inbox_path": str(source_path),
-                "canonical_audio_path": str(error_audio) if error_audio else str(canonical_audio),
-                "transcript_txt_path": str(txt_path),
-                "transcript_json_path": str(json_path),
-                "error_message": str(exc),
-                "error_step": fail_step,
-                "pending_count": queue.get("PENDING", 0),
-                "processing_count": queue.get("PROCESSING", 0),
-            })
+                self.notifier.notify_error({
+                    "job_id": job_id,
+                    "orig_name": source_path.name,
+                    "canonical_base": canonical_base,
+                    "orig_inbox_path": str(source_path),
+                    "canonical_audio_path": str(error_audio) if error_audio else str(canonical_audio),
+                    "transcript_txt_path": str(txt_path),
+                    "transcript_json_path": str(json_path),
+                    "error_message": str(exc),
+                    "error_step": fail_step,
+                    "pending_count": queue.get("PENDING", 0),
+                    "processing_count": queue.get("PROCESSING", 0),
+                })
             self._log(logging.ERROR, "failed", job_ctx)
         finally:
             if tmp_wav:
@@ -1115,7 +1288,13 @@ def main() -> None:
     )
 
     logger.info("Loaded and validated configuration from %s", args.config)
-    STTPipeline(config=config, logger=logger).run(run_once=args.once)
+    lock_path = Path(config["paths"]["db_path"]).parent / "stt.lock"
+    try:
+        with SingleInstanceLock(lock_path):
+            logger.info("Acquired main worker lock at %s", lock_path)
+            STTPipeline(config=config, logger=logger).run(run_once=args.once)
+    except BlockingIOError:
+        logger.warning("Another STT worker is already running; exiting (lock=%s)", lock_path)
 
 
 if __name__ == "__main__":

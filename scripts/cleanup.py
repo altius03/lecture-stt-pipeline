@@ -126,11 +126,15 @@ def _cleanup_tmp(tmp_dir: Path, dry_run: bool) -> int:
         raise ValueError(f"Tmp path is not a directory: {tmp_dir}")
 
     deleted = 0
+    preserved_dirs = {"inbox_staging"}
     for item in tmp_dir.iterdir():
         _assert_under_base(item, tmp_dir)
         if item.is_file() and _delete_path(item, dry_run):
             deleted += 1
         elif item.is_dir():
+            if item.name in preserved_dirs:
+                print(f"preserved tmp directory: {item}")
+                continue
             if not dry_run:
                 shutil.rmtree(item)
                 print(f"removed directory: {item}")

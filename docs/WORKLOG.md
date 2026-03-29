@@ -3,6 +3,22 @@
 이 파일은 저장소에 반영된 변경을 날짜순으로 누적 기록한다.
 최신 항목을 위에 추가한다.
 
+## 2026-03-29
+
+### 메인 워커 선점 레이스 완화와 로컬 staging 추가
+- 메인 STT 워커 시작 시 `state/stt.lock` 파일 락을 잡아 launchd, 수동 실행, 제어판 실행이 겹쳐도 동시에 두 개 이상 돌지 않도록 막았다.
+- inbox에서 안정 판정된 파일은 바로 `01_audio`로 가지 않고 `tmp/inbox_staging`으로 먼저 선점 이동한 뒤 canonical audio로 넘기도록 바꿔, iCloud rename/sync가 전사 본 처리 단계에 끼어드는 구간을 줄였다.
+- claim 전에 원본이 사라진 경우는 최근 동일 source를 다른 워커가 이미 잡았는지 재확인하고, benign race나 외부 rename 가능성으로 판단되면 ERROR 대신 warning log만 남기고 skip하도록 완화했다.
+- 워커 재시작 시 `tmp/inbox_staging`에 남은 파일을 inbox로 되돌리고, 대응되는 stale staging job을 정리하도록 보완했다.
+- 추가로 `01_audio`에만 남은 pre-claim `PENDING` 오디오도 시작 복구 시 inbox로 되돌려, canonical move 직후 크래시가 영구 정체로 남지 않게 했다.
+- scheduled cleanup이 `tmp/inbox_staging`을 삭제하지 않도록 예외 처리하고, 관련 STT/cleanup 회귀 테스트를 추가했다.
+
+## 2026-03-27
+
+### PyCharm 모듈 루트 설정 수정
+- `.idea/lecture_stt.iml`의 module content root가 `.idea/`를 가리키고 있어 프로젝트 파일 트리가 비정상적으로 보일 수 있던 문제를 수정했다.
+- module root를 저장소 루트 기준으로 바꾸고 `src/`, `.venv/` 경로도 같은 기준으로 다시 연결했다.
+
 ## 2026-03-26
 
 ### 경로 설정 정책 정리와 사용자 절대경로 제거

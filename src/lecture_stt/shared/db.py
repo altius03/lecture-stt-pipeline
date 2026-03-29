@@ -263,6 +263,11 @@ def update_job(conn: sqlite3.Connection, job_id: int, **fields: Any) -> None:
     conn.commit()
 
 
+def delete_job(conn: sqlite3.Connection, job_id: int) -> None:
+    conn.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
+    conn.commit()
+
+
 def claim_job_for_processing(conn: sqlite3.Connection, job_id: int) -> bool:
     now = _now()
     cur = conn.execute(

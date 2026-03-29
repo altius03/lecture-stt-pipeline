@@ -15,6 +15,7 @@
 - `tests/`: downstream 배포 계층 테스트
 - `state/`: SQLite DB, pause flag, 구조화 로그
 - `tmp/`: ffmpeg 전처리 산출물 등 임시 파일
+- `tmp/inbox_staging/`: iCloud inbox에서 선점한 원본을 로컬로 잠시 옮겨 두는 staging 영역
 
 ## 현재 소스 구조
 - 실제 구현 코드는 `src/lecture_stt/` 패키지 아래에 정리되어 있다.
@@ -29,7 +30,8 @@
 - `load_config()`와 `validate_config()`가 설정 파일을 읽고 경로, ffmpeg, 쓰기 권한을 검증한다.
 - `STTPipeline`이 전체 작업을 오케스트레이션한다.
 - `PollingWatcher`가 inbox 폴더를 polling하면서 일정 시간 이상 변하지 않은 파일만 안정 파일로 판단한다.
-- 안정 파일은 `01_audio`로 이동한 뒤 SHA-256을 계산한다.
+- 안정 파일은 먼저 로컬 `tmp/inbox_staging`으로 선점 이동한 뒤 `01_audio`로 옮겨, iCloud rename/sync 영향이 전사 중간 단계로 번지지 않게 한다.
+- 워커 시작 시 `tmp/inbox_staging`에 남아 있던 중단 파일과 `01_audio`에만 남은 pre-claim pending 오디오는 다시 inbox로 되돌려 재처리하고, 대응되는 stale job row도 정리한다.
 - 같은 SHA-256의 완료 작업이 있으면 기존 결과를 복제해 dedupe 처리한다.
 - 중복이 아니면 `STTWorker`가 ffmpeg로 WAV 전처리 후 faster-whisper 전사를 수행한다.
 - 전사 결과는 `postprocess()`로 반복/노이즈/오인식 용어를 정리한다.
@@ -47,6 +49,8 @@
 - `src/lecture_stt/stt/quality_gate.py`: 품질 보고서 생성
 - `src/lecture_stt/stt/notifier.py`: Telegram/Discord notifier, 중복 방지 마커, provider 팩토리
 - `src/lecture_stt/shared/utils.py`: 파일 이동, atomic write, hash, pause flag 등 공용 함수
+- 메인 워커는 `state/stt.lock` 파일 락으로 단일 인스턴스를 보장하고, claim 전에 원본이 사라진 경우는 다른 워커 선점 또는 외부 rename 가능성으로 보고 경고 후 skip한다.
+- scheduled cleanup은 `tmp/`를 정리하되 `tmp/inbox_staging`은 보존해 복구 대기 중인 claimed input을 삭제하지 않는다.
 
 ## 상태 저장
 - `src/lecture_stt/shared/db.py`가 SQLite 스키마와 접근 로직을 담당한다.

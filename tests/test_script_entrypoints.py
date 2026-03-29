@@ -74,3 +74,18 @@ class ScriptEntrypointTests(unittest.TestCase):
 
         module = _load_module("ab_test_script", REPO_ROOT / "scripts" / "ab_test.py")
         self.assertEqual(module.resolve_ffmpeg_path("ffmpeg"), ffmpeg_path)
+
+    def test_cleanup_tmp_preserves_inbox_staging_directory(self) -> None:
+        module = _load_module("cleanup_script", REPO_ROOT / "scripts" / "cleanup.py")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tmp_root = Path(temp_dir)
+            staging_dir = tmp_root / "inbox_staging"
+            staging_dir.mkdir(parents=True, exist_ok=True)
+            (staging_dir / "claimed.m4a").write_bytes(b"audio")
+            (tmp_root / "old.tmp").write_text("x", encoding="utf-8")
+
+            deleted = module._cleanup_tmp(tmp_root, dry_run=False)
+
+            self.assertEqual(deleted, 1)
+            self.assertTrue(staging_dir.exists())
+            self.assertTrue((staging_dir / "claimed.m4a").exists())
