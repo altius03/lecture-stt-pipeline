@@ -22,7 +22,7 @@
 - `src/lecture_stt/stt/`: 메인 STT 파이프라인
 - `src/lecture_stt/shared/`: 공용 DB, 유틸
 - `src/lecture_stt/downstream/`: correction/summary 배포 파이프라인
-- `src/lecture_stt/ui/`: 웹/Tk 제어판
+- `src/lecture_stt/ui/`: 웹 제어판
 - 운영 스크립트는 `PYTHONPATH=<repo>/src python -m lecture_stt...` 방식으로 패키지를 직접 실행한다.
 
 ## 메인 STT 파이프라인
@@ -76,7 +76,7 @@
 - 최근 작업과 로그는 분리 카드 대신 하나의 Activity 패널로 묶어, 최근 작업 행 선택과 해당 작업 중심의 한국어 운영 로그 확인을 한 흐름으로 제공한다.
 - Activity 패널의 로그 영역은 raw log를 그대로 유지하되, `logParser.ts`가 반복 패턴을 파싱해 과목/날짜/요일/교시를 포함한 한국어 운영 로그 뷰와 오류 전용 뷰를 함께 제공한다.
 - pause/resume는 별도 IPC 대신 `state/paused` 플래그 파일로 제어한다.
-- `src/lecture_stt/ui/tk_panel.py`는 Tk 기반 구형 GUI이며, 현재 운영 문서와 스크립트는 웹 패널 중심이다.
+- Tk 기반 구형 GUI는 제거했고, 운영 제어면은 웹 패널로 단일화한다.
 
 ## Downstream 배포 파이프라인
 - 진입점은 `src/lecture_stt/downstream/worker.py`다.

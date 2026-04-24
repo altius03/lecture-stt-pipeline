@@ -239,6 +239,10 @@ def validate_config(config_path: str, config: dict) -> dict:
         transcribe["condition_on_previous_text"] = parse_bool(
             "transcribe.condition_on_previous_text", transcribe["condition_on_previous_text"]
         )
+    if "keep_model_loaded" in transcribe:
+        transcribe["keep_model_loaded"] = parse_bool(
+            "transcribe.keep_model_loaded", transcribe["keep_model_loaded"]
+        )
 
     if notification:
         provider = str(notification.get("provider", "auto") or "auto").strip().lower()
@@ -299,6 +303,7 @@ def _ensure_config_defaults(config: dict) -> dict:
             "vad_filter": False,
             "word_timestamps": False,
             "condition_on_previous_text": True,
+            "keep_model_loaded": False,
         },
         "ffmpeg": {"binary_path": "ffmpeg"},
         "logging": {
@@ -437,6 +442,7 @@ class STTPipeline:
             vad_threshold=float(trans.get("vad_threshold", 0.55)),
             min_silence_duration_ms=int(trans.get("min_silence_duration_ms", 1200)),
             initial_prompt=str(trans.get("initial_prompt", "")),
+            keep_model_loaded=bool(trans.get("keep_model_loaded", False)),
         )
 
         self.worker = STTWorker(self.params, self.config["ffmpeg"]["binary_path"], str(self.tmp_dir))
@@ -584,6 +590,13 @@ class STTPipeline:
     def _log(self, level: int, message: str, job_ctx: Dict[str, str], *args: Any) -> None:
         self.logger.log(level, message, *args, extra=job_ctx)
 
+    def _release_worker_model_if_idle(self) -> None:
+        if self.params.keep_model_loaded:
+            return
+        unload = getattr(self.worker, "unload_model", None)
+        if callable(unload):
+            unload()
+
     # 소스 파일 기준으로 유일한 base와 경로들을 생성한다.
     # 원본 파일명이 앞에 와서 전사물에서 원본을 쉽게 식별할 수 있다.
     def _job_paths(self, source_path: Path) -> Dict[str, Any]:
@@ -649,6 +662,13 @@ class STTPipeline:
             )
         return candidate
 
+    def _original_base_from_staging_stem(self, stem: str) -> str:
+        # __stage__ 또는 __requeued__ 마커 앞부분만 추출해 원본 base를 복원한다.
+        for marker in ("__stage__", "__requeued__"):
+            if marker in stem:
+                return stem.split(marker)[0]
+        return utils.sanitize_stem(stem)
+
     def _recover_staged_claims(self) -> tuple[int, int]:
         restored = 0
         cleared_jobs = 0
@@ -656,6 +676,23 @@ class STTPipeline:
         if self.staging_dir.exists() and self.staging_dir.is_dir():
             for item in sorted(self.staging_dir.iterdir()):
                 if not item.is_file():
+                    continue
+                # 이미 DONE된 base의 staging 잔여물은 재처리 없이 삭제한다.
+                original_base = self._original_base_from_staging_stem(item.stem)
+                done_row = self.conn.execute(
+                    "SELECT id FROM jobs WHERE canonical_base = ? AND status = ? LIMIT 1",
+                    (original_base, STATUS_DONE),
+                ).fetchone()
+                if done_row:
+                    self.logger.info(
+                        "recovery: staging 잔여물 삭제 (job %s 이미 DONE): %s",
+                        done_row["id"], item,
+                    )
+                    try:
+                        item.unlink()
+                    except OSError:
+                        pass
+                    cleared_jobs += 1
                     continue
                 target = self._requeue_target_for_staged(item, None)
                 utils.safe_move_file(item, target)
@@ -731,6 +768,7 @@ class STTPipeline:
             "vad_filter": self.params.vad_filter,
             "word_timestamps": self.params.word_timestamps,
             "condition_on_previous_text": self.params.condition_on_previous_text,
+            "keep_model_loaded": self.params.keep_model_loaded,
             "timings": {
                 "preprocess_sec": round(float(preprocess_sec), 6),
                 "transcribe_sec": round(float(transcribe_sec), 6),
@@ -947,6 +985,7 @@ class STTPipeline:
                     "vad_filter": self.params.vad_filter,
                     "word_timestamps": self.params.word_timestamps,
                     "condition_on_previous_text": self.params.condition_on_previous_text,
+                    "keep_model_loaded": self.params.keep_model_loaded,
                 },
                 current_step="로컬 staging",
                 progress_pct=15,
@@ -1191,6 +1230,7 @@ class STTPipeline:
         finally:
             if tmp_wav:
                 self.worker.cleanup_tmp(tmp_wav)
+            self._release_worker_model_if_idle()
 
     def run(self, run_once: bool = False) -> None:
         # 파이프라인을 루프 또는 한 번 처리 모드로 실행하고 pause 상태를 반영한다.

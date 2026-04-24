@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import logging
 import os
 import subprocess
@@ -8,8 +9,6 @@ import wave
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, List, Tuple
-
-from faster_whisper import WhisperModel
 
 from lecture_stt.shared.utils import ensure_dir
 
@@ -35,6 +34,7 @@ class EngineParams:
     vad_threshold: float = 0.55
     min_silence_duration_ms: int = 1200
     initial_prompt: str = ""
+    keep_model_loaded: bool = False
 
 
 class STTWorker:
@@ -44,11 +44,36 @@ class STTWorker:
         self.ffmpeg_path = ffmpeg_path
         self.tmp_dir = Path(tmp_dir)
         ensure_dir(self.tmp_dir)
-        self.model = WhisperModel(
-            params.model_size,
-            device=params.device,
-            compute_type=params.compute_type,
-        )
+        self._model = None
+
+    @property
+    def model(self):
+        if self._model is None:
+            from faster_whisper import WhisperModel
+
+            logger.info(
+                "Loading Whisper model: %s (%s/%s)",
+                self.params.model_size,
+                self.params.device,
+                self.params.compute_type,
+            )
+            self._model = WhisperModel(
+                self.params.model_size,
+                device=self.params.device,
+                compute_type=self.params.compute_type,
+            )
+        return self._model
+
+    @model.setter
+    def model(self, value) -> None:
+        self._model = value
+
+    def unload_model(self) -> None:
+        if self._model is None:
+            return
+        self._model = None
+        gc.collect()
+        logger.info("Unloaded Whisper model from idle worker")
 
     # ffmpeg로 wav 형식으로 변환해 모델 입력 형식으로 정규화한다.
     def preprocess(self, src_audio: Path, canonical_base: str) -> Path:

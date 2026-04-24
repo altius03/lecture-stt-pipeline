@@ -281,12 +281,12 @@ class ControlState:
             self.notice = "알림 채널이 저장되었습니다. 다음 시작부터 적용됩니다."
         self._set_poll_boost()
 
-    def _wait_for_worker_shutdown(self, timeout_sec: float = 8.0) -> bool:
+    def _wait_for_worker_shutdown(self, timeout_sec: float = 30.0) -> bool:
         deadline = time.monotonic() + max(0.0, timeout_sec)
         while time.monotonic() < deadline:
             if not self._is_managed_running() and not self._find_worker_pids():
                 return True
-            time.sleep(0.2)
+            time.sleep(0.5)
         return not self._is_managed_running() and not self._find_worker_pids()
 
     def restart_worker_for_notification(self) -> None:
@@ -297,7 +297,7 @@ class ControlState:
 
         if not (self._is_managed_running() or self._find_worker_pids()):
             self._notification_restart_required = False
-            self.notice = "실행 중 워커가 없어 재시작은 건너뛰었습니다. 다음 시작부터 적용됩니다."
+            self.notice = "알림 채널이 저장되었습니다. 다음 시작부터 적용됩니다."
             self._set_poll_boost()
             return
 
@@ -305,7 +305,10 @@ class ControlState:
         if "실패" in self.notice:
             return
         if not self._wait_for_worker_shutdown():
-            self.notice = "알림 채널은 저장했지만 기존 워커 종료가 지연되어 즉시 적용하지 못했습니다."
+            # 타임아웃: 전사 중일 수 있음. config는 이미 저장됐으므로
+            # 새 관리 워커는 시작하지 않고 기존 워커 자연 종료를 기다린다.
+            self._notification_restart_required = False
+            self.notice = "알림 채널 저장 완료. 현재 전사가 끝나면 반영됩니다 (워커를 재시작하면 즉시 적용)."
             self._set_poll_boost()
             return
         self.start()
@@ -858,7 +861,7 @@ class ControlState:
 
             if managed_running or pids:
                 runtime = "일시정지" if paused else "실행중"
-                runtime_desc = "일시정지 상태(큐/파일 대기 중)"
+                runtime_desc = "일시정지 상태(큐/파일 대기 중)" if paused else "큐/파일 대기 중"
             elif paused:
                 runtime = "일시정지"
                 runtime_desc = "일시정지 상태(워커 미실행)"

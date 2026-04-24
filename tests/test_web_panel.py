@@ -97,7 +97,7 @@ class WebPanelRequestHandlerTests(unittest.TestCase):
 
         handler._api_error.assert_called_once_with(404, "Not Found")
 
-    def test_api_notification_route_dispatches_with_form_selection(self) -> None:
+    def test_api_notification_route_defaults_to_deferred_apply(self) -> None:
         handler = object.__new__(web_panel.RequestHandler)
         handler.path = "/api/notification"
         handler.headers = {"Content-Length": "14"}
@@ -107,7 +107,7 @@ class WebPanelRequestHandlerTests(unittest.TestCase):
 
         handler.do_POST()
 
-        handler._action_notification_update.assert_called_once_with("both", apply_now=True, api_mode=True)
+        handler._action_notification_update.assert_called_once_with("both", apply_now=False, api_mode=True)
         handler._api_error.assert_not_called()
 
     def test_api_notification_route_passes_apply_now_flag(self) -> None:

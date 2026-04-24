@@ -97,7 +97,7 @@ fi
 
 # ── 2. 패키지 설치 ───────────────────────────────────────────
 print_step "패키지 설치 확인"
-"$REPO/.venv/bin/pip" install -q -r "$REPO/requirements.txt"
+"$REPO/.venv/bin/python" -m pip install -q -r "$REPO/requirements.txt"
 print_ok "패키지 설치 완료"
 
 # ── 3. ffmpeg 확인 ───────────────────────────────────────────

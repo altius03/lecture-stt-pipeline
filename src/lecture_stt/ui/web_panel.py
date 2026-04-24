@@ -279,6 +279,13 @@ function text(v) {
   return (v === null || v === undefined) ? '' : String(v);
 }
 
+function esc(v) {
+  if (v === null || v === undefined) return '';
+  return String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+                  .replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+                  .replace(/'/g, '&#39;');
+}
+
 function setActionLabel(label) {
   const button = document.getElementById('pauseBtn');
   if (button) {
@@ -329,13 +336,13 @@ function updateJobs(rows) {
   for (const row of rows) {
     const [job_id, status, orig_name, updated_at, step, progress, error_msg] = row;
     html += '<tr>' +
-      '<td>' + text(job_id) + '</td>' +
-      '<td>' + text(status) + '</td>' +
-      '<td>' + text(orig_name) + '</td>' +
-      '<td>' + text(updated_at) + '</td>' +
+      '<td>' + esc(job_id) + '</td>' +
+      '<td>' + esc(status) + '</td>' +
+      '<td>' + esc(orig_name) + '</td>' +
+      '<td>' + esc(updated_at) + '</td>' +
       '<td>' + formatProgressValue(progress) + '%</td>' +
-      '<td>' + text(step) + '</td>' +
-      '<td>' + text(error_msg) + '</td>' +
+      '<td>' + esc(step) + '</td>' +
+      '<td>' + esc(error_msg) + '</td>' +
       '</tr>';
   }
   target.innerHTML = html;
@@ -352,7 +359,7 @@ function updateProcessing(rows) {
   for (const row of rows) {
     const [job_id, file_name, step, progress, eta_sec] = row;
     const etaText = formatEta(eta_sec);
-    html += `<li>#${text(job_id)} ${text(file_name)} : ${text(step)} (${text(progress)}%) / 이 파일 완료예정 ${etaText}</li>`;
+    html += `<li>#${esc(job_id)} ${esc(file_name)} : ${esc(step)} (${esc(progress)}%) / 이 파일 완료예정 ${esc(etaText)}</li>`;
   }
   target.innerHTML = html;
 }
@@ -794,7 +801,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 selection = fields.get("selection", "")
                 apply_now_raw = fields.get("apply_now")
                 if apply_now_raw is None or apply_now_raw == "":
-                    apply_now = True
+                    apply_now = False
                 else:
                     apply_now = apply_now_raw.strip().lower() in {"1", "true", "yes", "on"}
                 self._action_notification_update(selection, apply_now=apply_now, api_mode=True)

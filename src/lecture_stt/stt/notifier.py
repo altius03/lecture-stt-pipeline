@@ -283,6 +283,10 @@ class TelegramNotifier(BaseNotifier):
     def _api_base(self) -> str:
         return f"https://api.telegram.org/bot{self.bot_token}"
 
+    @property
+    def _safe_api_base(self) -> str:
+        return "https://api.telegram.org/bot<REDACTED>"
+
     def _test_bot(self) -> None:
         if not self.bot_token:
             return
@@ -298,8 +302,8 @@ class TelegramNotifier(BaseNotifier):
                 response.status_code,
                 self._truncate(response.text, 200),
             )
-        except Exception:
-            logger.exception("Telegram bot verification failed")
+        except Exception as exc:
+            logger.error("Telegram bot verification failed: %s", exc, exc_info=False)
 
     def _transport_send(self, content: str) -> bool:
         if not self.bot_token or not self.chat_id:
