@@ -58,7 +58,7 @@ export function PanelHero({
         </div>
         <div>
           <p className="eyebrow">Lecture STT</p>
-          <h1>전사 파이프라인 관제판</h1>
+          <h1>강의 전사 운영 패널</h1>
         </div>
       </div>
 
