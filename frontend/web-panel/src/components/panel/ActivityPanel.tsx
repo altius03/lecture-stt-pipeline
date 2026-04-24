@@ -145,7 +145,7 @@ export function ActivityPanel({
   )
   const visibleEntries = useMemo(() => {
     const sourceEntries = viewMode === "errors" ? errorEntries : selectedEntries
-    return [...sourceEntries].slice(-14).reverse()
+    return [...sourceEntries].slice(-5).reverse()
   }, [errorEntries, selectedEntries, viewMode])
 
   function handleRowKeyDown(event: KeyboardEvent<HTMLTableRowElement>, jobId: number) {
@@ -157,10 +157,17 @@ export function ActivityPanel({
 
   return (
     <SectionCard label="Activity" title="최근 작업과 운영 로그" className="activity-card">
-      <p className="notice-copy">최근 작업을 고르면 해당 파일 기준의 운영 로그를 바로 아래에서 확인할 수 있습니다.</p>
-
       <div className="table-wrap activity-table">
         <table>
+          <colgroup>
+            <col className="jobs-col-id" />
+            <col className="jobs-col-status" />
+            <col className="jobs-col-file" />
+            <col className="jobs-col-updated" />
+            <col className="jobs-col-progress" />
+            <col className="jobs-col-step" />
+            <col className="jobs-col-error" />
+          </colgroup>
           <thead>
             <tr>
               <th>ID</th>
@@ -193,12 +200,12 @@ export function ActivityPanel({
                     }}
                   >
                     <td className="mono-cell">{job.id}</td>
-                    <td><span className={statusClassName(job.status)}>{job.status}</span></td>
+                    <td className="status-cell"><span className={statusClassName(job.status)}>{job.status}</span></td>
                     <td className="file-cell">{job.file_name}</td>
                     <td className="muted-cell">{job.updated_at}</td>
-                    <td className="mono-cell">{job.progress_pct}%</td>
-                    <td>{job.step}</td>
-                    <td className="error-cell">{job.error_message || "-"}</td>
+                    <td className="mono-cell progress-cell">{job.progress_pct}%</td>
+                    <td className="step-cell">{job.step || "-"}</td>
+                    <td className="error-cell" title={job.error_message || "-"}>{job.error_message || "-"}</td>
                   </tr>
                 )
               })

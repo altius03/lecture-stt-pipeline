@@ -182,9 +182,9 @@ button:disabled {
 .app-shell {
   width: 1280px;
   margin: 0 auto;
-  padding: 24px 0 42px;
+  padding: 18px 0 32px;
   display: grid;
-  gap: 14px;
+  gap: 10px;
 }
 
 .panel-header,
@@ -203,15 +203,15 @@ button:disabled {
 
 .panel-header {
   position: sticky;
-  top: 14px;
+  top: 10px;
   z-index: 10;
   display: grid;
   grid-template-columns: 300px minmax(0, 1fr) auto;
   align-items: center;
-  gap: 18px;
-  min-height: 88px;
+  gap: 14px;
+  min-height: 74px;
   border-radius: 8px;
-  padding: 16px 18px;
+  padding: 12px 14px;
 }
 
 .panel-brand {
@@ -225,8 +225,8 @@ button:disabled {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 46px;
-  height: 46px;
+  width: 40px;
+  height: 40px;
   border: 1px solid var(--border-strong);
   border-radius: 8px;
   background: var(--primary);
@@ -239,7 +239,7 @@ button:disabled {
 .panel-brand h1,
 .hero-copy h1 {
   margin: 0;
-  font-size: 1.48rem;
+  font-size: 1.28rem;
   line-height: 1.18;
   letter-spacing: 0;
 }
@@ -273,7 +273,7 @@ button:disabled {
 
 .header-meta-item strong {
   display: block;
-  margin-top: 4px;
+  margin-top: 2px;
   overflow: hidden;
   color: var(--text);
   font-size: 0.92rem;
@@ -284,7 +284,7 @@ button:disabled {
 
 .header-meta-item em {
   display: block;
-  margin-top: 2px;
+  margin-top: 1px;
   color: var(--muted);
   font-size: 0.78rem;
   font-style: normal;
@@ -490,14 +490,14 @@ button:disabled {
 .control-layout {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 356px;
-  gap: 14px;
+  gap: 10px;
   align-items: start;
 }
 
 .primary-column,
 .side-column {
   display: grid;
-  gap: 14px;
+  gap: 10px;
 }
 
 .panel-card {
@@ -510,11 +510,11 @@ button:disabled {
 }
 
 .panel-card-header {
-  padding: 16px 18px 0;
+  padding: 12px 14px 0;
 }
 
 .panel-card-body {
-  padding: 0 18px 18px;
+  padding: 0 14px 14px;
 }
 
 .panel-card h2 {
@@ -528,7 +528,7 @@ button:disabled {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px;
-  margin: 0 0 14px;
+  margin: 0 0 10px;
 }
 
 .meta-grid > div,
@@ -581,7 +581,7 @@ button:disabled {
   justify-content: space-between;
   align-items: center;
   gap: 12px;
-  padding: 11px 12px;
+  padding: 9px 10px;
 }
 
 .metric-list span {
@@ -602,13 +602,13 @@ button:disabled {
 
 .current-job-panel {
   display: grid;
-  gap: 16px;
+  gap: 12px;
 }
 
 .current-job-empty {
   display: grid;
-  gap: 6px;
-  padding: 18px;
+  gap: 4px;
+  padding: 12px;
 }
 
 .current-job-empty p {
@@ -622,7 +622,7 @@ button:disabled {
   justify-content: space-between;
   align-items: flex-start;
   gap: 18px;
-  padding-top: 4px;
+  padding-top: 2px;
 }
 
 .current-job-summary > div {
@@ -631,10 +631,10 @@ button:disabled {
 
 .current-job-summary strong {
   display: block;
-  margin-top: 6px;
+  margin-top: 4px;
   overflow: hidden;
   color: var(--text);
-  font-size: 1.36rem;
+  font-size: 1.18rem;
   font-weight: 800;
   line-height: 1.24;
   text-overflow: ellipsis;
@@ -642,7 +642,7 @@ button:disabled {
 }
 
 .current-job-summary p {
-  margin: 6px 0 0;
+  margin: 4px 0 0;
   color: var(--muted-strong);
   font-size: 0.96rem;
 }
@@ -652,7 +652,7 @@ button:disabled {
   align-items: center;
   justify-content: center;
   min-width: 4.6rem;
-  height: 42px;
+  height: 38px;
   border-radius: 6px;
   border: 1px solid var(--border-strong);
   background: var(--surface-inset);
@@ -691,11 +691,11 @@ button:disabled {
   grid-template-columns: 26px minmax(0, 1fr);
   align-items: center;
   gap: 8px;
-  min-height: 44px;
+  min-height: 38px;
   border: 1px solid var(--border);
   border-radius: 6px;
   background: var(--surface-muted);
-  padding: 8px;
+  padding: 6px;
 }
 
 .pipeline-strip span {
@@ -782,11 +782,12 @@ table {
   width: 100%;
   border-collapse: collapse;
   font-size: 0.9rem;
+  table-layout: fixed;
 }
 
 thead th {
   text-align: left;
-  padding: 11px 12px;
+  padding: 9px 10px;
   border-bottom: 1px solid var(--border);
   color: var(--muted);
   font-size: 0.74rem;
@@ -806,7 +807,7 @@ tbody tr:hover {
 }
 
 tbody td {
-  padding: 12px;
+  padding: 10px;
   border-bottom: 1px solid var(--border);
   vertical-align: top;
 }
@@ -829,7 +830,10 @@ tbody td[colspan] {
 
 .file-cell {
   min-width: 14rem;
+  overflow: hidden;
   font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .muted-cell {
@@ -837,18 +841,62 @@ tbody td[colspan] {
   white-space: nowrap;
 }
 
+.status-cell,
+.progress-cell,
+.step-cell {
+  white-space: nowrap;
+}
+
+.step-cell {
+  overflow: hidden;
+  color: var(--muted-strong);
+  font-weight: 700;
+  text-overflow: ellipsis;
+}
+
 .error-cell {
+  overflow: hidden;
   max-width: 18rem;
   color: var(--muted-strong);
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .activity-card .panel-card-body {
   display: grid;
-  gap: 14px;
+  gap: 10px;
 }
 
 .activity-table table {
-  min-width: 940px;
+  min-width: 980px;
+}
+
+.jobs-col-id {
+  width: 54px;
+}
+
+.jobs-col-status {
+  width: 94px;
+}
+
+.jobs-col-file {
+  width: 178px;
+}
+
+.jobs-col-updated {
+  width: 188px;
+}
+
+.jobs-col-progress {
+  width: 70px;
+}
+
+.jobs-col-step {
+  width: 148px;
+}
+
+.jobs-col-error {
+  width: 248px;
 }
 
 .jobs-row {
@@ -867,7 +915,7 @@ tbody td[colspan] {
 
 .activity-detail {
   display: grid;
-  gap: 12px;
+  gap: 9px;
 }
 
 .activity-selection-card {
@@ -876,7 +924,7 @@ tbody td[colspan] {
   column-gap: 14px;
   row-gap: 4px;
   align-items: start;
-  padding: 13px 14px;
+  padding: 10px 12px;
 }
 
 .activity-selection-card strong {
@@ -899,7 +947,7 @@ tbody td[colspan] {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
+  gap: 10px;
 }
 
 .log-view-switch,
@@ -955,12 +1003,12 @@ tbody td[colspan] {
 }
 
 .activity-card pre {
-  min-height: 420px;
-  max-height: 560px;
+  min-height: 220px;
+  max-height: 300px;
   margin: 0;
   border: 1px solid var(--terminal-border);
   border-radius: 6px;
-  padding: 15px 16px;
+  padding: 12px 13px;
   background: var(--terminal-bg);
   color: var(--terminal-text);
   overflow: auto;
@@ -972,12 +1020,15 @@ tbody td[colspan] {
 
 .parsed-log-list {
   display: grid;
-  gap: 8px;
+  gap: 6px;
+  max-height: 288px;
+  overflow: auto;
+  padding-right: 2px;
 }
 
 .parsed-log-entry,
 .parsed-log-empty {
-  padding: 13px 14px;
+  padding: 10px 12px;
 }
 
 .parsed-log-header {
@@ -1012,7 +1063,7 @@ tbody td[colspan] {
 }
 
 .parsed-log-summary {
-  margin-top: 9px;
+  margin-top: 6px;
   color: var(--text);
   font-size: 0.92rem;
   line-height: 1.45;
