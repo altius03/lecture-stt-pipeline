@@ -182,7 +182,7 @@ export function ActivityPanel({
   }
 
   return (
-    <SectionCard label="Activity" title="최근 작업과 운영 로그" className="activity-card">
+    <SectionCard label="History" title="최근 작업" className="activity-card">
       <div className="table-wrap activity-table">
         <table>
           <colgroup>
@@ -240,104 +240,101 @@ export function ActivityPanel({
         </table>
       </div>
 
-      <div className="activity-detail">
-        <div className="activity-selection-card">
-          <span>선택 작업</span>
-          <strong>{selectedDisplay.title}</strong>
-          <p>{selectedDisplay.meta}</p>
-        </div>
-
-        <div className="activity-toolbar">
-          <div className="log-view-switch" role="tablist" aria-label="작업 로그 보기">
-            <button
-              className={`button-secondary log-view-tab${viewMode === "selected" ? " is-active" : ""}`}
-              type="button"
-              onClick={() => {
-                setViewMode("selected")
-              }}
-            >
-              선택 작업 로그
-            </button>
-            <button
-              className={`button-secondary log-view-tab${viewMode === "errors" ? " is-active" : ""}`}
-              type="button"
-              onClick={() => {
-                setViewMode("errors")
-              }}
-            >
-              전체 오류
-            </button>
-            <button
-              className={`button-secondary log-view-tab${viewMode === "raw" ? " is-active" : ""}`}
-              type="button"
-              onClick={() => {
-                setViewMode("raw")
-              }}
-            >
-              원본 로그
-            </button>
+      <details className="log-details">
+        <summary>선택 작업 로그</summary>
+        <div className="activity-detail">
+          <div className="activity-selection-card">
+            <span>선택 작업</span>
+            <strong>{selectedDisplay.title}</strong>
+            <p>{selectedDisplay.meta}</p>
           </div>
+
+          <div className="activity-toolbar">
+            <div className="log-view-switch" role="tablist" aria-label="작업 로그 보기">
+              <button
+                className={`button-secondary log-view-tab${viewMode === "selected" ? " is-active" : ""}`}
+                type="button"
+                onClick={() => {
+                  setViewMode("selected")
+                }}
+              >
+                선택 작업 로그
+              </button>
+              <button
+                className={`button-secondary log-view-tab${viewMode === "errors" ? " is-active" : ""}`}
+                type="button"
+                onClick={() => {
+                  setViewMode("errors")
+                }}
+              >
+                전체 오류
+              </button>
+              <button
+                className={`button-secondary log-view-tab${viewMode === "raw" ? " is-active" : ""}`}
+                type="button"
+                onClick={() => {
+                  setViewMode("raw")
+                }}
+              >
+                원본 로그
+              </button>
+            </div>
+
+            {viewMode === "raw" ? (
+              <div className="log-toolbar-actions">
+                <label className="log-follow-toggle">
+                  <input
+                    checked={autoFollow}
+                    type="checkbox"
+                    onChange={(event) => {
+                      onToggleAutoFollow(event.target.checked)
+                    }}
+                  />
+                  자동 따라가기
+                </label>
+                {hasUnread ? (
+                  <button className="button-secondary log-jump-button" type="button" onClick={onJumpToLatest}>
+                    최신으로 이동
+                  </button>
+                ) : null}
+              </div>
+            ) : null}
+          </div>
+
+          {logs.droppedLineCount > 0 ? (
+            <p className="log-meta">오래된 로그 {logs.droppedLineCount}줄을 숨겼습니다.</p>
+          ) : null}
+          {error ? <p className="log-meta">{error}</p> : null}
 
           {viewMode === "raw" ? (
-            <div className="log-toolbar-actions">
-              <label className="log-follow-toggle">
-                <input
-                  checked={autoFollow}
-                  type="checkbox"
-                  onChange={(event) => {
-                    onToggleAutoFollow(event.target.checked)
-                  }}
-                />
-                자동 따라가기
-              </label>
-              {hasUnread ? (
-                <button className="button-secondary log-jump-button" type="button" onClick={onJumpToLatest}>
-                  최신으로 이동
-                </button>
-              ) : null}
+            <pre ref={logRef} onScroll={onLogScroll}>{formatLog(logs.text)}</pre>
+          ) : visibleEntries.length === 0 ? (
+            <div className="parsed-log-empty">
+              {viewMode === "selected"
+                ? "선택한 작업과 연결된 운영 이벤트가 아직 없습니다."
+                : "아직 경고나 오류가 없습니다."}
             </div>
           ) : (
-            <p className="log-toolbar-copy">
-              {viewMode === "selected"
-                ? "선택한 작업과 연결된 운영 이벤트를 우선 보여줍니다."
-                : "전체 경고와 오류 이벤트만 모아 보여줍니다."}
-            </p>
+            <div className="parsed-log-list">
+              {visibleEntries.map((entry, index) => (
+                <article className="parsed-log-entry" key={`${entry.raw}-${index}`}>
+                  <div className="parsed-log-header">
+                    <div>
+                      <strong className="parsed-log-target">{entryTargetLabel(entry)}</strong>
+                      <p className="parsed-log-meta">
+                        {(entry.timeLabel ?? "시간 미상") + " · " + entryMetaLabel(entry)}
+                      </p>
+                    </div>
+                    <span className={entryLevelClassName(entry)}>{entry.level === "UNKNOWN" ? "기타" : entry.level}</span>
+                  </div>
+                  <p className="parsed-log-summary">{entry.summary}</p>
+                  {entry.detail ? <p className="parsed-log-detail">{entry.detail}</p> : null}
+                </article>
+              ))}
+            </div>
           )}
         </div>
-
-        {logs.droppedLineCount > 0 ? (
-          <p className="log-meta">오래된 로그 {logs.droppedLineCount}줄을 숨겼습니다.</p>
-        ) : null}
-        {error ? <p className="log-meta">{error}</p> : null}
-
-        {viewMode === "raw" ? (
-          <pre ref={logRef} onScroll={onLogScroll}>{formatLog(logs.text)}</pre>
-        ) : visibleEntries.length === 0 ? (
-          <div className="parsed-log-empty">
-            {viewMode === "selected"
-              ? "선택한 작업과 연결된 운영 이벤트가 아직 없습니다."
-              : "아직 경고나 오류가 없습니다."}
-          </div>
-        ) : (
-          <div className="parsed-log-list">
-            {visibleEntries.map((entry, index) => (
-              <article className="parsed-log-entry" key={`${entry.raw}-${index}`}>
-                <div className="parsed-log-header">
-                  <div>
-                    <strong className="parsed-log-target">{entryTargetLabel(entry)}</strong>
-                    <p className="parsed-log-meta">
-                      {(entry.timeLabel ?? "시간 미상") + " · " + entryMetaLabel(entry)}
-                    </p>
-                  </div>
-                  <span className={entryLevelClassName(entry)}>{entry.level === "UNKNOWN" ? "기타" : entry.level}</span>
-                </div>
-                <p className="parsed-log-summary">{entry.summary}</p>
-                {entry.detail ? <p className="parsed-log-detail">{entry.detail}</p> : null}
-              </article>
-            ))}
-          </div>
-        )}
-      </div>
+      </details>
 
       <ActionBar
         compact
