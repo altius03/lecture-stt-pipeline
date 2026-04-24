@@ -781,7 +781,7 @@ button:disabled {
 table {
   width: 100%;
   border-collapse: collapse;
-  font-size: 0.9rem;
+  font-size: 0.86rem;
   table-layout: fixed;
 }
 
@@ -809,6 +809,8 @@ tbody tr:hover {
 tbody td {
   padding: 10px;
   border-bottom: 1px solid var(--border);
+  overflow: hidden;
+  text-overflow: ellipsis;
   vertical-align: top;
 }
 
@@ -837,7 +839,9 @@ tbody td[colspan] {
 }
 
 .muted-cell {
+  overflow: hidden;
   color: var(--muted);
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
@@ -868,35 +872,35 @@ tbody td[colspan] {
 }
 
 .activity-table table {
-  min-width: 980px;
+  min-width: 1080px;
 }
 
 .jobs-col-id {
-  width: 54px;
+  width: 52px;
 }
 
 .jobs-col-status {
-  width: 94px;
+  width: 88px;
 }
 
 .jobs-col-file {
-  width: 178px;
+  width: 180px;
 }
 
 .jobs-col-updated {
-  width: 188px;
+  width: 110px;
 }
 
 .jobs-col-progress {
-  width: 70px;
+  width: 66px;
 }
 
 .jobs-col-step {
-  width: 148px;
+  width: 156px;
 }
 
 .jobs-col-error {
-  width: 248px;
+  width: 200px;
 }
 
 .jobs-row {

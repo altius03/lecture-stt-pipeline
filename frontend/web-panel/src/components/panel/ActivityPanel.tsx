@@ -104,6 +104,32 @@ function pickDefaultJobId(jobs: PanelJob[]): number | null {
   return processingJob?.id ?? jobs[0]?.id ?? null
 }
 
+function formatUpdatedAt(value: string): string {
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) {
+    return value
+  }
+
+  const month = String(date.getMonth() + 1).padStart(2, "0")
+  const day = String(date.getDate()).padStart(2, "0")
+  const hour = String(date.getHours()).padStart(2, "0")
+  const minute = String(date.getMinutes()).padStart(2, "0")
+  return `${month}-${day} ${hour}:${minute}`
+}
+
+function shortErrorMessage(message: string): string {
+  if (!message) {
+    return "-"
+  }
+  if (message.includes("Source file disappeared before move")) {
+    return "원본 파일 사라짐"
+  }
+  if (message.length > 34) {
+    return `${message.slice(0, 34)}...`
+  }
+  return message
+}
+
 export function ActivityPanel({
   jobs,
   logs,
@@ -201,11 +227,11 @@ export function ActivityPanel({
                   >
                     <td className="mono-cell">{job.id}</td>
                     <td className="status-cell"><span className={statusClassName(job.status)}>{job.status}</span></td>
-                    <td className="file-cell">{job.file_name}</td>
-                    <td className="muted-cell">{job.updated_at}</td>
+                    <td className="file-cell" title={job.file_name}>{job.file_name}</td>
+                    <td className="muted-cell" title={job.updated_at}>{formatUpdatedAt(job.updated_at)}</td>
                     <td className="mono-cell progress-cell">{job.progress_pct}%</td>
                     <td className="step-cell">{job.step || "-"}</td>
-                    <td className="error-cell" title={job.error_message || "-"}>{job.error_message || "-"}</td>
+                    <td className="error-cell" title={job.error_message || "-"}>{shortErrorMessage(job.error_message)}</td>
                   </tr>
                 )
               })
