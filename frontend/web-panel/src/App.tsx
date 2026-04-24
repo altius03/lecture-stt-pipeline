@@ -106,45 +106,47 @@ export default function App() {
 
       {sharedError ? <ErrorBanner message={sharedError} /> : null}
 
-      <section className="summary-grid">
-        <RuntimeCard
-          runtimeState={state.runtime_state}
-          summary={state.summary}
-          pauseAction={state.actions.pause_action}
-          pauseLabel={state.actions.pause_label}
-          pendingAction={pendingAction}
-          onAction={(action) => {
-            void runAction(action)
-          }}
-        />
+      <section className="control-layout" aria-label="Lecture STT 운영 현황">
+        <div className="primary-column">
+          <ProcessingCard jobs={state.processing_v2} />
 
-        <SectionCard label="Queue" title="작업 상태 개수" tone="muted">
-          <MetricList items={queueItems} />
-        </SectionCard>
+          <ActivityPanel
+            jobs={state.jobs_v2}
+            logs={logs}
+            error={logsError}
+            logRef={logRef}
+            autoFollow={autoFollow}
+            hasUnread={hasUnread}
+            pendingAction={pendingAction}
+            onLogScroll={handleLogScroll}
+            onToggleAutoFollow={setAutoFollow}
+            onJumpToLatest={jumpToLatest}
+            onAction={(action) => {
+              void runAction(action)
+            }}
+          />
+        </div>
 
-        <SectionCard label="Folders" title="폴더 현황">
-          <MetricList items={folderItems} />
-        </SectionCard>
+        <aside className="side-column" aria-label="제어 및 요약">
+          <RuntimeCard
+            runtimeState={state.runtime_state}
+            summary={state.summary}
+            pauseAction={state.actions.pause_action}
+            pauseLabel={state.actions.pause_label}
+            pendingAction={pendingAction}
+            onAction={(action) => {
+              void runAction(action)
+            }}
+          />
 
-        <ProcessingCard jobs={state.processing_v2} />
-      </section>
+          <SectionCard label="Queue Ledger" title="작업 장부" tone="muted">
+            <MetricList items={queueItems} />
+          </SectionCard>
 
-      <section className="content-layout single-column">
-        <ActivityPanel
-          jobs={state.jobs_v2}
-          logs={logs}
-          error={logsError}
-          logRef={logRef}
-          autoFollow={autoFollow}
-          hasUnread={hasUnread}
-          pendingAction={pendingAction}
-          onLogScroll={handleLogScroll}
-          onToggleAutoFollow={setAutoFollow}
-          onJumpToLatest={jumpToLatest}
-          onAction={(action) => {
-            void runAction(action)
-          }}
-        />
+          <SectionCard label="Storage" title="폴더 현황">
+            <MetricList items={folderItems} />
+          </SectionCard>
+        </aside>
       </section>
     </main>
   )

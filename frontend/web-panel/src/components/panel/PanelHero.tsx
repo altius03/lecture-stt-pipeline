@@ -51,77 +51,78 @@ export function PanelHero({
   }, [])
 
   return (
-    <section className="hero-card">
-      <div className="hero-copy state-stack">
-        <p className="eyebrow">Lecture STT Control Panel</p>
-        <div className="hero-heading-row">
-          <div className="hero-heading-copy">
-            <h1>실시간 운영 패널</h1>
-            <p className="hero-description">워커 상태, 큐, 최근 작업, 로그를 한 화면에서 확인하고 제어합니다.</p>
-          </div>
-          <div className="hero-actions">
-            <NotificationToggle
-              notification={notification}
-              pendingSelection={pendingNotificationSelection}
-              pendingApplyNow={pendingNotificationApplyNow}
-              onSave={onNotificationSave}
-            />
-            <button
-              className="theme-switch"
-              data-theme={theme}
-              type="button"
-              onClick={() => {
-                onThemeChange(nextTheme)
-              }}
-              aria-label={theme === "dark" ? "라이트 모드로 전환" : "다크 모드로 전환"}
-              aria-pressed={theme === "dark"}
-              title={theme === "dark" ? "라이트 모드" : "다크 모드"}
-            >
-              <span className="theme-switch-icon theme-switch-icon-light" aria-hidden="true">
-                <svg viewBox="0 0 24 24" focusable="false">
-                  <circle cx="12" cy="12" r="4.25" fill="none" stroke="currentColor" strokeWidth="1.8" />
-                  <path
-                    d="M12 2.75v2.5M12 18.75v2.5M21.25 12h-2.5M5.25 12h-2.5M18.54 5.46l-1.77 1.77M7.23 16.77l-1.77 1.77M18.54 18.54l-1.77-1.77M7.23 7.23L5.46 5.46"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeLinecap="round"
-                    strokeWidth="1.8"
-                  />
-                </svg>
-              </span>
-              <span className="theme-switch-icon theme-switch-icon-dark" aria-hidden="true">
-                <svg viewBox="0 0 24 24" focusable="false">
-                  <path
-                    d="M14.6 3.35a8.65 8.65 0 1 0 6.05 14.95 8.95 8.95 0 0 1-10.6-10.6A8.6 8.6 0 0 0 14.6 3.35Z"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeLinejoin="round"
-                    strokeWidth="1.8"
-                  />
-                </svg>
-              </span>
-              <span className="theme-switch-thumb" aria-hidden="true" />
-            </button>
-            <StatusBadge status={runtimeState.status} label={runtimeState.label} />
-          </div>
+    <header className="panel-header">
+      <div className="panel-brand">
+        <div className="brand-mark" aria-hidden="true">
+          STT
+        </div>
+        <div>
+          <p className="eyebrow">Lecture STT</p>
+          <h1>전사 파이프라인 관제판</h1>
         </div>
       </div>
 
-      <div className="hero-meta-grid">
-        <div className="hero-meta-item">
+      <div className="panel-header-center" aria-label="현재 패널 상태">
+        <div className="header-meta-item">
           <span>마지막 갱신</span>
           <strong>{summary.updated_at}</strong>
         </div>
-        <div className="hero-meta-item">
-          <span>현재 안내</span>
-          <strong>{summary.notice || "운영상 특이사항이 없습니다."}</strong>
-        </div>
-        <div className="hero-meta-item">
+        <div className="header-meta-item">
           <span>현재 시간</span>
           <strong>{currentTime}</strong>
-          <em className="hero-meta-status">{realtimeConnected ? "실시간 연결됨" : "fallback polling 중"}</em>
+          <em>{realtimeConnected ? "SSE 연결" : "Polling"}</em>
+        </div>
+        <div className="header-meta-item header-notice">
+          <span>안내</span>
+          <strong>{summary.notice || "운영상 특이사항이 없습니다."}</strong>
         </div>
       </div>
-    </section>
+
+      <div className="panel-command-bar">
+        <NotificationToggle
+          notification={notification}
+          pendingSelection={pendingNotificationSelection}
+          pendingApplyNow={pendingNotificationApplyNow}
+          onSave={onNotificationSave}
+        />
+        <button
+          className="theme-switch"
+          data-theme={theme}
+          type="button"
+          onClick={() => {
+            onThemeChange(nextTheme)
+          }}
+          aria-label={theme === "dark" ? "라이트 모드로 전환" : "다크 모드로 전환"}
+          aria-pressed={theme === "dark"}
+          title={theme === "dark" ? "라이트 모드" : "다크 모드"}
+        >
+          <span className="theme-switch-icon theme-switch-icon-light" aria-hidden="true">
+            <svg viewBox="0 0 24 24" focusable="false">
+              <circle cx="12" cy="12" r="4.25" fill="none" stroke="currentColor" strokeWidth="1.8" />
+              <path
+                d="M12 2.75v2.5M12 18.75v2.5M21.25 12h-2.5M5.25 12h-2.5M18.54 5.46l-1.77 1.77M7.23 16.77l-1.77 1.77M18.54 18.54l-1.77-1.77M7.23 7.23L5.46 5.46"
+                fill="none"
+                stroke="currentColor"
+                strokeLinecap="round"
+                strokeWidth="1.8"
+              />
+            </svg>
+          </span>
+          <span className="theme-switch-icon theme-switch-icon-dark" aria-hidden="true">
+            <svg viewBox="0 0 24 24" focusable="false">
+              <path
+                d="M14.6 3.35a8.65 8.65 0 1 0 6.05 14.95 8.95 8.95 0 0 1-10.6-10.6A8.6 8.6 0 0 0 14.6 3.35Z"
+                fill="none"
+                stroke="currentColor"
+                strokeLinejoin="round"
+                strokeWidth="1.8"
+              />
+            </svg>
+          </span>
+          <span className="theme-switch-thumb" aria-hidden="true" />
+        </button>
+        <StatusBadge status={runtimeState.status} label={runtimeState.label} />
+      </div>
+    </header>
   )
 }
