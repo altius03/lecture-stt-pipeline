@@ -64,7 +64,7 @@
 - 웹 제어 백엔드 상태/워커 제어 로직은 `src/lecture_stt/ui/web_panel_state.py`로 분리되어 있다.
 - 내장 HTTP 서버가 워커 시작, 일시정지, 재개, 중지, 로그 tail, DB 상태 조회를 제공한다.
 - 웹 제어 계층은 `config.yaml`의 `notification` 섹션도 수정할 수 있으며, 패널에서 텔레그램/디스코드/둘 다/끄기 선택을 저장한다.
-- 레거시 SSR 패널은 `/`에서 제공하고, React 빌드 산출물이 있으면 `/app`에서 정적 자산을 서빙한다.
+- React 빌드 산출물이 있으면 내장 HTTP 서버가 `/`에서 메인 웹 패널과 정적 자산을 서빙한다.
 - React 소스는 `frontend/web-panel/`에 있으며, Vite + React + TypeScript 기반으로 유지한다.
 - 프론트 데이터 계층은 `src/lib/panelApi.ts`, `src/lib/panelEvents.ts`, `src/lib/decodePanelState.ts`, `src/lib/logParser.ts`, `src/hooks/usePanelState.ts`, `src/hooks/usePanelLogs.ts`로 나뉜다.
 - 패널 UI는 `src/components/panel/`과 `src/components/ui/`의 로컬 재사용 컴포넌트로 나누고, `App.tsx`는 화면 조합만 담당한다.
