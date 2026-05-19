@@ -29,7 +29,7 @@ class WebPanelRequestHandlerTests(unittest.TestCase):
         state = mock.Mock()
         web_panel.STATE = state
 
-        handler._action_exit(api_mode=True)
+        handler._action_exit()
 
         state.request_shutdown.assert_called_once_with()
         state.stop.assert_not_called()
@@ -38,9 +38,9 @@ class WebPanelRequestHandlerTests(unittest.TestCase):
             {"ok": True, "notice": "웹 제어판 종료 요청됨"},
         )
 
-    def test_app_route_returns_placeholder_when_react_build_is_missing(self) -> None:
+    def test_root_route_returns_placeholder_when_react_build_is_missing(self) -> None:
         handler = object.__new__(web_panel.RequestHandler)
-        handler.path = "/app"
+        handler.path = "/"
         handler._write = mock.Mock()
 
         with mock.patch.object(web_panel, "_resolve_react_asset", return_value=None):
@@ -49,7 +49,32 @@ class WebPanelRequestHandlerTests(unittest.TestCase):
         handler._write.assert_called_once()
         args = handler._write.call_args[0]
         self.assertEqual(args[0], 200)
-        self.assertIn("React 패널 빌드가 아직 없습니다", args[1])
+        self.assertIn("웹 패널 빌드가 필요합니다", args[1])
+
+    def test_root_route_serves_react_index_when_build_exists(self) -> None:
+        handler = object.__new__(web_panel.RequestHandler)
+        handler.path = "/"
+        handler._write_file = mock.Mock()
+        index_asset = Path("/tmp/index.html")
+
+        with mock.patch.object(web_panel, "_resolve_react_asset", return_value=index_asset):
+            handler.do_GET()
+
+        handler._write_file.assert_called_once_with(index_asset)
+
+    def test_app_route_redirects_to_main_panel(self) -> None:
+        handler = object.__new__(web_panel.RequestHandler)
+        handler.path = "/app"
+        handler.send_response = mock.Mock()
+        handler.send_header = mock.Mock()
+        handler.end_headers = mock.Mock()
+
+        handler.do_GET()
+
+        handler.send_response.assert_called_once_with(303)
+        handler.send_header.assert_any_call("Location", "/")
+        handler.send_header.assert_any_call("Content-Length", "0")
+        handler.end_headers.assert_called_once_with()
 
     def test_placeholder_uses_runtime_repo_root_in_instructions(self) -> None:
         rendered = web_panel.render_react_placeholder(Path("/tmp/lecture-stt-alt"))
@@ -76,7 +101,7 @@ class WebPanelRequestHandlerTests(unittest.TestCase):
 
                 handler.do_POST()
 
-                getattr(handler, handler_name).assert_called_once_with(api_mode=True)
+                getattr(handler, handler_name).assert_called_once_with()
                 handler._api_error.assert_not_called()
 
     def test_api_events_route_dispatches_stream_handler(self) -> None:
@@ -97,7 +122,16 @@ class WebPanelRequestHandlerTests(unittest.TestCase):
 
         handler._api_error.assert_called_once_with(404, "Not Found")
 
-    def test_api_notification_route_dispatches_with_form_selection(self) -> None:
+    def test_unknown_api_get_path_returns_json_404(self) -> None:
+        handler = object.__new__(web_panel.RequestHandler)
+        handler.path = "/api/does-not-exist"
+        handler._api_error = mock.Mock()
+
+        handler.do_GET()
+
+        handler._api_error.assert_called_once_with(404, "Not Found")
+
+    def test_api_notification_route_defaults_to_deferred_apply(self) -> None:
         handler = object.__new__(web_panel.RequestHandler)
         handler.path = "/api/notification"
         handler.headers = {"Content-Length": "14"}
@@ -107,7 +141,7 @@ class WebPanelRequestHandlerTests(unittest.TestCase):
 
         handler.do_POST()
 
-        handler._action_notification_update.assert_called_once_with("both", apply_now=True, api_mode=True)
+        handler._action_notification_update.assert_called_once_with("both", apply_now=False)
         handler._api_error.assert_not_called()
 
     def test_api_notification_route_passes_apply_now_flag(self) -> None:
@@ -121,5 +155,5 @@ class WebPanelRequestHandlerTests(unittest.TestCase):
 
         handler.do_POST()
 
-        handler._action_notification_update.assert_called_once_with("discord", apply_now=True, api_mode=True)
+        handler._action_notification_update.assert_called_once_with("discord", apply_now=True)
         handler._api_error.assert_not_called()

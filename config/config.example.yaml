@@ -25,6 +25,8 @@ transcribe:
   beam_size: 5
   vad_filter: false
   word_timestamps: false
+  condition_on_previous_text: true
+  keep_model_loaded: false
 
 ffmpeg:
   binary_path: ffmpeg
@@ -37,6 +39,12 @@ logging:
 cleanup:
   retain_days: 7
   retain_min_transcripts: 5
+
+correction:
+  prompt_folder: "${LECTURE_RECORDINGS_ROOT}/05_prompt"
+  mode: manual  # API-backed automatic correction is disabled; use manual/provider-neutral correction.
+  stable_for_sec: 60
+  scan_interval_sec: 60
 
 notification:
   provider: telegram
@@ -54,6 +62,11 @@ downstream:
   gh_current_semester_root: "${GH_CURRENT_SEMESTER_ROOT}"
   obsidian_semester_root: "${OBSIDIAN_SEMESTER_ROOT}"
   log_jsonl_path: state/logs/downstream.jsonl
+  log_jsonl_max_bytes: 0  # 0 disables JSONL rotation; production example: 10485760
+  log_jsonl_backup_count: 3
+  stats_heartbeat_scans: 120
+  log_suppression_max_keys: 4096
+  log_routine_scan_events: false
   lock_path: state/downstream.lock
   subjects:
     LC:

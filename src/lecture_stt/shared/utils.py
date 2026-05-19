@@ -77,15 +77,32 @@ def stacktrace(exc: BaseException) -> str:
 
 
 # 파일의 SHA-256 해시를 계산한다.
+# iCloud Drive 동기화 중 발생하는 OSError(errno=11, EDEADLK)에 대해
+# 지수 백오프로 재시도한다.
 def compute_sha256(path: Union[str, Path], chunk_size: int = 1024 * 1024) -> str:
-    digest = hashlib.sha256()
-    with open(path, "rb") as f:
-        while True:
-            chunk = f.read(chunk_size)
-            if not chunk:
-                break
-            digest.update(chunk)
-    return digest.hexdigest()
+    max_retries = 6
+    delay = 1.0
+    for attempt in range(max_retries):
+        try:
+            digest = hashlib.sha256()
+            with open(path, "rb") as f:
+                while True:
+                    chunk = f.read(chunk_size)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+            return digest.hexdigest()
+        except OSError as exc:
+            if exc.errno == 11 and attempt < max_retries - 1:
+                logger.warning(
+                    "compute_sha256: OSError errno=11 (iCloud 잠금 추정), "
+                    "%d/%d 재시도, %.1f초 후: %s",
+                    attempt + 1, max_retries, delay, path,
+                )
+                time.sleep(delay)
+                delay = min(delay * 2, 30.0)
+            else:
+                raise
 
 
 # 파일 쓰기 실패를 줄이기 위해 임시파일-교체 방식으로 저장한다.

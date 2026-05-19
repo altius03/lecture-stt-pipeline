@@ -3,6 +3,7 @@ from __future__ import annotations
 import shutil
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -23,6 +24,7 @@ from lecture_stt.downstream.lib import (  # noqa: E402
     SUMMARY_STATUS_DELIVERED,
     DownstreamConfig,
     DownstreamDistributor,
+    JsonlLogger,
     default_subject_routes,
 )
 from lecture_stt.shared import db  # noqa: E402
@@ -248,6 +250,95 @@ class DownstreamDistributorTests(unittest.TestCase):
         row = db.get_delivery(self.conn, stem)
         self.assertEqual(row["correction_status"], CORRECTION_STATUS_ERROR)
         self.assertEqual(row["subject_abbr"], "ZZ")
+
+    def test_repeated_invalid_correction_is_not_logged_every_scan(self) -> None:
+        stem = "260316ZZ_1"
+        self._write_text(self.correction_dir / f"{stem}.txt", "bad subject")
+        self._write_json(self.correction_dir / f"{stem}.json", '{"segments":[{"text":"bad subject"}]}')
+
+        distributor = self._make_distributor()
+        first_stats = distributor.scan_once()
+        second_stats = distributor.scan_once()
+        distributor.close()
+
+        self.assertEqual(first_stats["errors"], 1)
+        self.assertEqual(second_stats["errors"], 1)
+        content = self.log_jsonl.read_text(encoding="utf-8")
+        self.assertEqual(content.count('"event": "correction_invalid"'), 1)
+
+    def test_repeated_correction_conflict_is_not_logged_every_scan(self) -> None:
+        stem = "260316LC_9"
+        self._write_text(self.correction_dir / f"{stem}.txt", "new correction")
+        self._write_json(self.correction_dir / f"{stem}.json", '{"segments":[{"text":"new correction"}]}')
+        route = self._route("LC")
+        self._write_text(route.gh_origin_dir(self.gh_root) / f"{stem}.txt", "existing correction")
+
+        distributor = self._make_distributor()
+        first_stats = distributor.scan_once()
+        second_stats = distributor.scan_once()
+        distributor.close()
+
+        self.assertEqual(first_stats["conflicts"], 1)
+        self.assertEqual(second_stats["conflicts"], 1)
+        content = self.log_jsonl.read_text(encoding="utf-8")
+        self.assertEqual(content.count('"event": "correction_conflict"'), 1)
+
+    def test_repeating_problem_suppression_cache_is_bounded(self) -> None:
+        bounded_config = replace(self.config, log_suppression_max_keys=2)
+        distributor = DownstreamDistributor(bounded_config, conn=self.conn)
+
+        distributor._log_repeating_problem_once("manual_problem", logical_stem="a", error_code="E")
+        distributor._log_repeating_problem_once("manual_problem", logical_stem="b", error_code="E")
+        distributor._log_repeating_problem_once("manual_problem", logical_stem="a", error_code="E")
+        distributor._log_repeating_problem_once("manual_problem", logical_stem="c", error_code="E")
+        distributor._log_repeating_problem_once("manual_problem", logical_stem="a", error_code="E")
+        distributor.close()
+
+        content = self.log_jsonl.read_text(encoding="utf-8")
+        self.assertEqual(content.count('"event": "manual_problem"'), 4)
+        self.assertLessEqual(len(distributor._logged_repeating_problem_events), 2)
+
+    def test_routine_scan_events_skip_stdout_by_default_but_stay_in_jsonl(self) -> None:
+        distributor = self._make_distributor()
+        with mock.patch("lecture_stt.downstream.lib.logger") as mocked_logger:
+            distributor._log_event("scan_started", dry_run=False)
+        distributor.close()
+
+        mocked_logger.info.assert_not_called()
+        content = self.log_jsonl.read_text(encoding="utf-8")
+        self.assertIn('"event": "scan_started"', content)
+
+    def test_routine_scan_events_can_be_logged_to_stdout(self) -> None:
+        noisy_config = replace(self.config, log_routine_scan_events=True)
+        distributor = DownstreamDistributor(noisy_config, conn=self.conn)
+        with mock.patch("lecture_stt.downstream.lib.logger") as mocked_logger:
+            distributor._log_event("scan_started", dry_run=False)
+        distributor.close()
+
+        mocked_logger.info.assert_called_once()
+
+    def test_jsonl_logger_rotates_when_size_guard_is_exceeded(self) -> None:
+        logger = JsonlLogger(self.log_jsonl, enabled=True, max_bytes=120, backup_count=2)
+
+        logger.write(event="first", payload="x" * 120)
+        logger.write(event="second", payload="y" * 120)
+
+        rotated_path = self.log_jsonl.with_name(f"{self.log_jsonl.name}.1")
+        self.assertTrue(rotated_path.exists())
+        self.assertIn('"event": "first"', rotated_path.read_text(encoding="utf-8"))
+        self.assertIn('"event": "second"', self.log_jsonl.read_text(encoding="utf-8"))
+
+    def test_jsonl_logger_backup_count_zero_uses_unique_rotated_paths(self) -> None:
+        logger = JsonlLogger(self.log_jsonl, enabled=True, max_bytes=1, backup_count=0)
+
+        logger.write(event="first", payload="x")
+        logger.write(event="second", payload="y")
+        logger.write(event="third", payload="z")
+
+        rotated_paths = sorted(self.log_jsonl.parent.glob(f"{self.log_jsonl.name}.*"))
+        self.assertEqual(len(rotated_paths), 2)
+        self.assertEqual(len({path.name for path in rotated_paths}), 2)
+        self.assertIn('"event": "third"', self.log_jsonl.read_text(encoding="utf-8"))
 
     def test_summary_blocks_without_correction_history(self) -> None:
         stem = "260316Unix_1"

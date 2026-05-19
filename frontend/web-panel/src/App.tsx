@@ -106,30 +106,30 @@ export default function App() {
 
       {sharedError ? <ErrorBanner message={sharedError} /> : null}
 
-      <section className="summary-grid">
-        <RuntimeCard
-          runtimeState={state.runtime_state}
-          summary={state.summary}
-          pauseAction={state.actions.pause_action}
-          pauseLabel={state.actions.pause_label}
-          pendingAction={pendingAction}
-          onAction={(action) => {
-            void runAction(action)
-          }}
-        />
-
-        <SectionCard label="Queue" title="작업 상태 개수" tone="muted">
-          <MetricList items={queueItems} />
-        </SectionCard>
-
-        <SectionCard label="Folders" title="폴더 현황">
-          <MetricList items={folderItems} />
-        </SectionCard>
-
+      <section className="control-layout" aria-label="Lecture STT 운영 현황">
         <ProcessingCard jobs={state.processing_v2} />
-      </section>
 
-      <section className="content-layout single-column">
+        <section className="overview-grid" aria-label="제어 및 요약">
+          <RuntimeCard
+            runtimeState={state.runtime_state}
+            summary={state.summary}
+            pauseAction={state.actions.pause_action}
+            pauseLabel={state.actions.pause_label}
+            pendingAction={pendingAction}
+            onAction={(action) => {
+              void runAction(action)
+            }}
+          />
+
+          <SectionCard label="Queue Ledger" title="작업 장부" tone="muted">
+            <MetricList items={queueItems} />
+          </SectionCard>
+
+          <SectionCard label="Storage" title="폴더 현황">
+            <MetricList items={folderItems} />
+          </SectionCard>
+        </section>
+
         <ActivityPanel
           jobs={state.jobs_v2}
           logs={logs}

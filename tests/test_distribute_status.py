@@ -90,6 +90,9 @@ class DistributeStatusCliTests(unittest.TestCase):
         self.assertIn("problem_rows: 2", stdout)
         self.assertIn("- DELIVERED: 2", stdout)
         self.assertIn("- BLOCKED: 1", stdout)
+        self.assertIn("Problem reason counts", stdout)
+        self.assertIn("- CONFLICT: 1", stdout)
+        self.assertIn("- INCOMPLETE_CORRECTION_PAIR: 1", stdout)
         self.assertIn("260316DStr_3", stdout)
         self.assertIn("260316DS_2", stdout)
 

@@ -21,8 +21,9 @@
 - 실제 구현 코드는 `src/lecture_stt/` 패키지 아래에 정리되어 있다.
 - `src/lecture_stt/stt/`: 메인 STT 파이프라인
 - `src/lecture_stt/shared/`: 공용 DB, 유틸
+- `src/lecture_stt/correction/`: 수동/provider-neutral correction 대기 상태 조회와 correction prompt helper
 - `src/lecture_stt/downstream/`: correction/summary 배포 파이프라인
-- `src/lecture_stt/ui/`: 웹/Tk 제어판
+- `src/lecture_stt/ui/`: 웹 제어판
 - 운영 스크립트는 `PYTHONPATH=<repo>/src python -m lecture_stt...` 방식으로 패키지를 직접 실행한다.
 
 ## 메인 STT 파이프라인
@@ -64,7 +65,7 @@
 - 웹 제어 백엔드 상태/워커 제어 로직은 `src/lecture_stt/ui/web_panel_state.py`로 분리되어 있다.
 - 내장 HTTP 서버가 워커 시작, 일시정지, 재개, 중지, 로그 tail, DB 상태 조회를 제공한다.
 - 웹 제어 계층은 `config.yaml`의 `notification` 섹션도 수정할 수 있으며, 패널에서 텔레그램/디스코드/둘 다/끄기 선택을 저장한다.
-- 레거시 SSR 패널은 `/`에서 제공하고, React 빌드 산출물이 있으면 `/app`에서 정적 자산을 서빙한다.
+- React 빌드 산출물이 있으면 내장 HTTP 서버가 `/`에서 메인 웹 패널과 정적 자산을 서빙한다.
 - React 소스는 `frontend/web-panel/`에 있으며, Vite + React + TypeScript 기반으로 유지한다.
 - 프론트 데이터 계층은 `src/lib/panelApi.ts`, `src/lib/panelEvents.ts`, `src/lib/decodePanelState.ts`, `src/lib/logParser.ts`, `src/hooks/usePanelState.ts`, `src/hooks/usePanelLogs.ts`로 나뉜다.
 - 패널 UI는 `src/components/panel/`과 `src/components/ui/`의 로컬 재사용 컴포넌트로 나누고, `App.tsx`는 화면 조합만 담당한다.
@@ -76,9 +77,12 @@
 - 최근 작업과 로그는 분리 카드 대신 하나의 Activity 패널로 묶어, 최근 작업 행 선택과 해당 작업 중심의 한국어 운영 로그 확인을 한 흐름으로 제공한다.
 - Activity 패널의 로그 영역은 raw log를 그대로 유지하되, `logParser.ts`가 반복 패턴을 파싱해 과목/날짜/요일/교시를 포함한 한국어 운영 로그 뷰와 오류 전용 뷰를 함께 제공한다.
 - pause/resume는 별도 IPC 대신 `state/paused` 플래그 파일로 제어한다.
-- `src/lecture_stt/ui/tk_panel.py`는 Tk 기반 구형 GUI이며, 현재 운영 문서와 스크립트는 웹 패널 중심이다.
+- Tk 기반 구형 GUI는 제거했고, 운영 제어면은 웹 패널로 단일화한다.
 
 ## Downstream 배포 파이프라인
+- API-backed 자동 correction provider는 현재 비활성화되어 있으며, `src/lecture_stt/correction/worker.py`는 `02_transcripts`의 pending pair를 manual correction 대기 상태로만 보고한다.
+- `CorrectionConfig`에는 API key/model/max token 필드가 없고, `correction.mode: manual`을 기본 운영 모드로 둔다.
+- `src/lecture_stt/correction/corrector.py`는 외부 API 호출 구현을 갖지 않는 compatibility/helper 모듈이며, 자동 correction 시도는 명시적으로 실패한다.
 - 진입점은 `src/lecture_stt/downstream/worker.py`다.
 - correction 입력은 `03_correction` 폴더의 `{stem}.txt + {stem}.json` pair다.
 - summary 입력은 `04_summarize` 폴더의 `{stem}.md`다.
@@ -87,6 +91,9 @@
 - summary는 GH archive의 `01_summarize`와 Obsidian 노트 경로 둘 다로 배포된다.
 - summary는 correction 전달 완료가 확인된 경우에만 배포된다.
 - 동일 내용은 hash 비교로 idempotent하게 처리하고, 다른 내용이 있으면 overwrite하지 않고 conflict로 남긴다.
+- 반복되는 invalid/incomplete/blocked/conflict/error 이벤트는 같은 worker 프로세스 안에서 bounded suppression cache의 동일 key 기준 1회만 stdout/JSONL에 남겨 로그 폭주를 줄인다.
+- scan 통계 로그는 최초, 통계 변화, 설정된 heartbeat 주기 때만 출력한다.
+- `downstream.log_jsonl_max_bytes`를 0보다 크게 설정하면 `state/logs/downstream.jsonl`에 size guard/rotation을 적용한다. `downstream.log_suppression_max_keys`는 장기 실행 중 suppression cache 상한을 정한다. `downstream.log_routine_scan_events: false`이면 routine `scan_started`/`scan_completed`는 JSONL에만 남기고 stdout에는 내보내지 않는다. 기존 `downstream.out.log` truncate/delete나 launchd 재시작은 운영 승인 후 별도 절차로 처리한다.
 
 ## Downstream 상태 저장
 - downstream 상태는 `deliveries` 테이블에 기록된다.
@@ -99,6 +106,7 @@
 - `scripts/run_gui.sh`: 웹 제어판 실행
 - `scripts/run_distribute.sh`: downstream 워커 실행
 - `scripts/distribute_status.sh`: deliveries 상태 CLI 래퍼
+- `scripts/benchmark_models.py`: baseline/current model과 승인된 후보 STT 모델을 비교하는 benchmark CLI 초안
 - `scripts/setup_launchd.sh`: venv, 의존성, 모델, 폴더, launchd를 한 번에 설정
 - `scripts/cleanup.py`: 오래된 audio/transcript/tmp 정리
 - `launchd/com.geonha.lecture-stt.plist`: 메인 워커 상시 실행
@@ -115,7 +123,10 @@
 
 ## 테스트 범위
 - 현재 자동 테스트는 downstream 계층에 집중되어 있다.
-- `tests/test_distribute_lib.py`: pair 처리, block/unblock, idempotency, conflict, cleanup failure
+- `tests/test_distribute_lib.py`: pair 처리, block/unblock, idempotency, conflict, cleanup failure, 반복 문제 로그 suppression, JSONL rotation
+- `tests/test_downstream_worker.py`: scan stats heartbeat/suppression 회귀 테스트
+- `tests/test_correction_manual.py`: 자동 correction provider 제거, API key 불필요, manual mode pending skip 회귀 테스트
+- `tests/test_benchmark_models.py`: benchmark plan safety와 segment quality metric 회귀 테스트
 - `tests/test_distribute_status.py`: deliveries CLI 출력과 삭제 동작
 - `tests/test_stt_main.py`: pause/resume/status control command 회귀 테스트
 - `tests/test_web_panel.py`: 웹 제어판 종료 동작 회귀 테스트

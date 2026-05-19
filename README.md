@@ -12,8 +12,8 @@
 - 실패 폴더: `99_errors`
 - 관리 폴더
   - `01_audio`: 변환 전 임시 원본 보관
-  - `03_correction`: LLM 교정 결과
-  - `04_summarize`: LLM 요약 결과
+  - `03_correction`: 수동/provider-neutral 교정 결과
+  - `04_summarize`: 수동/provider-neutral 요약 결과
   - `state/jobs.sqlite3`: 처리 이력 DB
   - `logs/app.log`: 실행 로그
 
@@ -69,6 +69,13 @@ mkdir -p "/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_rec
 3. 변환 완료 시 텍스트는 `02_transcripts`에 저장됩니다.
 4. 실패 시 `99_errors`로 이동되며, 실패 사유는 앱 로그와 알림에 남습니다.
 
+### 4.1 Correction/summary 수동 모드
+- API-backed 자동 교정 provider는 현재 비활성화되어 있으며, `ANTHROPIC_API_KEY`나 Claude 전용 모델 설정은 필요하지 않습니다.
+- `02_transcripts`의 raw `{stem}.txt + {stem}.json`은 그대로 보존합니다.
+- 사람이 검토했거나 외부 도구로 교정한 `{stem}.txt + {stem}.json` pair를 `03_correction`에 넣으면 downstream worker가 GH archive origin으로 배포합니다.
+- 요약 `{stem}.md`를 `04_summarize`에 넣으면 correction 전달 완료를 확인한 뒤 GH archive summary와 Obsidian note 경로로 배포합니다.
+- destination에 다른 내용이 이미 있으면 overwrite하지 않고 `CONFLICT`로 남깁니다. 현재 problem row 전수 분류는 `docs/DOWNSTREAM_TRIAGE_2026-05-19.md`를 참고합니다.
+
 ## 5. 실행 방법
 
 ### 5.1 수동 실행(터미널)
@@ -110,9 +117,7 @@ launchctl bootout "gui/$uid" /Users/geonha/Library/LaunchAgents/com.geonha.lectu
 ```bash
 bash /Users/geonha/lecture_stt/scripts/run_gui.sh
 ```
-- 브라우저 접속
-  - 레거시 패널: `http://127.0.0.1:8765`
-  - React 패널 빌드가 있으면: `http://127.0.0.1:8765/app`
+- 브라우저 접속: `http://127.0.0.1:8765`
 - 기본 동작: 시작 / 일시정지(재개) / 중지 / 새로고침
 - React 패널 상단 알림 토글에서 `텔레그램만 / 디스코드만 / 둘 다 / 끄기`를 순환 선택할 수 있습니다.
 - 이 변경은 `config/config.yaml`의 `notification` 섹션에 반영되며, 실행 중 워커가 있으면 즉시 재시작 적용됩니다.
@@ -144,7 +149,7 @@ cd /Users/geonha/lecture_stt/frontend/web-panel
 npm test
 ```
 - React 패널 수동 검증 체크리스트
-  1. `/app` 초기 진입 시 loading block 뒤에 runtime, queue, folders, jobs, logs 카드가 모두 렌더링되는지 확인합니다.
+  1. `/` 초기 진입 시 loading block 뒤에 runtime, queue, folders, jobs, logs 카드가 모두 렌더링되는지 확인합니다.
   2. `새로고침` 액션 실행 시 버튼이 pending 상태를 거친 뒤 `updated_at` 또는 summary 정보가 다시 갱신되는지 확인합니다.
   3. 운영 중인 워커 제어가 안전한 환경이면 `시작 -> 일시정지/재개 -> 중지`를 순서대로 눌러 각 액션 후 상태 카드와 버튼 라벨이 refetch 결과로 바뀌는지 확인합니다.
   4. 다른 터미널에서 `logs/app.log`에 테스트 마커를 추가해 로그 패널에 새 줄이 append 되는지 확인합니다.
@@ -153,7 +158,7 @@ npm test
   7. `최신으로 이동` 클릭 후 스크롤이 맨 아래로 이동하고 자동 따라가기가 다시 켜지는지 확인합니다.
 - 프론트 산출물 커밋 기준
   - `frontend/web-panel/package-lock.json`은 커밋합니다. 설치, 테스트, 빌드 재현성을 고정하는 역할이 있습니다.
-  - `frontend/web-panel/dist/`는 기본적으로 커밋하지 않습니다. 현재 웹 패널 서버는 로컬 `dist`가 있으면 `/app`을 서빙하고, 없으면 placeholder를 보여주도록 되어 있어 빌드 산출물을 저장소 기본 소스로 취급하지 않습니다.
+  - `frontend/web-panel/dist/`는 기본적으로 커밋하지 않습니다. 현재 웹 패널 서버는 로컬 `dist`가 있으면 `/`에서 메인 패널로 서빙하고, 없으면 빌드 안내 화면을 보여주도록 되어 있어 빌드 산출물을 저장소 기본 소스로 취급하지 않습니다.
   - 배포 대상 장비에서 Node 빌드를 수행할 수 없다면 `dist`를 VCS가 아니라 릴리스 산출물로 관리할지 별도 정책을 정합니다.
 
 ### 5.4 Stage 5 downstream 배포 worker
