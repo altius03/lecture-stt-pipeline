@@ -12,8 +12,8 @@
 - 실패 폴더: `99_errors`
 - 관리 폴더
   - `01_audio`: 변환 전 임시 원본 보관
-  - `03_correction`: LLM 교정 결과
-  - `04_summarize`: LLM 요약 결과
+  - `03_correction`: 수동/provider-neutral 교정 결과
+  - `04_summarize`: 수동/provider-neutral 요약 결과
   - `state/jobs.sqlite3`: 처리 이력 DB
   - `logs/app.log`: 실행 로그
 
@@ -68,6 +68,13 @@ mkdir -p "/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_rec
 2. 파일 복사가 끝나고 안정 시간(기본 90초)이 지나면 처리 대상으로 인식됩니다.
 3. 변환 완료 시 텍스트는 `02_transcripts`에 저장됩니다.
 4. 실패 시 `99_errors`로 이동되며, 실패 사유는 앱 로그와 알림에 남습니다.
+
+### 4.1 Correction/summary 수동 모드
+- API-backed 자동 교정 provider는 현재 비활성화되어 있으며, `ANTHROPIC_API_KEY`나 Claude 전용 모델 설정은 필요하지 않습니다.
+- `02_transcripts`의 raw `{stem}.txt + {stem}.json`은 그대로 보존합니다.
+- 사람이 검토했거나 외부 도구로 교정한 `{stem}.txt + {stem}.json` pair를 `03_correction`에 넣으면 downstream worker가 GH archive origin으로 배포합니다.
+- 요약 `{stem}.md`를 `04_summarize`에 넣으면 correction 전달 완료를 확인한 뒤 GH archive summary와 Obsidian note 경로로 배포합니다.
+- destination에 다른 내용이 이미 있으면 overwrite하지 않고 `CONFLICT`로 남깁니다. 현재 problem row 전수 분류는 `docs/DOWNSTREAM_TRIAGE_2026-05-19.md`를 참고합니다.
 
 ## 5. 실행 방법
 

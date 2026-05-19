@@ -151,13 +151,13 @@ launchd plist template은 `__REPO_ROOT__` placeholder 상태지만 설치된 실
 - `downstream.log_jsonl_path`: `state/logs/downstream.jsonl`
 - `downstream.lock_path`: `state/downstream.lock`
 
-Claude/Anthropic 잔존:
+Claude/Anthropic 제거 결과:
 
-- `requirements.txt`: `anthropic>=0.40.0`
-- `config/config.yaml`: `correction.model: claude-haiku-4-5-20251001`
-- `config/config.example.yaml`: Claude model/API key 주석
-- `src/lecture_stt/correction/corrector.py`: `import anthropic`, `anthropic.Anthropic(...)`
-- `src/lecture_stt/correction/worker.py`: `ANTHROPIC_API_KEY` 요구 및 Claude correction worker
+- `requirements.txt`: `anthropic` dependency 제거 완료
+- `config/config.yaml`: Claude 전용 `correction.model`/`max_tokens` 제거 후 `correction.mode: manual` 적용
+- `config/config.example.yaml`: Claude model/API key 예시 제거 후 manual/provider-neutral correction 문서화
+- `src/lecture_stt/correction/corrector.py`: 외부 API 호출 구현 제거, disabled compatibility/helper 모듈로 전환
+- `src/lecture_stt/correction/worker.py`: API key 요구 제거, pending transcript pair를 manual correction 대기 상태로 보고
 
 ## 8. 우선순위 제안
 

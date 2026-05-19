@@ -1,7 +1,7 @@
 """교정 시스템 프롬프트 조합 모듈.
 
 00_base_prompt.txt + 01_common_glossary.txt + glossary_{subject}.txt 를
-순서대로 합쳐 Claude API system prompt를 만든다.
+순서대로 합쳐 provider-neutral correction prompt를 만든다.
 """
 from __future__ import annotations
 

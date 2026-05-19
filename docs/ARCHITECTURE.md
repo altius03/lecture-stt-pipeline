@@ -21,6 +21,7 @@
 - 실제 구현 코드는 `src/lecture_stt/` 패키지 아래에 정리되어 있다.
 - `src/lecture_stt/stt/`: 메인 STT 파이프라인
 - `src/lecture_stt/shared/`: 공용 DB, 유틸
+- `src/lecture_stt/correction/`: 수동/provider-neutral correction 대기 상태 조회와 correction prompt helper
 - `src/lecture_stt/downstream/`: correction/summary 배포 파이프라인
 - `src/lecture_stt/ui/`: 웹 제어판
 - 운영 스크립트는 `PYTHONPATH=<repo>/src python -m lecture_stt...` 방식으로 패키지를 직접 실행한다.
@@ -79,6 +80,9 @@
 - Tk 기반 구형 GUI는 제거했고, 운영 제어면은 웹 패널로 단일화한다.
 
 ## Downstream 배포 파이프라인
+- API-backed 자동 correction provider는 현재 비활성화되어 있으며, `src/lecture_stt/correction/worker.py`는 `02_transcripts`의 pending pair를 manual correction 대기 상태로만 보고한다.
+- `CorrectionConfig`에는 API key/model/max token 필드가 없고, `correction.mode: manual`을 기본 운영 모드로 둔다.
+- `src/lecture_stt/correction/corrector.py`는 외부 API 호출 구현을 갖지 않는 compatibility/helper 모듈이며, 자동 correction 시도는 명시적으로 실패한다.
 - 진입점은 `src/lecture_stt/downstream/worker.py`다.
 - correction 입력은 `03_correction` 폴더의 `{stem}.txt + {stem}.json` pair다.
 - summary 입력은 `04_summarize` 폴더의 `{stem}.md`다.
@@ -121,6 +125,7 @@
 - 현재 자동 테스트는 downstream 계층에 집중되어 있다.
 - `tests/test_distribute_lib.py`: pair 처리, block/unblock, idempotency, conflict, cleanup failure, 반복 문제 로그 suppression, JSONL rotation
 - `tests/test_downstream_worker.py`: scan stats heartbeat/suppression 회귀 테스트
+- `tests/test_correction_manual.py`: 자동 correction provider 제거, API key 불필요, manual mode pending skip 회귀 테스트
 - `tests/test_benchmark_models.py`: benchmark plan safety와 segment quality metric 회귀 테스트
 - `tests/test_distribute_status.py`: deliveries CLI 출력과 삭제 동작
 - `tests/test_stt_main.py`: pause/resume/status control command 회귀 테스트

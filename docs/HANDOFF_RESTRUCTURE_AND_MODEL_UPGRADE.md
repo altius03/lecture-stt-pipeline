@@ -448,11 +448,11 @@ transcripts/
 
 ### Phase 3. Claude/Anthropic 제거
 
-- [ ] `anthropic`, `claude`, `ANTHROPIC_API_KEY` 참조 검색
-- [ ] Claude API 호출부 제거 또는 neutral manual/provider abstraction으로 교체
-- [ ] correction/summary 산출물 개념은 유지
-- [ ] config/docs/tests 갱신
-- [ ] Python unittest 실행
+- [x] `anthropic`, `claude`, `ANTHROPIC_API_KEY` 참조 검색
+- [x] Claude API 호출부 제거 또는 neutral manual/provider abstraction으로 교체
+- [x] correction/summary 산출물 개념은 유지
+- [x] config/docs/tests 갱신
+- [x] Python unittest 실행
 
 ### Phase 4. retry/failure/log 안정화
 
@@ -537,4 +537,6 @@ git diff --stat
 - 추천 방향을 확정했다: txt/json은 유지하되 JSON을 machine-readable canonical artifact로 강화하고, downstream은 수동 correction/summary 산출물을 감지·검증·배포하는 보조 계층으로 유지하되 반복 로그 폭주부터 완화한다.
 - retry 기본안은 사용자 승인대로 2회 재시도 후 `99_errors` 이동으로 둔다. 실제 구현 전에는 원본 이동/복사 정책을 코드 기준으로 다시 검증한다.
 - downstream 운영 로그는 gzip archive 후 truncate했고, 승인된 config 적용 및 launchd 재시작 후 stdout 반복 폭주는 멈춘 상태다.
+- Claude/Anthropic API-backed correction 구현과 dependency/config coupling을 제거하고, correction worker를 manual/provider-neutral pending reporter로 전환했다.
+- downstream problem row 41건을 read-only로 분류해 `docs/DOWNSTREAM_TRIAGE_2026-05-19.md`에 기록했다. conflict는 overwrite 없이 수동 canonical 결정 대상으로 남겨 두었다.
 - 모델 benchmark 결과 canonical 기본값은 `large-v3` 유지로 판단했다. turbo/distil/Korean turbo 후보는 탈락했고, `faster-whisper==1.2.1`은 isolated 환경에서만 보류 후보로 남긴다.

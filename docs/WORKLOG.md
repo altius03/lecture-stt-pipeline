@@ -5,6 +5,14 @@
 
 ## 2026-05-19
 
+### Claude/Anthropic 자동 교정 제거와 downstream problem row 전수 분류
+- correction 단계는 유지하되 API-backed 자동 교정 provider를 비활성화하고 manual/provider-neutral 모드로 전환했다.
+- `requirements.txt`에서 `anthropic` dependency를 제거하고, `config/config.yaml`/`config/config.example.yaml`의 Claude 전용 model/API key 설정을 `correction.mode: manual`로 대체했다.
+- `CorrectionConfig`에서 API key/model/max token 필드를 제거하고, `CorrectionWorker`가 pending transcript pair를 correction output으로 쓰지 않고 `skipped`로 보고하도록 바꿨다.
+- legacy `corrector.py`는 외부 API 호출 없이 provider-neutral helper와 disabled compatibility shim만 남겼다.
+- API key 없이 설정을 로드하고 manual mode에서 source/correction 폴더를 변경하지 않는 회귀 테스트를 추가했다.
+- 운영 DB의 downstream problem row 41건을 read-only로 전수 분류해 `docs/DOWNSTREAM_TRIAGE_2026-05-19.md`에 기록했다. 25건은 실제 source/destination hash conflict, 1건은 stale/DB-only conflict 의심, 8건은 invalid stem, 7건은 subject route/rename 확인 대상으로 분리했다.
+
 ### downstream 로그 폭주 완화와 모델 benchmark 초안
 - downstream worker가 반복 conflict/blocked/error 문제를 매 scan마다 다시 stdout/JSONL에 쓰지 않도록, 프로세스 생애 동안 동일 문제 이벤트를 1회만 기록하는 suppression을 추가했다.
 - scan 통계 stdout은 최초/변경/heartbeat 때만 출력하도록 `ScanStatsReporter`를 추가해 `downstream.out.log` 증가량을 줄였다.

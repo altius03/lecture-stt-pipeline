@@ -42,11 +42,9 @@ cleanup:
 
 correction:
   prompt_folder: "${LECTURE_RECORDINGS_ROOT}/05_prompt"
-  model: claude-haiku-4-5-20251001  # claude-sonnet-4-6 으로 교체하면 정확도 향상
-  max_tokens: 8192
+  mode: manual  # API-backed automatic correction is disabled; use manual/provider-neutral correction.
   stable_for_sec: 60
   scan_interval_sec: 60
-  # api_key: "<ANTHROPIC_API_KEY>"  # .env에 ANTHROPIC_API_KEY로 설정하는 것을 권장
 
 notification:
   provider: telegram
