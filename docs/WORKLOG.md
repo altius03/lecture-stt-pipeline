@@ -5,6 +5,14 @@
 
 ## 2026-05-19
 
+### Final downstream cleanup, preserved failure evidence, runtime cleanup dry-run
+- Later explicit execution request에 따라 남은 downstream problem 16건 중 safe 자동 수리 가능한 항목을 백업 후 적용했다. Backup은 `state/backups/downstream-repair-20260519T123211Z`, manifest는 `state/reports/downstream-repair-apply-20260519T123211Z.json`이다.
+- Source canonical/rename-needed correction pair 9건은 canonical stem으로 rename했고 downstream worker가 처리해 9건 모두 `DELIVERED`가 됐다. DB-only stale rows `zztest`, `test123`, `tmp_260330DStr_2`는 backup 후 삭제했다.
+- 정책상 보존 대상인 `260422LC`는 그대로 두었다. 남은 downstream problem rows는 invalid/manual review 3건과 document-only conflict 1건이다.
+- Canary 실패 job `201`은 terminal `ERROR` DB row와 `99_errors/260519OOP_1.m4a`를 증거로 보존했다. 관련 stale tmp wav는 backup 후 제거했고 report는 `state/reports/stt-error-cleanup-20260519T123547Z.json`이다.
+- Runtime cleanup은 destructive apply 없이 dry-run/list만 수행했다. Report directory는 `state/reports/runtime-cleanup-20260519T123847Z`이며 repo-local stale tmp 6 files, legacy root `/Users/geonha/lecture_stt`, repo/state/runtime logs inventory를 기록했다. iCloud audio/transcript bulk deletion과 log/archive prune은 적용하지 않았다.
+- canonical STT model은 계속 `large-v3`다.
+
 ### Runtime migration, VAD compatibility fix, launchd canary 완료
 - 승인된 runtime migration을 적용해 STT tmp는 `~/Library/Caches/lecture_stt/tmp`, STT/downstream/webpanel/cleanup launchd stdout/stderr와 app/downstream logs는 `~/Library/Logs/lecture_stt`로 이동했다. DB는 계속 repo 내부 `state/jobs.sqlite3`에 유지한다.
 - migration backup은 `state/backups/runtime-migration-20260519T114522Z`에 보존했다. post-migration log rotation은 dry-run만 수행했고 결과는 `state/reports/log-rotation-post-migration-dry-run-20260519T114610Z.txt`에 남겼다.

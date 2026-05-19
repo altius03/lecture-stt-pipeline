@@ -459,11 +459,18 @@ Completed under explicit approval:
 - Root cause fix: `STTWorker` now builds `vad_parameters` according to the installed faster-whisper `VadOptions` signature, covering both 1.1-style `onset/offset` and 1.2-style `threshold` APIs. Canonical STT model still remains `large-v3`.
 - Second launchd copied canary `260519OOP_2` completed as job `202` with `DONE`, transcript txt/json present, report `state/reports/canary-20260519T120017Z.json`.
 
+Later explicit execution request in this session:
+
+- User requested continuing remaining work through execution and main-branch push, while still keeping `large-v3`, preserving rollback evidence, and reporting through Telegram.
+- Downstream repair applied with backup `state/backups/downstream-repair-20260519T123211Z` and manifest `state/reports/downstream-repair-apply-20260519T123211Z.json`: 9 source-canonical rename-needed pairs were repaired and processed by downstream; 3 DB-only stale rows were cleared; `260422LC` remained preserved.
+- Canary failure evidence cleanup applied with report `state/reports/stt-error-cleanup-20260519T123547Z.json`: job `201` terminal `ERROR` row and `99_errors/260519OOP_1.m4a` remained preserved; stale cache tmp wav was removed after backup.
+- Runtime cleanup remained dry-run/list only because the manifest included broad audio/transcript/log/archive/legacy deletion candidates. Report directory: `state/reports/runtime-cleanup-20260519T123847Z`.
+- Main push is approved by the later explicit request; tag and release remain out of scope.
+
 Still not approved unless explicitly requested later:
 
-- Local commit, remote push, tag, release.
-- DB cleanup of failed canary job `201` or any existing downstream problem row.
-- Old log archive deletion/prune beyond dry-run.
+- Tag or release.
+- Broad audio/transcript cleanup apply, old log archive deletion/prune, or legacy root deletion beyond dry-run/list.
 - Model switch away from `large-v3`.
 
 ## C — Canary / live observation
