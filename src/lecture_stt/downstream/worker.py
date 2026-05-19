@@ -17,8 +17,10 @@ from lecture_stt.downstream.lib import (
     SubjectRoute,
     default_subject_routes,
 )
+from lecture_stt.shared.log_retention import DEFAULT_DOWNSTREAM_BACKUP_COUNT, DEFAULT_LOG_MAX_BYTES
 from lecture_stt.shared.paths import (
     default_db_path,
+    default_log_dir,
     env_file,
     repo_root,
     resolve_config_path,
@@ -87,9 +89,9 @@ def _default_config() -> dict[str, Any]:
         "downstream": {
             "scan_interval_sec": 30,
             "stable_for_sec": 60,
-            "log_jsonl_path": str(state_root / "logs" / "downstream.jsonl"),
-            "log_jsonl_max_bytes": 0,
-            "log_jsonl_backup_count": 3,
+            "log_jsonl_path": str(default_log_dir() / "downstream.jsonl"),
+            "log_jsonl_max_bytes": DEFAULT_LOG_MAX_BYTES,
+            "log_jsonl_backup_count": DEFAULT_DOWNSTREAM_BACKUP_COUNT,
             "stats_heartbeat_scans": 120,
             "log_suppression_max_keys": 4096,
             "log_routine_scan_events": False,

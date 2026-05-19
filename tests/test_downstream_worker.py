@@ -90,6 +90,15 @@ class DownstreamWorkerConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "downstream.log_routine_scan_events"):
                 load_worker_config(str(config_path))
 
+    def test_default_downstream_jsonl_rotation_matches_retention_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = self._write_config(Path(tmp), override_line="log_routine_scan_events: false")
+
+            config = load_worker_config(str(config_path))
+
+        self.assertEqual(config.log_jsonl_max_bytes, 10 * 1024 * 1024)
+        self.assertEqual(config.log_jsonl_backup_count, 5)
+
 
 if __name__ == "__main__":
     unittest.main()

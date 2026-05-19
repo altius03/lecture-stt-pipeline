@@ -5,6 +5,56 @@
 
 ## 2026-05-19
 
+### Pre-commit review blocker fixes
+- 독립 리뷰에서 지적된 3개 blocker를 TDD로 재현한 뒤 수정했다.
+- secret redaction은 `Authorization: Bearer ...`, `authorization=Bearer ...`, JWT-like token, `sk-...` 표면을 모두 `[REDACTED]` 처리하도록 보강했다.
+- launchd plain log rotation은 active fd가 열린 상태에서도 정책이 맞도록 rename+touch 대신 copytruncate 방식으로 바꿨다.
+- PROCESSING 상태에서 죽은 retry job은 `engine_params.transcription_failures/transcription_max_retries`를 기준으로 `전사 재시도 대기 n/max`를 복원해 다음 scan에서 즉시 재시도되게 했다.
+- 관련 regression test 3개를 추가했고 전체 unittest/compileall/diff-check가 통과했다.
+
+### Launchd canary readiness read-only 점검
+- launchd read-only check에서 `com.geonha.lecture-stt`와 `com.geonha.lecture-stt-distribute`는 PID가 있는 running 상태로 확인했다. cleanup은 상시 PID가 없는 보조 서비스로 보이며 canary blocker로 보지 않는다.
+- DB read-only check는 `integrity_check=ok`, `foreign_key_check=[]`, job status는 `DONE=29`, `PROCESSING=0`, retry 대기 row `0`, ERROR row `0`로 확인했다.
+- downstream 기존 problem row 41건은 별도 conflict/rename 작업으로 남아 있으며, canary 중 DB clear/destination overwrite를 하지 않는 조건으로 blocker에서 제외한다.
+- 현재 inbox는 비어 있어 다음 실제 강의 1개를 canary input으로 기다릴 수 있는 상태다.
+- installed LaunchAgents와 운영 config는 아직 repo-local log/tmp path를 사용하므로, runtime path migration/restart 없이 현재 운영 기준으로 canary를 기다리는 것으로 문서화했다.
+
+### Runtime path default와 migration/rollback 계획 보강
+- macOS 표준 위치 정책에 맞춰 기본 log/tmp/cache helper를 추가했다. 기본 log는 `~/Library/Logs/lecture_stt`, 기본 tmp/cache는 `~/Library/Caches/lecture_stt/tmp`를 사용하고 DB는 repo 내부 `state/jobs.sqlite3`에 유지한다.
+- STT/downstream default config와 `config/config.example.yaml`을 위 정책에 맞춰 보강했다.
+- `docs/RUNTIME_MIGRATION_PLAN_2026-05-19.md`에 승인 전 read-only preflight, 승인 후 migration 초안, rollback 절차, 아직 하지 않는 작업을 분리해 문서화했다.
+- 운영 `config/config.yaml`, installed LaunchAgents, 기존 repo log/tmp 파일, DB에는 손대지 않았다.
+
+### Downstream conflict dry-run/report/repair flow 보강
+- `lecture_stt.downstream.status diagnose`에 live source/destination existence/hash 기반 classification을 추가했다.
+- classification은 `same-content-now`, `source-missing`, `dest-missing`, `hash-conflict`, `route/rename-needed`, `manual-review`로 나뉘며, route suffix가 붙은 stem은 proposed stem을 계산한다.
+- `diagnose --json --report-path ...`로 machine-readable dry-run report를 `state/reports/` 같은 gitignored 경로에 저장할 수 있게 했다.
+- DB-only/source-missing row clear는 `clear-stale`로 분리했다. 실제 적용은 `--yes`와 `--backup-path`가 모두 필요하며, DB backup을 만든 뒤 row 1개만 삭제한다.
+- `260422LC`는 D3 결정에 맞춰 `clear-stale`에서도 document-only 예외로 거부한다.
+- live read-only diagnose 결과는 41 problem rows로, 기존 triage와 동일하게 `260422LC`는 source-missing/document-only, 나머지는 hash conflict 또는 route/rename-needed로 분류됐다.
+- 운영 DB/file에 대한 clear, overwrite, delete, migration은 수행하지 않았다.
+
+### 로그 retention/rotation 정책 보강
+- app log와 downstream JSONL 기본 rotation 값을 확정 정책에 맞춰 10MB x 5로 맞췄다.
+- launchd stdout/stderr plain log에 대해 10MB x 3 정책을 dry-run/apply로 실행할 수 있는 `scripts/rotate_logs.py`를 추가했다. 기본은 dry-run이며, `--apply` 없이는 로그 파일을 변경하지 않는다.
+- 압축 archive(`*.gz`)는 30일 보존 기준으로 dry-run/prune 할 수 있는 공통 helper를 추가했다.
+- rotation helper, compressed archive retention, downstream 기본값, rotate script dry-run/apply 회귀 테스트를 추가했다.
+- 기존 운영 로그 archive/cleanup, launchd restart, 실제 로그 변경은 수행하지 않았다.
+
+### STT retry/failure policy 구현
+- STT 실행 실패 job을 기본 2회까지 `PENDING` + `전사 재시도 대기 n/2` 상태로 남기고, 다음 scan에서 즉시 재시도하도록 구현했다.
+- retryable job은 canonical audio를 `01_audio`에 유지하며, retry 한도 초과 시 terminal `ERROR`로 확정하고 원본 오디오는 `99_errors`로 이동한다.
+- 실패 메시지/trace/알림 payload에는 secret-like 문자열을 `[REDACTED]`로 마스킹하도록 방어 로직을 추가했다.
+- retry 상태 metadata는 DB schema migration 없이 `engine_params`의 `transcription_failures`, `transcription_max_retries`, `last_error_message`에 기록한다.
+- transient success, terminal failure, startup recovery가 retryable job을 보존하는 회귀 테스트를 추가했다.
+- 모델은 변경하지 않았고, launchd/운영 DB/iCloud 실제 artifact에는 손대지 않았다.
+
+### 운영 결정사항 정리와 OPERATIONS runbook 추가
+- 남은 고도화 workstream의 사용자 결정사항을 `.hermes/plans/2026-05-19_160615-lecture-stt-remaining-hardening.md`에 반영했다.
+- `docs/OPERATIONS.md`를 현재 운영 기준 문서로 추가했다. quick checklist와 상세 runbook을 함께 두고, downstream conflict, retry/failure, log retention, runtime path, model/package, canary 기준을 분리해 정리했다.
+- README 상단에 `docs/OPERATIONS.md` 링크와 legacy 경로 주의 문구를 추가했다.
+- 코드, DB, launchd, production `.venv`는 변경하지 않았다.
+
 ### Claude/Anthropic 자동 교정 제거와 downstream problem row 전수 분류
 - correction 단계는 유지하되 API-backed 자동 교정 provider를 비활성화하고 manual/provider-neutral 모드로 전환했다.
 - `requirements.txt`에서 `anthropic` dependency를 제거하고, `config/config.yaml`/`config/config.example.yaml`의 Claude 전용 model/API key 설정을 `correction.mode: manual`로 대체했다.

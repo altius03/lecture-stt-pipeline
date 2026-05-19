@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import logging
 import os
 import tempfile
@@ -100,14 +101,38 @@ class _FakeNotifier:
         pass
 
 
+class _RecordingNotifier(_FakeNotifier):
+    def __init__(self) -> None:
+        self.errors: list[dict] = []
+
+    def notify_error(self, payload: dict) -> None:
+        self.errors.append(dict(payload))
+
+
 class _FakeWorker:
     def __init__(self, params, ffmpeg_path: str, tmp_dir: str):
         self.params = params
         self.ffmpeg_path = ffmpeg_path
         self.tmp_dir = Path(tmp_dir)
 
-    def transcribe_file(self, src_audio: Path, canonical_base: str, progress_callback=None):
+    def transcribe_file(self, src_audio: Path, canonical_base: str, progress_callback=None) -> tuple[list[dict], str, float, float, Path]:
         return ([{"id": 0, "start": 0.0, "end": 1.0, "text": "테스트"}], "테스트", 0.1, 0.2, self.tmp_dir / "temp.wav")
+
+    def cleanup_tmp(self, wav_path: Path) -> None:
+        pass
+
+
+class _FailingWorker(_FakeWorker):
+    def __init__(self, tmp_dir: Path, *, failures_before_success: int | None):
+        self.tmp_dir = Path(tmp_dir)
+        self.failures_before_success = failures_before_success
+        self.calls = 0
+
+    def transcribe_file(self, src_audio: Path, canonical_base: str, progress_callback=None) -> tuple[list[dict], str, float, float, Path]:
+        self.calls += 1
+        if self.failures_before_success is None or self.calls <= self.failures_before_success:
+            raise RuntimeError("api_key=sk-secret-1234567890 transient STT failure")
+        return ([{"id": 0, "start": 0.0, "end": 1.0, "text": "재시도 성공"}], "재시도 성공", 0.1, 0.2, self.tmp_dir / "retry.wav")
 
     def cleanup_tmp(self, wav_path: Path) -> None:
         pass
@@ -289,6 +314,206 @@ class SttPipelineBehaviorTests(unittest.TestCase):
         self.assertFalse(canonical_audio.exists())
         remaining = self.pipeline.conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
         self.assertEqual(remaining, 0)
+
+    def test_startup_recovery_keeps_retryable_transcription_jobs_for_next_scan(self) -> None:
+        canonical_audio = self.audio_dir / "retry-pending.m4a"
+        canonical_audio.write_bytes(b"claimed-audio")
+        source_path = self.watch_dir / "retry-pending.m4a"
+
+        self.pipeline.conn.execute(
+            "INSERT INTO jobs (status, created_at, updated_at, orig_inbox_path, orig_name, canonical_base, "
+            "canonical_audio_path, transcript_txt_path, transcript_json_path, engine_params, current_step, progress_pct) "
+            "VALUES (?, datetime('now'), datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                stt_main.STATUS_PENDING,
+                str(source_path),
+                source_path.name,
+                "retry-pending",
+                str(canonical_audio),
+                str(self.transcript_dir / "retry-pending.txt"),
+                str(self.transcript_dir / "retry-pending.json"),
+                json.dumps({"transcription_failures": 1, "transcription_max_retries": 2}),
+                "전사 재시도 대기 1/2",
+                18,
+            ),
+        )
+        self.pipeline.conn.commit()
+
+        self.pipeline.startup_recovery()
+
+        self.assertTrue(canonical_audio.exists())
+        self.assertFalse(source_path.exists())
+        row = self.pipeline.conn.execute(
+            "SELECT status, current_step FROM jobs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual(row["status"], stt_main.STATUS_PENDING)
+        self.assertEqual(row["current_step"], "전사 재시도 대기 1/2")
+
+    def test_startup_recovery_restores_processing_retry_marker_for_next_scan(self) -> None:
+        canonical_audio = self.audio_dir / "retry-processing.m4a"
+        canonical_audio.write_bytes(b"claimed-audio")
+        source_path = self.watch_dir / "retry-processing.m4a"
+
+        self.pipeline.conn.execute(
+            "INSERT INTO jobs (status, created_at, updated_at, started_at, orig_inbox_path, orig_name, canonical_base, "
+            "canonical_audio_path, transcript_txt_path, transcript_json_path, engine_params, current_step, progress_pct) "
+            "VALUES (?, datetime('now'), datetime('now'), datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                stt_main.STATUS_PROCESSING,
+                str(source_path),
+                source_path.name,
+                "retry-processing",
+                str(canonical_audio),
+                str(self.transcript_dir / "retry-processing.txt"),
+                str(self.transcript_dir / "retry-processing.json"),
+                json.dumps({"transcription_failures": 1, "transcription_max_retries": 2}),
+                "전사 시작/진행",
+                31,
+            ),
+        )
+        self.pipeline.conn.commit()
+
+        self.pipeline.startup_recovery()
+
+        recovered = self.pipeline.conn.execute(
+            "SELECT status, current_step, progress_pct, canonical_audio_path FROM jobs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual(recovered["status"], stt_main.STATUS_PENDING)
+        self.assertEqual(recovered["current_step"], "전사 재시도 대기 1/2")
+        self.assertEqual(recovered["progress_pct"], 18)
+        self.assertEqual(Path(recovered["canonical_audio_path"]), canonical_audio)
+        self.assertTrue(canonical_audio.exists())
+        self.assertFalse(source_path.exists())
+
+        self.assertEqual(self.pipeline.process_retryable_jobs(), 1)
+        done = self.pipeline.conn.execute(
+            "SELECT status, current_step FROM jobs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual(done["status"], stt_main.STATUS_DONE)
+        self.assertEqual(done["current_step"], "전체 완료")
+
+    def test_transcription_retries_transient_failures_before_success(self) -> None:
+        source_path = self.watch_dir / "retry-success.m4a"
+        source_path.write_bytes(b"fake-audio")
+        worker = _FailingWorker(self.tmp_dir, failures_before_success=2)
+
+        with mock.patch.object(self.pipeline, "worker", worker):
+            self.pipeline.process_job(source_path)
+            first_row = self.pipeline.conn.execute(
+                "SELECT status, current_step, canonical_audio_path, engine_params FROM jobs ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            self.assertEqual(worker.calls, 1)
+            self.assertEqual(first_row["status"], stt_main.STATUS_PENDING)
+            self.assertEqual(first_row["current_step"], "전사 재시도 대기 1/2")
+            self.assertEqual(json.loads(first_row["engine_params"])["transcription_failures"], 1)
+            self.assertTrue((self.audio_dir / "retry-success.m4a").exists())
+            self.assertFalse((self.error_dir / "retry-success.m4a").exists())
+
+            self.assertEqual(self.pipeline.process_retryable_jobs(), 1)
+            second_row = self.pipeline.conn.execute(
+                "SELECT status, current_step, engine_params FROM jobs ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            self.assertEqual(worker.calls, 2)
+            self.assertEqual(second_row["status"], stt_main.STATUS_PENDING)
+            self.assertEqual(second_row["current_step"], "전사 재시도 대기 2/2")
+            self.assertEqual(json.loads(second_row["engine_params"])["transcription_failures"], 2)
+
+            self.assertEqual(self.pipeline.process_retryable_jobs(), 1)
+
+        self.assertEqual(worker.calls, 3)
+        row = self.pipeline.conn.execute(
+            "SELECT status, canonical_audio_path, transcript_txt_path, transcript_json_path, "
+            "error_message, engine_params FROM jobs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["status"], stt_main.STATUS_DONE)
+        self.assertIsNone(row["error_message"])
+        self.assertFalse(source_path.exists())
+        self.assertTrue((self.audio_dir / "retry-success.m4a").exists())
+        self.assertFalse((self.error_dir / "retry-success.m4a").exists())
+        self.assertEqual(Path(row["canonical_audio_path"]).parent, self.audio_dir)
+        self.assertTrue(Path(row["transcript_txt_path"]).exists())
+        self.assertTrue(Path(row["transcript_json_path"]).exists())
+        self.assertIn("재시도 성공", Path(row["transcript_txt_path"]).read_text(encoding="utf-8"))
+        payload = json.loads(Path(row["transcript_json_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(payload["metadata"]["canonical_base"], "retry-success")
+        self.assertEqual(json.loads(row["engine_params"])["transcription_failures_before_success"], 2)
+
+    def test_redacts_authorization_bearer_and_jwt_tokens(self) -> None:
+        sample_jwt = ".".join([
+            "eyJhbGciOiJIUzI1NiJ9",
+            "eyJzdWIiOiIxMjM0NTY3ODkwIn0",
+            "sgntr",
+        ])
+        text = (
+            f"Authorization: Bearer {sample_jwt}; "
+            f"authorization=Bearer {sample_jwt}; "
+            f"token={sample_jwt}; api_key=sk-secret-token-1234567890"
+        )
+
+        redacted = stt_main._redact_sensitive_text(text)
+
+        self.assertNotIn("Bearer eyJ", redacted)
+        self.assertNotIn(sample_jwt, redacted)
+        self.assertNotIn("sk-secret-token", redacted)
+        self.assertGreaterEqual(redacted.count("[REDACTED]"), 4)
+
+    def test_transcription_final_failure_moves_audio_to_errors_and_redacts_secret(self) -> None:
+        source_path = self.watch_dir / "retry-fail.m4a"
+        source_path.write_bytes(b"fake-audio")
+        worker = _FailingWorker(self.tmp_dir, failures_before_success=None)
+        notifier = _RecordingNotifier()
+
+        with (
+            mock.patch.object(self.pipeline, "worker", worker),
+            mock.patch.object(self.pipeline, "notifier", notifier),
+        ):
+            self.pipeline.process_job(source_path)
+            self.assertEqual(worker.calls, 1)
+            first_row = self.pipeline.conn.execute(
+                "SELECT status, current_step FROM jobs ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            self.assertEqual(first_row["status"], stt_main.STATUS_PENDING)
+            self.assertEqual(first_row["current_step"], "전사 재시도 대기 1/2")
+
+            self.assertEqual(self.pipeline.process_retryable_jobs(), 1)
+            self.assertEqual(worker.calls, 2)
+            second_row = self.pipeline.conn.execute(
+                "SELECT status, current_step FROM jobs ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            self.assertEqual(second_row["status"], stt_main.STATUS_PENDING)
+            self.assertEqual(second_row["current_step"], "전사 재시도 대기 2/2")
+
+            with self.assertLogs(self.logger.name, level="ERROR") as captured:
+                self.assertEqual(self.pipeline.process_retryable_jobs(), 1)
+
+        self.assertEqual(worker.calls, 3)
+        row = self.pipeline.conn.execute(
+            "SELECT status, canonical_audio_path, transcript_txt_path, transcript_json_path, "
+            "error_message, error_trace, current_step, engine_params FROM jobs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["status"], stt_main.STATUS_ERROR)
+        self.assertEqual(row["current_step"], "실패: 전사 실행")
+        self.assertEqual(json.loads(row["engine_params"])["transcription_failures"], 3)
+        error_audio = self.error_dir / "retry-fail.m4a"
+        self.assertTrue(error_audio.exists())
+        self.assertFalse(source_path.exists())
+        self.assertFalse((self.audio_dir / "retry-fail.m4a").exists())
+        self.assertEqual(Path(row["canonical_audio_path"]), error_audio)
+        self.assertFalse(Path(row["transcript_txt_path"]).exists())
+        self.assertFalse(Path(row["transcript_json_path"]).exists())
+        self.assertEqual(len(notifier.errors), 1)
+
+        sensitive_surfaces = [
+            row["error_message"] or "",
+            row["error_trace"] or "",
+            json.dumps(notifier.errors[0], ensure_ascii=False),
+            "\n".join(captured.output),
+        ]
+        for surface in sensitive_surfaces:
+            self.assertNotIn("sk-", surface)
+            self.assertIn("[REDACTED]", surface)
 
     def test_main_acquires_single_instance_lock_in_state_dir(self) -> None:
         config_path = self.root / "config.yaml"

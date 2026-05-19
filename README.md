@@ -1,9 +1,12 @@
 # Lecture STT 운영 가이드
 
 ## 추가 문서
+- 현재 운영 runbook: `docs/OPERATIONS.md`
 - 구조 문서: `docs/ARCHITECTURE.md`
 - 누적 변경 기록: `docs/WORKLOG.md`
 - 저장소 작업 워크플로우: `AGENTS.md`
+
+주의: 이 README에는 legacy 경로 예시가 남아 있을 수 있습니다. 현재 운영 기준은 `/Users/geonha/DEV/lecture_stt`와 `docs/OPERATIONS.md`를 우선합니다.
 
 ## 1. 시스템 개요
 - 업로드된 음성 파일을 자동으로 텍스트로 변환합니다.

@@ -28,6 +28,18 @@ def state_dir() -> Path:
     return repo_root() / "state"
 
 
+def default_log_dir() -> Path:
+    return Path.home() / "Library" / "Logs" / "lecture_stt"
+
+
+def default_cache_dir() -> Path:
+    return Path.home() / "Library" / "Caches" / "lecture_stt"
+
+
+def default_tmp_dir() -> Path:
+    return default_cache_dir() / "tmp"
+
+
 def default_db_path() -> Path:
     return state_dir() / "jobs.sqlite3"
 

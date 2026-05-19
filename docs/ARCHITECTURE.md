@@ -38,7 +38,9 @@
 - 전사 결과는 `postprocess()`로 반복/노이즈/오인식 용어를 정리한다.
 - `quality_gate.evaluate()`가 반복도 기반 건강도를 계산해 메타데이터에 포함한다.
 - 최종 산출물은 `02_transcripts` 아래 `{base}.txt`, `{base}.json`으로 저장된다.
-- 실패 시 오디오는 `99_errors`로 이동하고 DB 상태는 `ERROR`로 기록된다.
+- STT 실행 실패는 기본 2회까지 retryable 상태(`전사 재시도 대기 n/2`)로 DB에 남기고, 다음 scan에서 즉시 재시도한다.
+- retry 한도 초과 후 terminal failure가 되면 오디오는 `99_errors`로 이동하고 DB 상태는 `ERROR`로 기록된다.
+- DB `engine_params`에는 `transcription_failures`, `transcription_max_retries`, `last_error_message`를 secret-redacted 형태로 남긴다.
 - 알림 계층은 `notification.provider` 설정과 `.env` secret을 기준으로 Telegram 또는 Discord provider를 선택한다.
 - `notification.dual_send_providers`를 사용하면 전환 기간 동안 다중 채널 shadow 전송을 할 수 있다.
 

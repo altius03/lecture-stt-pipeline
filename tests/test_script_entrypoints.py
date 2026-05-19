@@ -89,3 +89,29 @@ class ScriptEntrypointTests(unittest.TestCase):
             self.assertEqual(deleted, 1)
             self.assertTrue(staging_dir.exists())
             self.assertTrue((staging_dir / "claimed.m4a").exists())
+
+    def test_rotate_logs_script_is_dry_run_by_default(self) -> None:
+        module = _load_module("rotate_logs_script", REPO_ROOT / "scripts" / "rotate_logs.py")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "launchd.out.log"
+            log_path.write_text("x" * 128, encoding="utf-8")
+
+            code = module.main(["--path", str(log_path), "--max-bytes", "1", "--backup-count", "3"])
+
+            self.assertEqual(code, 0)
+            self.assertEqual(log_path.read_text(encoding="utf-8"), "x" * 128)
+            self.assertFalse((Path(temp_dir) / "launchd.out.log.1").exists())
+
+    def test_rotate_logs_script_apply_rotates_explicit_path(self) -> None:
+        module = _load_module("rotate_logs_script", REPO_ROOT / "scripts" / "rotate_logs.py")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "launchd.err.log"
+            log_path.write_text("x" * 128, encoding="utf-8")
+
+            code = module.main(
+                ["--path", str(log_path), "--max-bytes", "1", "--backup-count", "3", "--apply"]
+            )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(log_path.read_text(encoding="utf-8"), "")
+            self.assertEqual((Path(temp_dir) / "launchd.err.log.1").read_text(encoding="utf-8"), "x" * 128)

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import io
+import json
+import sqlite3
 import tempfile
 import unittest
 from contextlib import redirect_stdout, redirect_stderr
@@ -72,6 +74,11 @@ class DistributeStatusCliTests(unittest.TestCase):
             code = distribute_status.main(["--db-path", str(self.db_path), *args])
         return code, stdout.getvalue(), stderr.getvalue()
 
+    def _write_text(self, path: Path, content: str) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        return path
+
     def test_resolve_db_path_override_skips_worker_config_import(self) -> None:
         args = distribute_status.parse_args(["--db-path", str(self.db_path), "summary"])
         with mock.patch.object(
@@ -137,6 +144,178 @@ class DistributeStatusCliTests(unittest.TestCase):
 
         row = db.get_delivery(self.conn, "260316LC_1")
         self.assertIsNone(row)
+
+    def test_diagnose_json_classifies_current_hash_conflict_without_mutating(self) -> None:
+        source_txt = self._write_text(self.root / "03_correction" / "260316LC_9.txt", "source correction")
+        source_json = self._write_text(self.root / "03_correction" / "260316LC_9.json", '{"text":"source"}')
+        dest_txt = self._write_text(self.root / "GH" / "260316LC_9.txt", "destination correction")
+        dest_json = self._write_text(self.root / "GH" / "260316LC_9.json", '{"text":"destination"}')
+        db.upsert_delivery(
+            self.conn,
+            "260316LC_9",
+            subject_abbr="LC",
+            correction_status="CONFLICT",
+            summary_status="BLOCKED",
+            correction_txt_path=str(source_txt),
+            correction_json_path=str(source_json),
+            tuk_origin_txt_path=str(dest_txt),
+            tuk_origin_json_path=str(dest_json),
+            last_error_code="CONFLICT",
+        )
+        before_count = self.conn.execute("SELECT COUNT(*) FROM deliveries").fetchone()[0]
+
+        code, stdout, _ = self._run("diagnose", "--json", "--limit", "20")
+
+        after_count = self.conn.execute("SELECT COUNT(*) FROM deliveries").fetchone()[0]
+        self.assertEqual(code, 0)
+        self.assertEqual(after_count, before_count)
+        payload = json.loads(stdout)
+        row = next(item for item in payload["rows"] if item["logical_stem"] == "260316LC_9")
+        self.assertEqual(row["classification"], "hash-conflict")
+        self.assertIn("correction_txt", row["different_destinations"])
+        self.assertIn("manual", row["recommended_action"])
+
+    def test_diagnose_json_routes_invalid_and_unknown_subject_rows_to_manual_table(self) -> None:
+        db.upsert_delivery(
+            self.conn,
+            "260407_LA",
+            subject_abbr="UNKNOWN",
+            correction_status="ERROR",
+            summary_status="MISSING",
+            last_error_code="INVALID_STEM",
+        )
+        db.upsert_delivery(
+            self.conn,
+            "260323DS_1__20260412_020950__3b5301",
+            subject_abbr="DS",
+            correction_status="ERROR",
+            summary_status="MISSING",
+            last_error_code="UNKNOWN_SUBJECT",
+        )
+
+        code, stdout, _ = self._run("diagnose", "--json", "--limit", "20")
+
+        self.assertEqual(code, 0)
+        payload = json.loads(stdout)
+        invalid = next(item for item in payload["rows"] if item["logical_stem"] == "260407_LA")
+        unknown = next(
+            item for item in payload["rows"] if item["logical_stem"] == "260323DS_1__20260412_020950__3b5301"
+        )
+        self.assertEqual(invalid["classification"], "route/rename-needed")
+        self.assertEqual(unknown["classification"], "route/rename-needed")
+        self.assertEqual(unknown["proposed_stem"], "260323DS_1")
+        self.assertIn("manual table", unknown["recommended_action"])
+
+    def test_diagnose_json_protects_260422lc_source_missing_row(self) -> None:
+        db.upsert_delivery(
+            self.conn,
+            "260422LC",
+            subject_abbr="LC",
+            correction_status="CONFLICT",
+            summary_status="BLOCKED",
+            last_error_code="CONFLICT",
+        )
+
+        code, stdout, _ = self._run("diagnose", "--json", "--limit", "20")
+
+        self.assertEqual(code, 0)
+        payload = json.loads(stdout)
+        row = next(item for item in payload["rows"] if item["logical_stem"] == "260422LC")
+        self.assertEqual(row["classification"], "source-missing")
+        self.assertIn("document only", row["recommended_action"])
+
+    def test_diagnose_report_path_writes_machine_readable_report_without_mutating(self) -> None:
+        report_path = self.root / "state" / "reports" / "downstream-diagnose.json"
+        before_count = self.conn.execute("SELECT COUNT(*) FROM deliveries").fetchone()[0]
+
+        code, stdout, _ = self._run("diagnose", "--json", "--limit", "20", "--report-path", str(report_path))
+
+        after_count = self.conn.execute("SELECT COUNT(*) FROM deliveries").fetchone()[0]
+        self.assertEqual(code, 0)
+        self.assertEqual(after_count, before_count)
+        stdout_payload = json.loads(stdout)
+        file_payload = json.loads(report_path.read_text(encoding="utf-8"))
+        self.assertTrue(stdout_payload["dry_run"])
+        self.assertEqual(file_payload["row_count"], stdout_payload["row_count"])
+        self.assertIn("rows", file_payload)
+
+    def test_clear_stale_dry_run_keeps_row_and_reports_backup_plan(self) -> None:
+        db.upsert_delivery(
+            self.conn,
+            "260501LC",
+            subject_abbr="LC",
+            correction_status="CONFLICT",
+            summary_status="BLOCKED",
+            last_error_code="CONFLICT",
+        )
+        backup_path = self.root / "backups" / "jobs.before-clear.sqlite3"
+
+        code, stdout, _ = self._run("clear-stale", "260501LC", "--dry-run", "--backup-path", str(backup_path))
+
+        self.assertEqual(code, 0)
+        self.assertIn("Would clear stale delivery row: 260501LC", stdout)
+        self.assertIn("backup_path:", stdout)
+        self.assertFalse(backup_path.exists())
+        self.assertIsNotNone(db.get_delivery(self.conn, "260501LC"))
+
+    def test_clear_stale_requires_yes_and_backup_path(self) -> None:
+        db.upsert_delivery(
+            self.conn,
+            "260501LC",
+            subject_abbr="LC",
+            correction_status="CONFLICT",
+            summary_status="BLOCKED",
+            last_error_code="CONFLICT",
+        )
+
+        code, _, stderr = self._run("clear-stale", "260501LC", "--yes")
+
+        self.assertEqual(code, 2)
+        self.assertIn("--backup-path", stderr)
+        self.assertIsNotNone(db.get_delivery(self.conn, "260501LC"))
+
+    def test_clear_stale_with_yes_creates_backup_and_deletes_source_missing_row(self) -> None:
+        db.upsert_delivery(
+            self.conn,
+            "260501LC",
+            subject_abbr="LC",
+            correction_status="CONFLICT",
+            summary_status="BLOCKED",
+            last_error_code="CONFLICT",
+        )
+        backup_path = self.root / "backups" / "jobs.before-clear.sqlite3"
+
+        code, stdout, _ = self._run("clear-stale", "260501LC", "--yes", "--backup-path", str(backup_path))
+
+        self.assertEqual(code, 0)
+        self.assertIn("Cleared stale delivery row: 260501LC", stdout)
+        self.assertTrue(backup_path.is_file())
+        self.assertIsNone(db.get_delivery(self.conn, "260501LC"))
+        with sqlite3.connect(backup_path) as backup_conn:
+            row_count = backup_conn.execute(
+                "SELECT COUNT(*) FROM deliveries WHERE logical_stem = ?",
+                ("260501LC",),
+            ).fetchone()[0]
+        self.assertEqual(row_count, 1)
+
+    def test_clear_stale_refuses_260422lc_even_with_yes(self) -> None:
+        db.upsert_delivery(
+            self.conn,
+            "260422LC",
+            subject_abbr="LC",
+            correction_status="CONFLICT",
+            summary_status="BLOCKED",
+            last_error_code="CONFLICT",
+        )
+        backup_path = self.root / "backups" / "jobs.before-clear.sqlite3"
+
+        code, _, stderr = self._run("clear-stale", "260422LC", "--yes", "--backup-path", str(backup_path))
+
+        self.assertEqual(code, 2)
+        self.assertIn("260422LC", stderr)
+        self.assertIn("document-only", stderr)
+        self.assertFalse(backup_path.exists())
+        self.assertIsNotNone(db.get_delivery(self.conn, "260422LC"))
 
 
 if __name__ == "__main__":
