@@ -22,9 +22,9 @@
     <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
   </dict>
   <key>StandardOutPath</key>
-  <string>__REPO_ROOT__/state/logs/downstream.out.log</string>
+  <string>__HOME__/Library/Logs/lecture_stt/downstream.out.log</string>
   <key>StandardErrorPath</key>
-  <string>__REPO_ROOT__/state/logs/downstream.err.log</string>
+  <string>__HOME__/Library/Logs/lecture_stt/downstream.err.log</string>
   <key>ThrottleInterval</key>
   <integer>10</integer>
 </dict>

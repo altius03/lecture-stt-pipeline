@@ -5,6 +5,27 @@
 
 ## 2026-05-19
 
+### Runtime migration, VAD compatibility fix, launchd canary 완료
+- 승인된 runtime migration을 적용해 STT tmp는 `~/Library/Caches/lecture_stt/tmp`, STT/downstream/webpanel/cleanup launchd stdout/stderr와 app/downstream logs는 `~/Library/Logs/lecture_stt`로 이동했다. DB는 계속 repo 내부 `state/jobs.sqlite3`에 유지한다.
+- migration backup은 `state/backups/runtime-migration-20260519T114522Z`에 보존했다. post-migration log rotation은 dry-run만 수행했고 결과는 `state/reports/log-rotation-post-migration-dry-run-20260519T114610Z.txt`에 남겼다.
+- runtime package workstream 결과로 production `.venv`와 `requirements.txt`는 `faster-whisper==1.2.1`로 정렬됐다. 이는 package-only 변경이며 canonical STT model은 계속 `large-v3`다.
+- 1차 copied canary `260519OOP_1`은 launchd가 처리했지만 현재 `faster-whisper`의 `VadOptions` API가 `onset/offset` 대신 `threshold`를 받는 차이로 job `201`이 terminal `ERROR`가 됐다. 실패 row와 `99_errors/260519OOP_1.m4a`는 증거로 보존하고 정리하지 않았다.
+- 회귀 테스트를 먼저 추가한 뒤 `STTWorker` VAD parameter builder가 faster-whisper 1.1/1.2 계열 signature를 모두 지원하도록 수정했다.
+- 승인 후 `com.geonha.lecture-stt`만 kickstart 재시작했고, 2차 copied canary `260519OOP_2`는 job `202`로 `DONE` 처리됐다. 산출물은 `01_audio/260519OOP_2.m4a`, `02_transcripts/260519OOP_2.txt`, `02_transcripts/260519OOP_2.json`이며 preview는 `컴퓨터공학 전공 수업입니다.`다.
+- canary report는 `state/reports/canary-20260519T120017Z.json`에 저장했다. 처리 시간은 total `7.93s`, transcribe `7.87s`, 관찰 elapsed `110.1s`였다.
+- 최종 verification은 `state/reports/verification-unittest-20260519T121554Z.log` 기준 unittest 108개 통과, compileall 통과, `git diff --check` 통과, added-line static scan finding 0건이다. 2차 독립 review도 blocking issue 없이 통과했다.
+
+### 남은 고도화 사용자 결정 반영
+- 사용자가 지정한 `C/D/R/L/P/B/O` 결정값을 `.hermes/plans/2026-05-19_160615-lecture-stt-remaining-hardening.md`의 `User Decision Snapshot`에 반영했다.
+- 결정 경계는 read-only/dry-run 우선, canary 선행, downstream은 report/manual table만, runtime migration은 canary 이후, log cleanup은 dry-run/manifest만, benchmark 확대는 보류로 정리했다.
+- `P1=2`, `P2=2`, `P3=3`에 따라 `faster-whisper==1.2.1`은 production `.venv` upgrade 후보로 계획/rollback까지 검토하되, 실제 package 변경은 별도 승인 전 금지로 명시했다.
+- canonical STT model은 계속 `large-v3`로 유지하며, DB/file/config/launchd/package/model 변경, local commit, push/tag/release는 수행하지 않았다.
+
+### 남은 고도화 업무 결정 가이드 추가
+- 최초 고도화 계획에서 남은 canary, downstream 정리, runtime path migration, log cleanup, runtime package update, benchmark 확대, 문서/commit 정책 결정을 한 번에 검토할 수 있는 `docs/REMAINING_HARDENING_DECISION_GUIDE_2026-05-19.md`를 추가했다.
+- canary, launchd, downstream, canonical, hash-conflict, route/rename-needed, dry-run/apply, runtime path migration, copytruncate, `.venv`, benchmark 같은 운영 용어를 사용자 결정용으로 풀어 설명했다.
+- 이 문서는 의사결정 보조 자료이며, DB/file/config/launchd/package/git remote에 대한 실제 변경 승인은 포함하지 않는다.
+
 ### Pre-commit review blocker fixes
 - 독립 리뷰에서 지적된 3개 blocker를 TDD로 재현한 뒤 수정했다.
 - secret redaction은 `Authorization: Bearer ...`, `authorization=Bearer ...`, JWT-like token, `sk-...` 표면을 모두 `[REDACTED]` 처리하도록 보강했다.

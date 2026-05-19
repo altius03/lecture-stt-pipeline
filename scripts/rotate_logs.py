@@ -17,10 +17,11 @@ from lecture_stt.shared.log_retention import (  # noqa: E402
     prune_compressed_archives,
     rotate_plain_log_if_needed,
 )
+from lecture_stt.shared.paths import default_log_dir  # noqa: E402
 
 
 def _default_launchd_log_paths() -> list[Path]:
-    log_root = REPO_ROOT / "state" / "logs"
+    log_root = default_log_dir()
     return [
         log_root / "launchd.out.log",
         log_root / "launchd.err.log",
@@ -41,7 +42,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--path",
         action="append",
         default=[],
-        help="Plain log path to rotate. Repeatable. Defaults to known state/logs launchd stdout/stderr files.",
+        help="Plain log path to rotate. Repeatable. Defaults to ~/Library/Logs/lecture_stt launchd stdout/stderr files.",
     )
     parser.add_argument(
         "--archive-root",

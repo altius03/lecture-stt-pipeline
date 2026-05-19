@@ -24,7 +24,9 @@ from pathlib import Path
 src = Path(sys.argv[1])
 dst = Path(sys.argv[2])
 repo = sys.argv[3]
+home = str(Path.home())
 repo_placeholder = "__REPO_ROOT__"
+home_placeholder = "__HOME__"
 
 def rewrite(value):
     if isinstance(value, dict):
@@ -32,7 +34,7 @@ def rewrite(value):
     if isinstance(value, list):
         return [rewrite(item) for item in value]
     if isinstance(value, str):
-        return value.replace(repo_placeholder, repo)
+        return value.replace(repo_placeholder, repo).replace(home_placeholder, home)
     return value
 
 with src.open("rb") as handle:
@@ -124,8 +126,8 @@ done
 
 # ── 6. 로그 폴더 생성 ────────────────────────────────────────
 print_step "로그 폴더 확인"
-mkdir -p "$REPO/state/logs"
-print_ok "state/logs 준비 완료"
+mkdir -p "$HOME/Library/Logs/lecture_stt"
+print_ok "~/Library/Logs/lecture_stt 준비 완료"
 
 # ── 7. launchd 등록 ──────────────────────────────────────────
 print_step "launchd 서비스 등록"

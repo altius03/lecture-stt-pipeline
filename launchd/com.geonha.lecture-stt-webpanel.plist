@@ -26,9 +26,9 @@
     <string>8765</string>
   </dict>
   <key>StandardOutPath</key>
-  <string>__REPO_ROOT__/state/logs/webpanel.out.log</string>
+  <string>__HOME__/Library/Logs/lecture_stt/webpanel.out.log</string>
   <key>StandardErrorPath</key>
-  <string>__REPO_ROOT__/state/logs/webpanel.err.log</string>
+  <string>__HOME__/Library/Logs/lecture_stt/webpanel.err.log</string>
   <key>ThrottleInterval</key>
   <integer>10</integer>
 </dict>

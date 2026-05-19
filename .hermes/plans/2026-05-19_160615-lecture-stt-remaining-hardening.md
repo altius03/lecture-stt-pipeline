@@ -405,279 +405,163 @@ Commit style:
 
 ---
 
-# User Decision Snapshot
+# User Decision Snapshot — 2026-05-19 user reply
 
-## Resolved or defaulted decisions
+Source of truth for the current decision codes: `docs/REMAINING_HARDENING_DECISION_GUIDE_2026-05-19.md`.
+This section supersedes the older D/F/M-style decision snapshot that was produced before the remaining-hardening guide existed.
 
-D1 = B. Source `03_correction` is canonical for downstream conflicts. Destination replacement still requires backup/dry-run; no blind overwrite.
-
-D2 = recommended conservative default. For DB-only stale rows, first produce a dry-run table. Actual row clear is allowed only for rows that are proven DB-only/stale with no recoverable source action, after DB backup/snapshot and an explicit before/after row list. `260422LC` is excluded by D3 and should not be cleared automatically.
-
-D3 = Leave `260422LC` untouched and document only.
-
-D4 = Invalid stem files require per-file confirmation before rename.
-
-D5 = accepted default. Infer a proposed subject route from filename stem rules, but present ambiguous route/rename rows as a manual table before changing paths. Do not use existing destination folder as the sole source of truth when it conflicts with source naming.
-
-F1 = 2 retries.
-
-F2 = retry on the next scan immediately after currently running work finishes; no timed backoff for now.
-
-F3 = after terminal failure, move the original audio to `99_errors`.
-
-F4 = terminal failed jobs require manual reset before any further retry.
-
-L1 = retention uses both size and date.
-
-L2 = accepted defaults: app logs 10MB x 5, downstream JSONL 10MB x 5, launchd stdout/stderr 10MB x 3, compressed archive retention 30 days.
-
-L3 = routine scan stdout remains disabled by default.
-
-L4 = old log archive/cleanup must ask again at the time; no standing approval.
-
-R1 = move logs/tmp/cache outside repo; keep DB in repo.
-
-R2 = use macOS standard paths by default: logs under `~/Library/Logs/lecture_stt`, cache/tmp under `~/Library/Caches/lecture_stt`; DB remains in repo `state/` unless separately approved.
-
-R3 = legacy `/Users/geonha/lecture_stt` should be inspected again and decided later.
-
-R4 = keep empty repo runtime folders as placeholders.
-
-R5 = stale `tmp/*.wav` should be archived, then deleted.
-
-R6 = launchd restart during migration/canary requires showing the plan first.
-
-M1 = keep `large-v3`; skip model switching for now.
-
-M2 = no more isolated `faster-whisper==1.2.1` benchmark samples for now.
-
-M3 = no MLX/Apple Silicon spike now.
-
-M4 = production `.venv` package upgrade may proceed if checks show no separate issue, but only as a package/runtime update, not as a model switch, and with rollback verification.
-
-B1 = do not expand benchmarks now; revisit later.
-
-B2 = raw benchmark artifacts may remain locally under `state/benchmarks/`.
-
-B3 = docs should include metric summaries only, not raw transcript text.
-
-B4 = long sample `260415LA` only for final candidates.
-
-C1 = canary input should be the next real lecture only.
-
-C2 = accepted default. Use the launchd-running worker for the real canary; reserve `scripts/run_once.sh` for controlled debugging/preflight if launchd canary fails or if the worker must be paused.
-
-C3 = keep current notification config.
-
-C4 = keep downstream worker on during canary.
-
-C5 = accepted default. Define immediate canary pass as 1 real lecture job completed end-to-end without errors/log spam; define operational stability separately as 24h idle observation or next 2 real lectures.
-
-O1 = create `docs/OPERATIONS.md` as the main operator guide.
-
-O2 = keep existing handoff checklist as historical record; update `OPERATIONS`/`WORKLOG` as current truth.
-
-O3 = docs should include both concise command checklist and detailed runbook sections.
-
----
-
-# Decisions Needed From User Before Implementation
-
-## D. Downstream conflict/canonical decisions
-
-D1. For existing destination conflicts, which side is canonical by default?
-- A: destination/GH_archive wins; source in `03_correction` is stale
-- B: source in `03_correction` wins; destination should be replaced only after backup
-- C: no default; produce per-file table for manual decision
-
-D2. Are DB-only stale rows allowed to be cleared after dry-run confirmation?
-- yes / no / ask per row
-
-D3. For `260422LC`, preferred handling?
-- clear stale DB row if source is still missing
-- recreate source from destination if possible
-- leave untouched and document only
-
-D4. For invalid stem files, should we rename to standard stem format if mapping is obvious?
-- yes, after dry-run table
-- no, document only
-- ask per file
-
-D5. For subject route/rename issues, what is the authoritative subject mapping source?
-- filename stem rules
-- existing destination folder
-- manual table from user
-- other
-
-## F. Retry/failure policy decisions
-
-F1. Retry count: keep 2 retries?
-- yes / choose another number
-
-F2. Retry delay/backoff:
-- immediate next scan
-- fixed delay, e.g. 10 minutes
-- exponential backoff
-
-F3. Final failure handling for original audio:
-- move original to `99_errors`
-- keep original in `01_audio`, write diagnostic marker/copy to `99_errors`
-- copy original to `99_errors`, keep original in `01_audio`
-
-F4. Should terminal failed jobs require manual reset before retrying again?
-- yes / no
-
-## L. Log policy decisions
-
-L1. Retention policy:
-- size-based only
-- date-based only
-- both size and date
-
-L2. Recommended default acceptable?
-- app logs: 10MB x 5
-- downstream JSONL: 10MB x 5
-- launchd stdout/stderr: 10MB x 3
-- archive compressed logs for 30 days
-
-L3. Should verbose routine scan logs stay disabled by default?
-- yes / no
-
-L4. Is one-time cleanup/archive of current old logs allowed in the next session if dry-run looks safe?
-- yes / no / ask again then
-
-## R. Runtime structure decisions
-
-R1. Should runtime state remain inside repo for now, or move to macOS standard paths?
-- keep in repo for now
-- move logs only
-- move logs/tmp/cache, keep DB in repo
-- move all runtime state outside repo
-
-R2. If moving outside repo, preferred base paths?
-- `~/Library/Application Support/lecture_stt`
-- `~/Library/Logs/lecture_stt`
-- `~/Library/Caches/lecture_stt`
-- custom paths
-
-R3. What to do with legacy `/Users/geonha/lecture_stt`?
-- archive then delete
-- keep as-is
-- inspect again and ask later
-
-R4. What to do with empty repo folders `audio/`, `errors/`, `inbox/`, `transcripts/`, `models/`?
-- delete if unused
-- keep placeholders
-- document only
-
-R5. What to do with stale `tmp/*.wav`?
-- delete after dry-run
-- archive then delete
-- leave untouched
-
-R6. Is launchd restart allowed during runtime migration/canary?
-- yes, if plan shown first
-- only in a specified time window
-- no, manual instructions only
-
-## M/B. Model and benchmark decisions
-
-M1. Given current evidence, should `large-v3` remain fixed and skip more model work for now?
-- yes, skip model work
-- no, run more isolated benchmarks
-
-M2. Should `faster-whisper==1.2.1` get more isolated samples?
-- no
-- short+medium only
-- full representative set
-
-M3. Should MLX/Apple Silicon spike be included now?
-- no
-- yes, separate spike only
-
-M4. Production `.venv` upgrade remains forbidden until explicit later approval, correct?
-- yes / no
-
-B1. If expanding benchmark, which samples are approved?
-- use documented 8 candidates
-- only short+medium
-- user supplies list
-
-B2. Are raw transcript benchmark artifacts allowed to remain under local `state/benchmarks/`?
-- yes / no
-
-B3. Should benchmark docs include only metrics summaries, not raw text?
-- yes recommended / no
-
-B4. Is long sample `260415LA` allowed only for final candidates?
-- yes / no
-
-## C. Canary/live operation decisions
-
-C1. Canary input source:
-- next real lecture only
-- copied existing sample with test stem
-- no canary now
-
-C2. Use launchd-running worker or `run_once` for canary?
-- launchd
-- `scripts/run_once.sh`
-- both in sequence
-
-C3. Should notifications be enabled during canary?
-- current config
-- disable
-- Telegram only
-- Discord only
-
-C4. Should downstream worker stay on during canary?
-- yes
-- pause/disable while testing STT
-- only if manual correction output is present
-
-C5. How long should observation run before considering canary passed?
-- one completed job
-- 24 hours
-- next 2 real lectures
-
-## O. Documentation decisions
-
-O1. Create `docs/OPERATIONS.md` as the main operator guide?
-- yes / no, keep README only
-
-O2. Should historical handoff checklist be updated to reflect completed items, or left as historical record?
-- update it
-- leave it and point to OPERATIONS/WORKLOG
-
-O3. Preferred doc style:
-- concise command checklist
-- detailed runbook
-- both: quickstart plus detailed sections
-
----
-
-## Suggested User Reply Format for New Session
-
-Paste this at the start of the new session after decisions are made:
+User-provided decisions:
 
 ```text
-/Users/geonha/DEV/lecture_stt 고도화 남은 8개 작업을 진행한다.
-먼저 skill 로드, git status/diff 확인, 기존 변경 보존.
-계획 파일: .hermes/plans/2026-05-19_160615-lecture-stt-remaining-hardening.md
-
-결정사항:
-D1=..., D2=..., D3=..., D4=..., D5=...
-F1=..., F2=..., F3=..., F4=...
-L1=..., L2=..., L3=..., L4=...
-R1=..., R2=..., R3=..., R4=..., R5=..., R6=...
-M1=..., M2=..., M3=..., M4=...
-B1=..., B2=..., B3=..., B4=...
-C1=..., C2=..., C3=..., C4=..., C5=...
-O1=..., O2=..., O3=...
-
-제약:
-- 모델 교체 금지 unless explicitly approved
-- production .venv upgrade 금지 unless explicitly approved
-- destructive file/DB migration은 dry-run 보고 후 재승인
-- push/tag/release 금지 unless explicitly requested
+C1=1, C2=1, C3=1, C4=1, C5=1
+D1=1, D2=1, D3=1, D4=1, D5=3, D6=1, D7=1
+R1=3, R2=1, R3=1, R4=1, R5=1, R6=1, R7=2
+L1=1, L2=1, L3=3, L4=1
+P1=2, P2=2, P3=3, P4=1
+B1=1, B2=1, B3=1, B4=1
+O1=1, O2=1, O3=1
 ```
+
+## Approval boundary from this decision set
+
+Approved now:
+
+- Update this plan with the user decisions.
+- Run read-only checks and non-mutating dry-runs.
+- Generate downstream diagnostic/manual-table reports under gitignored `state/reports/` if needed for D7, as long as DB rows and source/destination files are not modified.
+- Write/update documentation summaries for already-run read-only/dry-run work.
+
+Not approved without a fresh explicit approval:
+
+- DB row delete/update/clear, including any `clear-stale --yes` operation.
+- Source/destination file delete/move/rename/overwrite.
+- Runtime path migration apply, operating `config/config.yaml` mutation, installed LaunchAgent mutation, or launchd restart.
+- Old log cleanup/archive apply, truncate, or rotation `--apply`.
+- Production `.venv` package install/upgrade/downgrade.
+- Model download, model switch, or candidate model execution beyond explicit benchmark approval.
+- Local commit; before committing, show diff summary and wait for approval.
+- Remote push, tag, or release.
+
+Canonical STT model remains `large-v3`.
+
+## Post-decision explicit approvals and execution status — 2026-05-19
+
+Later in the same operational session, the user explicitly approved the previously gated runtime migration, STT worker restart, and copied-sample canary. This section records that later approval without changing the original decision snapshot provenance.
+
+Completed under explicit approval:
+
+- Runtime migration applied: STT tmp now uses `~/Library/Caches/lecture_stt/tmp`; app/downstream/webpanel/cleanup logs and launchd stdout/stderr now use `~/Library/Logs/lecture_stt`; DB remains in repo `state/jobs.sqlite3`.
+- Runtime package workstream completed: production `.venv` and `requirements.txt` now align on `faster-whisper==1.2.1`; this did not change `transcribe.model_size`, and canonical STT model remains `large-v3`.
+- Package rollback, if later needed, is to restore `requirements.txt` to `faster-whisper==1.1.0`, reinstall that exact version in `.venv`, restart only affected launchd labels after approval, and rerun targeted tests plus the next canary.
+- Migration backup: `state/backups/runtime-migration-20260519T114522Z`.
+- Post-migration log rotation remained dry-run only: `state/reports/log-rotation-post-migration-dry-run-20260519T114610Z.txt`.
+- First launchd copied canary `260519OOP_1` reached job `201` but failed with `VadOptions.__init__() got an unexpected keyword argument 'onset'`; the failed DB row and `99_errors` artifact were preserved as evidence.
+- Root cause fix: `STTWorker` now builds `vad_parameters` according to the installed faster-whisper `VadOptions` signature, covering both 1.1-style `onset/offset` and 1.2-style `threshold` APIs. Canonical STT model still remains `large-v3`.
+- Second launchd copied canary `260519OOP_2` completed as job `202` with `DONE`, transcript txt/json present, report `state/reports/canary-20260519T120017Z.json`.
+
+Still not approved unless explicitly requested later:
+
+- Local commit, remote push, tag, release.
+- DB cleanup of failed canary job `201` or any existing downstream problem row.
+- Old log archive deletion/prune beyond dry-run.
+- Model switch away from `large-v3`.
+
+## C — Canary / live observation
+
+- C1=1: Canary input is the next real lecture only. Do not copy an old sample into the inbox as a test canary.
+- C2=1: One completed real lecture is the immediate pass criterion; 24h idle observation or the next 2 real lectures are a separate stability gate.
+- C3=1: Keep the downstream worker running during canary.
+- C4=1: Keep the current notification config during canary.
+- C5=1: Record canary results in `docs/WORKLOG.md`.
+
+Implication: wait for a real lecture input. `scripts/run_once.sh` remains debugging/preflight only; the actual canary pass is launchd-backed unless a later failure analysis requires otherwise.
+
+## D — Downstream problem rows
+
+- D1=1: Start now with read-only report/manual table only.
+- D2=1: Treat source `03_correction` as the default canonical side for hash conflicts.
+- D3=1: Later destination overwrite may be allowed only after dry-run table, destination backup, before/after hash check, and explicit approval.
+- D4=1: For route/rename-needed rows, create a manual table and ask the user to confirm.
+- D5=3: For invalid stem rows, the user decides file-by-file from the table.
+- D6=1: Leave `260422LC` in place and document only.
+- D7=1: Store downstream report artifacts under gitignored `state/reports/` as JSON/CSV when a file artifact is useful.
+
+Implication: downstream next step is `diagnose`/manual table generation only. No DB clear, no rename, no route config change, no destination overwrite.
+
+## R — Runtime path migration
+
+- R1=3: Do canary first, then runtime path migration.
+- R2=1: Actual order is canary first, migration second.
+- R3=1: Move logs/tmp/cache outside the repo eventually; keep DB in repo.
+- R4=1: launchd restart is allowed later only after exact plan/rollback is shown and approved label-by-label.
+- R5=1: Legacy `/Users/geonha/lecture_stt` gets read-only inspection first; decide later.
+- R6=1: Keep empty repo runtime folders as placeholders.
+- R7=2: For stale `tmp/*.wav`, create a read-only list only.
+
+Implication: do not apply migration in this batch. Read-only inventory and exact plan/rollback updates are okay.
+
+## L — Old logs archive/cleanup
+
+- L1=1: Generate dry-run/manifest only for old log cleanup.
+- L2=1: Keep compressed archive retention at 30 days.
+- L3=3: Do not apply plain launchd log rotation now.
+- L4=1: Summarize cleanup dry-run results in `docs/WORKLOG.md` if work is performed.
+
+Implication: `scripts/rotate_logs.py` may be run without `--apply`; do not truncate/archive/delete logs.
+
+## P — Runtime package update
+
+- P1=2: Address package update by writing an update plan/rollback, not by applying it now.
+- P2=2: The package-update scope may include `faster-whisper`, but model switch remains forbidden.
+- P3=3: Treat `faster-whisper==1.2.1` as a production `.venv` upgrade candidate to be evaluated in the plan.
+- P4=1: If an update is later approved, verification must include targeted tests, compileall, and the next real lecture canary.
+
+Implication: read live package state and draft rollback/verification steps only. Do not mutate `.venv`, `requirements.txt`, lockfiles, model cache, or production config without a new approval.
+
+## B — Benchmark expansion / model experiment
+
+- B1=1: Do not resume benchmark expansion now.
+- B2=1: If benchmarks are later approved, raw benchmark artifacts may stay local under `state/benchmarks/`.
+- B3=1: Docs should contain metric summaries only; no raw transcript text.
+- B4=1: Long sample `260415LA` runs only for final candidates.
+
+Implication: no new model benchmark, no model download, no candidate model run in this batch.
+
+## O — Documentation and work management
+
+- O1=1: Reflect decisions in this plan document.
+- O2=1: Manage remaining work as separate workstreams: canary, downstream, migration, package, logs/cleanup, benchmark/docs.
+- O3=1: Before local commit, show diff summary and ask for approval. Push only on explicit request.
+
+## Updated execution order
+
+1. Workstream 0: safety/read-only setup, git status/diff/check, relevant docs.
+2. Workstream O: record current decisions in this plan and `docs/WORKLOG.md`.
+3. Workstream D: run downstream read-only diagnose/manual-table work; save to `state/reports/` only if useful, and never mutate DB/files.
+4. Workstream L: run log cleanup/rotation dry-runs only; no `--apply`.
+5. Workstream P: inspect package state and write package update plan/rollback for possible `faster-whisper==1.2.1` production candidate; no `.venv` mutation.
+6. Workstream C: wait for next real lecture canary under launchd, current notification config, downstream on.
+7. Workstream R: after canary, revisit runtime migration plan/rollback and request explicit approval before any apply/restart.
+8. Workstream B: keep benchmark expansion paused unless a new explicit benchmark request appears.
+
+## Safe commands for the immediate read-only/dry-run batch
+
+These commands are safe in intent and should not perform destructive/system/external side effects:
+
+```bash
+cd /Users/geonha/DEV/lecture_stt
+
+git status --short --branch
+git diff --stat
+git diff --check
+
+sqlite3 state/jobs.sqlite3 'PRAGMA integrity_check;'
+sqlite3 state/jobs.sqlite3 'PRAGMA foreign_key_check;'
+
+PYTHONPATH=src .venv/bin/python -m lecture_stt.downstream.status diagnose --limit 60
+.venv/bin/python scripts/rotate_logs.py
+.venv/bin/python scripts/benchmark_models.py --config config/config.yaml --print-plan
+.venv/bin/python -m compileall -q scripts src tests
+```
+
+If a command wants to write an artifact, prefer `state/reports/` or `state/benchmarks/` only when the user decision explicitly allows that artifact type, and report the path in the final summary.
