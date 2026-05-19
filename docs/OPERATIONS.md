@@ -5,12 +5,16 @@
 ## 0. 현재 결론
 
 - 운영 repo: `/Users/geonha/DEV/lecture_stt`
-- 운영 모델: `large-v3` 유지
-- 현재 모델 교체 금지: `large-v3-turbo`, distil, Korean turbo 계열은 canonical STT 기본값으로 쓰지 않는다.
-- production `.venv` 업그레이드: 조건부 허용. 단, 모델 교체와 분리된 runtime package update로 다루고, 계획/rollback/검증 후 진행한다.
-- remote push, tag, release: 별도 명시 요청 없이는 하지 않는다.
-- destructive DB/file migration: dry-run 보고와 명시 승인 없이는 하지 않는다.
-- 기존 미커밋 변경: 항상 `git status`/`git diff`로 확인하고 보존한다.
+- 운영 branch: `main`
+- 운영 모델: `large-v3` 유지. 모델 교체 금지.
+- runtime package: production `.venv`와 `requirements.txt`는 `faster-whisper==1.2.1`로 정렬되어 있다. 이는 package-only 변경이며 canonical STT model 변경이 아니다.
+- runtime path migration: 적용 완료. STT tmp는 `~/Library/Caches/lecture_stt/tmp`, app/downstream/launchd logs는 `~/Library/Logs/lecture_stt`, DB는 repo `state/jobs.sqlite3`에 유지한다.
+- installed LaunchAgents stdout/stderr: `~/Library/Logs/lecture_stt/*.out.log`, `~/Library/Logs/lecture_stt/*.err.log` 기준으로 확인됐다.
+- downstream worker: 켜둔 상태 유지. 현재 downstream problem rows는 4건(`INVALID_STEM` 3, `CONFLICT` 1)이며, `260422LC`는 document-only 보존 대상이다.
+- runtime cleanup: dry-run/list만 완료. iCloud audio/transcript bulk cleanup, old archive prune, legacy root cleanup은 apply하지 않았다.
+- main branch push는 final hardening에서 완료됐지만, tag/release는 하지 않았다. 앞으로도 push/tag/release는 별도 명시 요청 없이는 하지 않는다.
+- destructive DB/file/config/launchd/package/model 작업은 plan/rollback 보고 후 명시 승인 없이 하지 않는다.
+- 기존 미커밋 변경은 항상 `git status`/`git diff`로 확인하고 보존한다.
 
 ## 1. 빠른 운영 체크리스트
 
@@ -97,6 +101,17 @@ launchctl kickstart -k "gui/$uid/com.geonha.lecture-stt-distribute"
 - `260422LC`는 현재 그대로 두고 문서화만 한다.
 - invalid stem rename은 파일별 확인 후 진행한다.
 
+현재 live 상태(2026-05-19 final hardening 이후):
+
+- delivery rows: total `152`, problem rows `4`
+- 남은 problem reason: `INVALID_STEM=3`, `CONFLICT=1`
+- invalid/manual review 대상:
+  - `선형대수학_시험출제포인트_전체정리`
+  - `BOSS_SPECIAL_LECTURE`
+  - `2603034LA_2`
+- preserved conflict/document-only 대상: `260422LC`
+- 이전 41건 triage 문구가 다른 문서에 남아 있으면 pre-execution 이력으로 보고, 현재 판단은 `downstream.status summary/diagnose` live 출력과 `docs/WORKLOG.md`를 우선한다.
+
 ### D5: subject route/rename 기준 설명
 
 `subject route/rename`은 파일을 어느 과목 폴더로 보낼지 결정하는 문제다. 예를 들어 stem이 `260504DS_1`이면 `DS`를 보고 데이터사이언스 폴더로 보낼지, 이미 destination에 있는 폴더 위치를 믿을지, 사용자가 별도로 매핑을 줄지 정해야 한다.
@@ -182,26 +197,30 @@ Launchd stdout/stderr rotation dry-run:
 
 ## 6. Runtime/state/tmp/cache 구조
 
-확정 방향:
+현재 적용 상태:
 
-- DB는 repo 내부 `state/jobs.sqlite3` 유지
-- logs/tmp/cache는 repo 밖 macOS 표준 경로로 이동하는 방향
-- 권장 target:
-  - STT app log: `~/Library/Logs/lecture_stt/app.log`
-  - downstream JSONL: `~/Library/Logs/lecture_stt/downstream.jsonl`
-  - launchd stdout/stderr: `~/Library/Logs/lecture_stt/*.out.log`, `*.err.log`로 전환하는 방향. 단, installed plist 교체/restart는 별도 승인 후 진행
-  - cache/tmp: `~/Library/Caches/lecture_stt/tmp`
-  - DB: `/Users/geonha/DEV/lecture_stt/state/jobs.sqlite3`
-- legacy `/Users/geonha/lecture_stt`는 다시 inspect 후 결정
-- repo 안 empty runtime folders는 placeholder로 유지
-- stale `tmp/*.wav`는 archive 후 삭제하되, cleanup 시점에 다시 확인
-- migration/canary 중 launchd restart는 계획 보고 후 허용
+- DB는 repo 내부 `/Users/geonha/DEV/lecture_stt/state/jobs.sqlite3` 유지.
+- STT tmp/cache는 `~/Library/Caches/lecture_stt/tmp` 사용.
+- app log는 `~/Library/Logs/lecture_stt/app.log` 사용.
+- downstream JSONL은 `~/Library/Logs/lecture_stt/downstream.jsonl` 사용.
+- installed LaunchAgents stdout/stderr는 `~/Library/Logs/lecture_stt/*.out.log`, `~/Library/Logs/lecture_stt/*.err.log` 기준으로 확인됐다.
+- legacy `/Users/geonha/lecture_stt`는 존재하지만 read-only inventory만 했고 cleanup/delete apply는 하지 않았다.
+- repo 안 empty runtime folders는 placeholder로 유지한다.
+- repo-local stale tmp/log/archive 후보와 iCloud audio/transcript cleanup 후보는 dry-run/list만 했고 apply하지 않았다.
 
-현재 문서화된 migration/rollback 계획:
+관련 이력/rollback 문서:
 
 - `docs/RUNTIME_MIGRATION_PLAN_2026-05-19.md`
+- migration backup: `state/backups/runtime-migration-20260519T114522Z`
+- runtime cleanup dry-run/list report: `state/reports/runtime-cleanup-20260519T123847Z`
 
-현재 코드/config default는 새 log/tmp 기본값을 사용할 수 있게 준비되어 있지만, 운영 `config/config.yaml`, installed LaunchAgents, 기존 repo log/tmp 파일은 별도 승인 없이 변경하지 않는다.
+추가 runtime cleanup 또는 rollback은 운영 파일 변경/launchd 영향이 있으므로 다음을 먼저 보고한 뒤 승인받는다.
+
+1. exact target list
+2. backup/snapshot 위치
+3. rollback command
+4. 예상 영향 범위
+5. 적용 후 verification gate
 
 ## 7. Model/package policy
 
@@ -211,21 +230,26 @@ Launchd stdout/stderr rotation dry-run:
 - `cpu / int8`
 - benchmark상 turbo 계열은 속도는 빠르지만 OOP/전공 용어 품질 regression과 누락/hallucination 문제가 있어 canonical 기본값으로 쓰지 않는다.
 
-Package update 정책:
+현재 runtime package 상태:
 
-- `faster-whisper==1.2.1` 추가 isolated benchmark는 지금은 하지 않는다.
-- production `.venv` 업그레이드는 가능하지만, 아래를 만족해야 한다.
-  1. model switch와 분리한다.
-  2. 현재 package/version 상태를 먼저 기록한다.
-  3. rollback 명령을 문서화한다.
-  4. targeted tests와 short canary를 통과한다.
-  5. 문제 생기면 즉시 이전 package set으로 되돌린다.
+- production `.venv`: `faster-whisper==1.2.1`
+- `requirements.txt`: `faster-whisper==1.2.1`
+- 이 변경은 명시 승인된 runtime package workstream에서 적용됐다.
+- package-only 변경이며 `transcribe.model_size`는 계속 `large-v3`다.
+- faster-whisper 1.2 계열의 VAD parameter signature 차이는 compatibility fix로 보정됐다.
+
+Package rollback 정책:
+
+- 다음 실제 강의 canary 또는 운영 관찰에서 1.2.1 regression이 확인되면 rollback 후보는 `faster-whisper==1.1.0`이다.
+- rollback도 production `.venv` 변경과 launchd restart가 필요할 수 있으므로, 실행 전 계획/rollback/검증 범위를 다시 보고하고 승인받는다.
+- rollback 후에는 targeted tests, compileall, DB integrity check, 다음 실제 강의 canary를 다시 본다.
 
 Benchmark artifact 정책:
 
 - raw benchmark artifact는 local `state/benchmarks/`에 둘 수 있다.
 - docs에는 metric summary만 남기고 raw transcript text는 넣지 않는다.
 - 긴 샘플 `260415LA`는 final candidate에만 실행한다.
+- B1=1에 따라 현재 benchmark expansion은 보류한다.
 
 ## 8. Canary/live observation
 
@@ -248,8 +272,8 @@ Benchmark artifact 정책:
    - `com.geonha.lecture-stt-distribute`가 running
    - cleanup/webpanel은 보조 서비스이며, cleanup이 실행 중이 아니어도 canary 자체의 blocker는 아님
 4. inbox가 비어 있거나, 다음 실제 강의 파일 1개만 들어오는 controlled 상태일 것.
-5. 기존 downstream problem rows는 canary blocker가 아니다. 단, known 41 problem rows는 별도 conflict/rename 작업으로 남겨두고, canary 중 destination overwrite/DB clear를 하지 않는다.
-6. runtime path migration은 canary와 분리한다. installed LaunchAgents나 운영 `config/config.yaml`가 아직 repo-local log/tmp path를 쓰고 있으면 그 상태를 기록하고, migration/restart 없이 현재 운영 기준으로 canary를 기다린다.
+5. 기존 downstream problem rows는 canary blocker가 아니다. 단, known 4 problem rows는 별도 manual/document-only 작업으로 남겨두고, canary 중 destination overwrite/DB clear를 하지 않는다.
+6. runtime path migration은 이미 적용 완료 상태다. canary 중에는 새 config 변경, cleanup apply, launchd restart를 하지 않고 현재 운영 기준으로 관찰한다.
 
 Canary 실행/판정은 자동으로 강의를 넣는 것이 아니라 다음 실제 강의 입력을 기다리는 방식이다.
 

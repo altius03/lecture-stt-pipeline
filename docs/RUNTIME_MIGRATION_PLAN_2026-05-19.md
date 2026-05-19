@@ -1,8 +1,8 @@
-# Runtime Path Migration Plan — 2026-05-19
+# Runtime Path Migration Plan and Status — 2026-05-19
 
 목적: repo 내부 runtime-like 경로를 macOS 표준 위치로 분리하되, 운영 DB와 사용자 산출물을 안전하게 보존한다.
 
-이 문서는 계획/rollback 문서다. 이 문서를 작성하는 것만으로 파일 이동, 삭제, DB migration, launchd restart를 승인한 것이 아니다.
+이 문서는 계획/rollback 및 실행 상태 문서다. 최초 작성만으로는 파일 이동, 삭제, DB migration, launchd restart를 승인한 것이 아니었고, 이후 명시 승인된 범위에서 runtime migration이 적용됐다. 새 cleanup apply, DB/file movement, launchd restart, rollback은 여전히 별도 계획/승인 대상이다.
 
 ## 1. 확정 정책
 
@@ -18,19 +18,26 @@
 - repo 내부 empty runtime folders는 placeholder로 유지한다.
 - stale `tmp/*.wav`는 archive 후 삭제하되, cleanup 시점에 다시 확인받는다.
 
-## 2. 현재 코드/config 상태
+## 2. 현재 적용 상태
 
-이미 안전하게 반영 가능한 path default만 코드/config에 반영한다.
+명시 승인 후 적용된 runtime migration 결과:
 
-- `lecture_stt.shared.paths.default_log_dir()` → `~/Library/Logs/lecture_stt`
-- `lecture_stt.shared.paths.default_cache_dir()` → `~/Library/Caches/lecture_stt`
-- `lecture_stt.shared.paths.default_tmp_dir()` → `~/Library/Caches/lecture_stt/tmp`
-- STT 기본 `logging.file` → `~/Library/Logs/lecture_stt/app.log`
-- STT 기본 `paths.tmp_dir` → `~/Library/Caches/lecture_stt/tmp`
-- downstream 기본 `log_jsonl_path` → `~/Library/Logs/lecture_stt/downstream.jsonl`
-- `config/config.example.yaml`도 위 기본값을 문서화한다.
+- STT tmp: `~/Library/Caches/lecture_stt/tmp`
+- STT app log: `~/Library/Logs/lecture_stt/app.log`
+- downstream JSONL: `~/Library/Logs/lecture_stt/downstream.jsonl`
+- installed LaunchAgents stdout/stderr: `~/Library/Logs/lecture_stt/*.out.log`, `~/Library/Logs/lecture_stt/*.err.log`
+- DB: `/Users/geonha/DEV/lecture_stt/state/jobs.sqlite3` 유지
+- migration backup: `state/backups/runtime-migration-20260519T114522Z`
+- post-migration log rotation: dry-run only, `state/reports/log-rotation-post-migration-dry-run-20260519T114610Z.txt`
 
-운영 `config/config.yaml`, installed LaunchAgents, 기존 log/tmp 파일은 이 문서만으로 변경하지 않는다.
+현재 cleanup 상태:
+
+- repo-local stale tmp/log/archive 후보는 dry-run/list만 수행했다.
+- iCloud `01_audio` / `02_transcripts` bulk cleanup 후보도 dry-run/list만 수행했다.
+- legacy `/Users/geonha/lecture_stt`는 read-only inventory만 수행했다.
+- broad deletion/prune/truncate/archive apply는 하지 않았다.
+
+현재 runtime path 상태를 다시 확인하려면 `config/config.yaml`, installed plist, `~/Library/Logs/lecture_stt`, `~/Library/Caches/lecture_stt/tmp`를 read-only로 대조한다.
 
 ## 3. 승인 전 허용되는 read-only/preflight
 
@@ -53,35 +60,35 @@ launchctl print "gui/$uid/com.geonha.lecture-stt-cleanup" 2>/dev/null | sed -n '
 launchctl print "gui/$uid/com.geonha.lecture-stt-webpanel" 2>/dev/null | sed -n '1,120p'
 ```
 
-## 4. 승인 후 migration 절차 초안
+## 4. 적용된 migration 절차와 재실행 원칙
 
-다음 절차는 아직 실행하지 않는다. 실행 전 dry-run 결과와 exact path list를 다시 보고하고 승인을 받는다.
+이미 적용된 범위:
 
 1. preflight 기록
    - git status/diff/check
    - DB integrity/foreign key check
    - launchd status
-   - inbox가 다음 실제 강의 canary를 방해하지 않는지 확인
 2. backup/snapshot
-   - `state/jobs.sqlite3`를 timestamped backup으로 copy
-   - 기존 repo log와 tmp stale wav 목록을 timestamped manifest로 저장
-3. target directory 생성
+   - migration backup: `state/backups/runtime-migration-20260519T114522Z`
+3. target directory 사용
    - `~/Library/Logs/lecture_stt`
    - `~/Library/Caches/lecture_stt/tmp`
 4. config/template update 적용
-   - 운영 `config/config.yaml`에서 tmp/log 경로를 macOS 표준 path로 변경
-   - launchd stdout/stderr template 또는 installed plist 교체가 필요한 경우 변경 내역을 별도 diff로 확인
-5. launchd 재시작
-   - 사용자에게 label별 restart plan을 다시 보여준 뒤 승인받는다.
-   - restart는 STT/downstream/webpanel/cleanup 영향이 있으므로 한 번에 하지 말고 label별로 상태를 확인한다.
+   - 운영 `config/config.yaml`의 tmp/log 경로는 macOS 표준 path 기준
+   - installed LaunchAgents stdout/stderr도 `~/Library/Logs/lecture_stt` 기준
+5. launchd 재시작/검증
+   - 승인된 범위에서 affected labels를 재시작하고 log path를 확인했다.
 6. verification
    - DB integrity/foreign key check
-   - unit tests + compileall + diff check
-   - launchd status/log path 확인
-   - 다음 실제 강의 canary 대기
-7. stale repo runtime 정리
-   - repo `tmp/*.wav` archive 후 삭제는 별도 승인 후 진행한다.
-   - old logs archive/cleanup도 별도 승인 후 진행한다.
+   - unittest/compileall/diff check
+   - copied canary와 VAD compatibility fix 후 `260519OOP_2` DONE 확인
+
+재실행 또는 추가 migration/rollback 원칙:
+
+- 같은 종류의 변경이라도 새 DB/file/config/launchd side effect가 있으면 현재 상태를 다시 read-only로 확인한다.
+- exact path list, backup/snapshot, rollback command, affected launchd labels를 먼저 보고한다.
+- 사용자의 명시 승인 전에는 cleanup apply, installed plist 변경, launchd restart, DB restore를 하지 않는다.
+- stale repo runtime 정리, old archive prune, iCloud audio/transcript cleanup은 migration과 분리된 별도 cleanup 작업으로 취급한다.
 
 ## 5. Rollback 절차 초안
 
@@ -104,17 +111,28 @@ launchctl print "gui/$uid/com.geonha.lecture-stt-webpanel" 2>/dev/null | sed -n 
 
 ## 6. 명시적으로 아직 하지 않는 것
 
-- 기존 repo `logs/`, `state/logs/`, `tmp/` 삭제 또는 archive/truncate
+- 기존 repo `logs/`, `state/logs/`, `tmp/` 삭제 또는 archive/truncate apply
+- iCloud `01_audio` / `02_transcripts` bulk cleanup apply
+- legacy `/Users/geonha/lecture_stt` 삭제 또는 archive apply
 - `state/jobs.sqlite3` 이동
 - source/destination 산출물 overwrite/delete
-- launchd restart
-- production `.venv` package upgrade
+- 추가 launchd restart 또는 installed plist 변경
+- production `.venv` package upgrade/downgrade/rollback
 - 모델 변경
 - remote push/tag/release
 
 ## 7. Acceptance criteria
 
-- path default tests가 macOS 표준 위치와 repo-local DB를 검증한다.
-- `config/config.example.yaml`이 같은 정책을 문서화한다.
-- 운영 runbook에서 migration/rollback 문서를 찾을 수 있다.
-- 실제 migration은 dry-run/plan/rollback 보고 후 별도 승인 없이는 실행하지 않는다.
+완료된 기준:
+
+- runtime log/tmp/cache 경로가 macOS 표준 위치로 적용됐다.
+- DB는 repo-local `state/jobs.sqlite3`에 유지된다.
+- installed LaunchAgents stdout/stderr가 `~/Library/Logs/lecture_stt` 기준으로 확인됐다.
+- migration backup과 post-migration dry-run report가 남아 있다.
+
+계속 유지할 기준:
+
+- cleanup apply는 dry-run/plan/rollback 보고 후 별도 승인 없이는 실행하지 않는다.
+- rollback도 DB/file/config/launchd side effect가 있으므로 별도 승인 없이는 실행하지 않는다.
+- canonical STT model은 `large-v3`로 유지한다.
+- 다음 실제 강의 canary 결과는 `docs/WORKLOG.md`에 기록한다.

@@ -41,25 +41,27 @@ transcribe:
 
 ## 2. 현재 설치 패키지와 최신성
 
-2026-05-19 live 조회 결과:
+2026-05-19 final hardening 이후 live 확인 결과:
 
-| package | installed | latest 확인 | 판단 |
+| package | production installed | requirements.txt | 판단 |
 |---|---:|---:|---|
-| `faster-whisper` | 1.1.0 | 1.2.1 | 업데이트 후보. 모델 교체와 별개로 package benchmark 필요 |
-| `ctranslate2` | 4.7.1 | 4.7.1 | 최신 |
-| `huggingface-hub` | 1.4.1 | 1.15.0 | dev/tooling 업데이트 후보. STT runtime 영향은 낮음 |
-| `openai-whisper` | not installed | 20250625 | 현재 runtime 아님. 비교 후보로만 검토 |
-| `transformers` | not installed | 5.8.1 | 현재 runtime 아님. raw OpenAI/Distil 후보 실험 시 필요 가능 |
+| `faster-whisper` | 1.2.1 | 1.2.1 | 운영 적용 완료. model switch가 아니라 package-only 변경 |
+| `ctranslate2` | 4.7.1 | transitive | 현재 운영에서 확인됨 |
+| `huggingface-hub` | 1.4.1 | transitive/tooling | 현재 운영에서 확인됨 |
+| `openai-whisper` | not installed | not listed | 현재 runtime 아님. 비교 후보로만 검토 |
+| `transformers` | not installed | not listed | 현재 runtime 아님. raw OpenAI/Distil 후보 실험 시 필요 가능 |
 
 주의:
 
-- 이번 작업은 정확도 우선이므로 package update 자체도 benchmark 통과 전 운영 반영 금지.
-- `ctranslate2`는 이미 최신이라 우선순위 낮음.
-- `faster-whisper` 1.1.0 → 1.2.1은 먼저 동일 모델 `large-v3`에서 regression 여부를 확인해야 한다.
+- canonical STT model은 계속 `large-v3`다.
+- `faster-whisper==1.2.1` 적용은 명시 승인된 runtime package workstream 결과이며, `transcribe.model_size` 변경이 아니다.
+- 1.2 계열 VAD option signature 차이는 compatibility fix로 보정됐다.
+- copied canary `260519OOP_2`는 package/VAD fix 이후 `DONE`을 확인했지만, 다음 실제 강의 canary gate는 별도로 남아 있다.
+- 향후 package upgrade/downgrade 또는 rollback은 model switch와 분리하고, 계획/rollback/검증 후 별도 승인으로 진행한다.
 
 ## 3. faster-whisper alias 확인
 
-현재 설치된 `faster-whisper==1.1.0` alias map 중 관련 항목:
+기존 확인된 faster-whisper alias map 중 관련 항목. 운영 package는 현재 `faster-whisper==1.2.1`이지만 canonical alias 정책은 계속 `large-v3` 기준이다:
 
 | alias | repo |
 |---|---|
@@ -112,8 +114,16 @@ transcribe:
 
 ### Stage A. 같은 모델, package update 영향 분리
 
-1. 현재 환경: `faster-whisper==1.1.0` + `large-v3`
+역사적 benchmark 기준:
+
+1. 당시 운영 환경: `faster-whisper==1.1.0` + `large-v3`
 2. 임시/분리 환경: `faster-whisper==1.2.1` + `large-v3`
+
+현재 운영 상태:
+
+- production `.venv`와 `requirements.txt`는 이후 명시 승인된 runtime package workstream에서 `faster-whisper==1.2.1`로 정렬됐다.
+- 이 변경은 model switch가 아니며, canonical model은 계속 `large-v3`다.
+- 향후 1.2.1 regression이 확인되면 rollback 후보는 `faster-whisper==1.1.0`이다.
 
 목적:
 
@@ -235,7 +245,7 @@ baseline 실제 측정 예시. 실행 전 후보 파일과 시간대를 다시 �
 
 `faster-whisper==1.2.1` isolated 결과는 `1.1.0 + large-v3` baseline보다 약 1.30배 빨랐다.
 하지만 text similarity가 약 0.649에 그쳤고, transcript 길이가 596자 줄었으며, 도입부가 `컴퓨터공학 전공 수업입니다.`처럼 initial prompt에 가까운 문장으로 시작하는 차이가 확인됐다.
-따라서 이는 “runtime package update 후보”로만 남기고 production `.venv`에는 반영하지 않는다.
+이 결과 때문에 당시에는 production 반영을 보류했지만, 이후 명시 승인된 runtime package workstream에서 production `.venv`와 `requirements.txt`를 `faster-whisper==1.2.1`로 정렬했다. 적용 후 1.2 계열 VAD signature 차이를 보정했고, copied canary `260519OOP_2`가 `DONE`이 된 것을 확인했다. 다만 canonical model은 계속 `large-v3`이며, 다음 실제 강의 canary gate는 별도로 남아 있다.
 
 ### Medium sample: `260504DS_1.m4a`
 
@@ -249,7 +259,8 @@ baseline 실제 측정 예시. 실행 전 후보 파일과 시간대를 다시 �
 - canonical STT 기본값은 `large-v3` 유지.
 - `large-v3-turbo`와 CT2 turbo 계열은 빠른 draft 모드 후보로만 보류하고 기본 모델로 교체하지 않는다.
 - `distil-large-v3`와 `ghost613` Korean turbo 후보는 현재 sample 기준 탈락.
-- `faster-whisper==1.2.1`은 모델 교체가 아니라 runtime package update로 별도 판단해야 하며, 추가 샘플에서 품질 regression이 없다는 증거가 쌓이기 전까지 production `.venv`를 업그레이드하지 않는다.
+- production `.venv`는 현재 `faster-whisper==1.2.1`로 정렬되어 있다. 이는 package-only 상태이며 model switch가 아니다.
+- 1.2.1에서 실제 강의 품질 regression이 확인되면 `faster-whisper==1.1.0` rollback을 검토한다. rollback도 package/config/launchd 영향이 있으므로 계획/승인/검증 후 진행한다.
 
 ## 9. 평가 기준
 
@@ -346,3 +357,11 @@ transcribe:
   device: cpu
   compute_type: int8
 ```
+
+Package rollback target:
+
+```text
+faster-whisper==1.1.0
+```
+
+Package rollback은 production `.venv` 변경, `requirements.txt` 변경, launchd restart가 필요할 수 있으므로 실행 전 별도 계획/rollback/검증 보고와 명시 승인을 받는다. 적용 후에는 targeted tests, compileall, DB integrity check, launchd 상태 확인, 다음 실제 강의 canary로 검증한다.

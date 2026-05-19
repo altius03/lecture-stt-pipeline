@@ -5,6 +5,13 @@
 
 ## 2026-05-19
 
+### Post-final docs 정합성 및 downstream manual table
+- Read-only baseline에서 `main`/`origin/main`이 `48be5a4`로 일치하고 worktree clean, DB `integrity_check=ok`, STT jobs `DONE=30`, `ERROR=1`임을 확인했다.
+- 현재 runtime 적용 상태에 맞춰 `docs/OPERATIONS.md`, `docs/MODELS.md`, `docs/RUNTIME_MIGRATION_PLAN_2026-05-19.md`의 stale pre-execution wording을 정리했다.
+- 현재 production `.venv`와 `requirements.txt`는 `faster-whisper==1.2.1`이며, canonical STT model은 계속 `large-v3`임을 문서에 재확인했다.
+- Downstream problem rows는 total `4`로, `INVALID_STEM` 3건과 document-only `260422LC` 1건만 남아 있다. 파일별 판단용 report는 `state/reports/downstream-manual-table-20260519T131110Z.json` 및 `.csv`에 생성했다.
+- Runtime cleanup은 계속 dry-run/list 상태만 유지한다. DB/file/config/launchd/package/model 변경, cleanup apply, push/tag/release는 수행하지 않았다.
+
 ### Final downstream cleanup, preserved failure evidence, runtime cleanup dry-run
 - Later explicit execution request에 따라 남은 downstream problem 16건 중 safe 자동 수리 가능한 항목을 백업 후 적용했다. Backup은 `state/backups/downstream-repair-20260519T123211Z`, manifest는 `state/reports/downstream-repair-apply-20260519T123211Z.json`이다.
 - Source canonical/rename-needed correction pair 9건은 canonical stem으로 rename했고 downstream worker가 처리해 9건 모두 `DELIVERED`가 됐다. DB-only stale rows `zztest`, `test123`, `tmp_260330DStr_2`는 backup 후 삭제했다.

@@ -6,30 +6,30 @@
 
 ## 0. 현재 상태 요약
 
-최근 live 확인 기준:
+Post-final live 확인 기준:
 
 - repo: `/Users/geonha/DEV/lecture_stt`
-- branch: `checkpoint/pre-web-panel-redesign`
-- HEAD: `06a78d2 fix: harden lecture stt retry and ops`
-- worktree: clean
-- GitHub Actions run list: `[]`
+- branch: `main`
+- remote main / HEAD at clean baseline: `48be5a4ddf5614ca5a37865c249b6d642dd0ca3f`
 - canonical STT model: `large-v3`
 - production model switch: 금지
+- production `.venv` / `requirements.txt`: `faster-whisper==1.2.1`
+- runtime migration: 적용 완료
+  - tmp: `~/Library/Caches/lecture_stt/tmp`
+  - logs: `~/Library/Logs/lecture_stt`
+  - DB: `/Users/geonha/DEV/lecture_stt/state/jobs.sqlite3` 유지
+  - installed LaunchAgents stdout/stderr도 `~/Library/Logs/lecture_stt` 기준
 - STT/downstream launchd worker: running
-- inbox: 비어 있음
+- inbox: 실제 강의 input 없음 (`.DS_Store`만 확인)
 - DB integrity: `ok`
 - STT job 상태:
-  - `DONE=29`
-  - `PROCESSING=0`
-  - `PENDING=0`
-  - retry 대기 row `0`
-  - `ERROR=0`
+  - `DONE=30`
+  - `ERROR=1` (`260519OOP_1` 실패 증거 보존)
 - downstream delivery row:
-  - total `164`
-  - problem rows `41`
-  - `hash-conflict=25`
-  - `route/rename-needed=15`
-  - `source-missing=1`, 이 1건은 `260422LC`이며 document-only 보호 대상
+  - total `152`
+  - problem rows `4`
+  - `INVALID_STEM=3`
+  - `CONFLICT=1` (`260422LC`, document-only 보호 대상)
 
 이미 완료된 큰 축:
 
@@ -37,11 +37,14 @@
 - secret redaction 보강
 - log retention/rotation 구현
 - downstream problem diagnosis/report/clear-stale tooling 보강
-- runtime path migration은 기본값/문서/rollback 계획만 준비
-- `docs/OPERATIONS.md` 운영 runbook 추가
-- 전체 unittest/compileall/diff-check 검증 완료
+- runtime path migration 적용
+- production package alignment to `faster-whisper==1.2.1`
+- VAD compatibility fix
+- copied canary `260519OOP_2` DONE
+- downstream safe repair 적용 후 problem rows 4건까지 축소
+- `docs/OPERATIONS.md` 운영 runbook 추가 및 post-final 정합성 업데이트
 
-지금 남은 핵심은 “운영에 실제로 손대는 작업을 어디까지 승인할지” 결정하는 것이다.
+지금 남은 핵심은 “다음 실제 강의 canary”, “downstream invalid stem 3건 파일별 결정”, “cleanup apply 여부”, “문서/commit 정리”다.
 
 ---
 
@@ -338,7 +341,7 @@ production `.venv` package update는 실제 운영 worker가 사용하는 Python
 
 - `large-v3` 유지
 - turbo/distil/Korean turbo 후보는 현재 품질 기준 탈락
-- `faster-whisper==1.2.1`은 isolated 결과에서 속도 이득은 있었지만 출력 shrink/누락 징후가 있어 production upgrade 보류
+- `faster-whisper==1.2.1`은 이후 명시 승인으로 production package alignment가 적용됐고, canonical model은 계속 `large-v3`
 
 ### artifact
 
@@ -463,17 +466,20 @@ O1=1, O2=1, O3=1
 
 ### 남은 일
 
-현재 problem rows는 41건이다.
+현재 problem rows는 4건이다.
 
-- hash-conflict: 25
-- route/rename-needed: 15
-- source-missing: 1 (`260422LC`, 보호 대상)
+- `INVALID_STEM`: 3건
+  - `선형대수학_시험출제포인트_전체정리`
+  - `BOSS_SPECIAL_LECTURE`
+  - `2603034LA_2`
+- `CONFLICT`: 1건
+  - `260422LC`, document-only 보호 대상
 
 가능한 작업 단계:
 
 1. read-only report/manual table 생성
-2. hash-conflict의 source/destination 비교
-3. route/rename-needed의 proposed stem/manual decision table 생성
+2. invalid stem 3건의 rename/exclude/document-only 여부 파일별 결정
+3. `260422LC`는 그대로 두고 문서화만 유지
 4. 승인 후에만 DB row clear, destination overwrite, rename, route change 진행
 
 ### 결정 질문
@@ -544,20 +550,18 @@ O1=1, O2=1, O3=1
 
 ### 남은 일
 
-현재 운영 config는 아직 repo-local runtime path를 사용한다.
+runtime path migration은 적용 완료됐다.
 
-- tmp: `/Users/geonha/DEV/lecture_stt/tmp`
-- app log: `/Users/geonha/DEV/lecture_stt/logs/app.log`
-- downstream JSONL: `/Users/geonha/DEV/lecture_stt/state/logs/downstream.jsonl`
-- launchd stdout/stderr: `/Users/geonha/DEV/lecture_stt/state/logs/*.log`
-
-목표 정책은 다음과 같다.
-
+- tmp/cache: `~/Library/Caches/lecture_stt/tmp`
+- app/downstream/launchd logs: `~/Library/Logs/lecture_stt`
 - DB: repo 내부 `state/jobs.sqlite3` 유지
-- logs: `~/Library/Logs/lecture_stt`
-- tmp/cache: `~/Library/Caches/lecture_stt`
+- installed LaunchAgents stdout/stderr: `~/Library/Logs/lecture_stt/*.out.log`, `*.err.log`
 
-실제 적용에는 config 변경, LaunchAgent 변경, launchd restart가 포함될 수 있다.
+현재 남은 runtime 작업은 migration 자체가 아니라 cleanup 검토다.
+
+- legacy `/Users/geonha/lecture_stt` read-only inventory 후 결정
+- repo-local stale tmp/log/archive 후보는 dry-run/list만 유지
+- iCloud `01_audio` / `02_transcripts` bulk cleanup 후보는 broad deletion이므로 별도 exact target list + backup/rollback + 승인 필요
 
 ### 결정 질문
 
@@ -676,16 +680,14 @@ old logs cleanup은 별도 작업이다.
 
 모델 교체는 하지 않는다. canonical STT는 `large-v3` 유지다.
 
-package update는 별도 작업으로만 진행해야 한다.
+package update workstream은 이미 명시 승인 후 적용되어 production `.venv`와 `requirements.txt`가 `faster-whisper==1.2.1`로 정렬됐다. 남은 package 관련 작업은 “추가 update”가 아니라 운영 관찰과 rollback 기준 유지다.
 
 필요 단계:
 
-1. 현재 package/version 상태 기록
-2. update candidate 선정
-3. rollback 명령 작성
-4. targeted tests
-5. short canary
-6. 문제 발생 시 rollback
+1. 다음 실제 강의 canary에서 1.2.1 + `large-v3` 품질/안정성 확인
+2. regression이 있으면 `faster-whisper==1.1.0` rollback 계획 수립
+3. rollback은 package/config/launchd 영향이 있으므로 별도 승인 후 진행
+4. targeted tests, compileall, DB integrity, launchd status, canary로 검증
 
 ### 결정 질문
 
@@ -735,7 +737,7 @@ package update는 별도 작업으로만 진행해야 한다.
 
 - `large-v3` 유지
 - turbo/distil/Korean turbo 후보는 품질 기준 탈락
-- `faster-whisper==1.2.1` production upgrade 보류
+- `faster-whisper==1.2.1` production package alignment 적용 완료, 다음 실제 강의 canary 대기
 - 긴 샘플 `260415LA`는 final candidate에만 실행
 
 ### 결정 질문
