@@ -87,6 +87,9 @@
 - summary는 GH archive의 `01_summarize`와 Obsidian 노트 경로 둘 다로 배포된다.
 - summary는 correction 전달 완료가 확인된 경우에만 배포된다.
 - 동일 내용은 hash 비교로 idempotent하게 처리하고, 다른 내용이 있으면 overwrite하지 않고 conflict로 남긴다.
+- 반복되는 invalid/incomplete/blocked/conflict/error 이벤트는 같은 worker 프로세스 안에서 bounded suppression cache의 동일 key 기준 1회만 stdout/JSONL에 남겨 로그 폭주를 줄인다.
+- scan 통계 로그는 최초, 통계 변화, 설정된 heartbeat 주기 때만 출력한다.
+- `downstream.log_jsonl_max_bytes`를 0보다 크게 설정하면 `state/logs/downstream.jsonl`에 size guard/rotation을 적용한다. `downstream.log_suppression_max_keys`는 장기 실행 중 suppression cache 상한을 정한다. `downstream.log_routine_scan_events: false`이면 routine `scan_started`/`scan_completed`는 JSONL에만 남기고 stdout에는 내보내지 않는다. 기존 `downstream.out.log` truncate/delete나 launchd 재시작은 운영 승인 후 별도 절차로 처리한다.
 
 ## Downstream 상태 저장
 - downstream 상태는 `deliveries` 테이블에 기록된다.
@@ -99,6 +102,7 @@
 - `scripts/run_gui.sh`: 웹 제어판 실행
 - `scripts/run_distribute.sh`: downstream 워커 실행
 - `scripts/distribute_status.sh`: deliveries 상태 CLI 래퍼
+- `scripts/benchmark_models.py`: baseline/current model과 승인된 후보 STT 모델을 비교하는 benchmark CLI 초안
 - `scripts/setup_launchd.sh`: venv, 의존성, 모델, 폴더, launchd를 한 번에 설정
 - `scripts/cleanup.py`: 오래된 audio/transcript/tmp 정리
 - `launchd/com.geonha.lecture-stt.plist`: 메인 워커 상시 실행
@@ -115,7 +119,9 @@
 
 ## 테스트 범위
 - 현재 자동 테스트는 downstream 계층에 집중되어 있다.
-- `tests/test_distribute_lib.py`: pair 처리, block/unblock, idempotency, conflict, cleanup failure
+- `tests/test_distribute_lib.py`: pair 처리, block/unblock, idempotency, conflict, cleanup failure, 반복 문제 로그 suppression, JSONL rotation
+- `tests/test_downstream_worker.py`: scan stats heartbeat/suppression 회귀 테스트
+- `tests/test_benchmark_models.py`: benchmark plan safety와 segment quality metric 회귀 테스트
 - `tests/test_distribute_status.py`: deliveries CLI 출력과 삭제 동작
 - `tests/test_stt_main.py`: pause/resume/status control command 회귀 테스트
 - `tests/test_web_panel.py`: 웹 제어판 종료 동작 회귀 테스트

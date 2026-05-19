@@ -8,6 +8,7 @@ import shutil
 import sqlite3
 import time
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, Optional
@@ -57,6 +58,11 @@ class DownstreamConfig:
     scan_interval_sec: int
     stable_for_sec: int
     subjects: Dict[str, SubjectRoute]
+    log_jsonl_max_bytes: int = 0
+    log_jsonl_backup_count: int = 3
+    stats_heartbeat_scans: int = 120
+    log_suppression_max_keys: int = 4096
+    log_routine_scan_events: bool = False
 
 
 @dataclass(frozen=True)
@@ -119,18 +125,63 @@ class FileConflictError(RuntimeError):
 
 
 class JsonlLogger:
-    def __init__(self, path: Path, enabled: bool):
+    def __init__(self, path: Path, enabled: bool, *, max_bytes: int = 0, backup_count: int = 3):
         self.path = Path(path)
         self.enabled = enabled
+        self.max_bytes = max(0, int(max_bytes))
+        self.backup_count = max(0, int(backup_count))
 
     def write(self, **payload: object) -> None:
         if not self.enabled:
             return
         utils.ensure_dir(self.path.parent)
         record = {"ts": utils.now_iso(), **payload}
+        line = json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
+        self._rotate_if_needed(len(line.encode("utf-8")))
         with self.path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True))
-            handle.write("\n")
+            handle.write(line)
+
+    def _rotate_if_needed(self, next_bytes: int) -> None:
+        if self.max_bytes <= 0 or not self.path.exists():
+            return
+        try:
+            current_size = self.path.stat().st_size
+        except OSError:
+            return
+        if current_size + max(next_bytes, 0) <= self.max_bytes:
+            return
+        self._rotate()
+
+    def _rotate(self) -> None:
+        if self.backup_count <= 0:
+            timestamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+            rotated = self.path.with_name(f"{self.path.name}.{timestamp}.{uuid.uuid4().hex[:8]}")
+            try:
+                self.path.rename(rotated)
+            except OSError:
+                logger.warning("Failed to rotate downstream jsonl log %s", self.path, exc_info=True)
+            return
+
+        for index in range(self.backup_count - 1, 0, -1):
+            src = self.path.with_name(f"{self.path.name}.{index}")
+            dst = self.path.with_name(f"{self.path.name}.{index + 1}")
+            if not src.exists():
+                continue
+            try:
+                if dst.exists():
+                    dst.unlink()
+                src.rename(dst)
+            except OSError:
+                logger.warning("Failed to rotate downstream jsonl backup %s", src, exc_info=True)
+                return
+
+        first_backup = self.path.with_name(f"{self.path.name}.1")
+        try:
+            if first_backup.exists():
+                first_backup.unlink()
+            self.path.rename(first_backup)
+        except OSError:
+            logger.warning("Failed to rotate downstream jsonl log %s", self.path, exc_info=True)
 
 
 def default_subject_routes() -> Dict[str, SubjectRoute]:
@@ -202,6 +253,8 @@ class DownstreamDistributor:
         self.dry_run = dry_run
         self._owns_connection = conn is None
         self._correction_ready_stems: set[str] = set()
+        self._log_suppression_max_keys = max(1, int(self.config.log_suppression_max_keys))
+        self._logged_repeating_problem_events: OrderedDict[tuple[str, str, str, str, str], None] = OrderedDict()
 
         if conn is not None:
             self.conn = conn
@@ -216,7 +269,12 @@ class DownstreamDistributor:
         else:
             self.conn = db.init_db(str(self.config.db_path))
 
-        self.jsonl = JsonlLogger(self.config.log_jsonl_path, enabled=not self.dry_run)
+        self.jsonl = JsonlLogger(
+            self.config.log_jsonl_path,
+            enabled=not self.dry_run,
+            max_bytes=self.config.log_jsonl_max_bytes,
+            backup_count=self.config.log_jsonl_backup_count,
+        )
 
     def close(self) -> None:
         if self._owns_connection:
@@ -249,10 +307,11 @@ class DownstreamDistributor:
             except Exception as exc:
                 stats["errors"] += 1
                 logger.exception("Unexpected correction error for %s", logical_stem)
-                self._log_event(
+                self._log_repeating_problem_once(
                     "correction_unexpected_error",
                     logical_stem=logical_stem,
-                    error=str(exc),
+                    error_code="UNEXPECTED_EXCEPTION",
+                    error_message=str(exc),
                 )
                 continue
             stats[result] += 1
@@ -263,10 +322,11 @@ class DownstreamDistributor:
             except Exception as exc:
                 stats["errors"] += 1
                 logger.exception("Unexpected summary error for %s", logical_stem)
-                self._log_event(
+                self._log_repeating_problem_once(
                     "summary_unexpected_error",
                     logical_stem=logical_stem,
-                    error=str(exc),
+                    error_code="UNEXPECTED_EXCEPTION",
+                    error_message=str(exc),
                 )
                 continue
             stats[result] += 1
@@ -376,7 +436,7 @@ class DownstreamDistributor:
                 last_error_code=unit.error_code,
                 last_error=unit.error_message,
             )
-            self._log_event(
+            self._log_repeating_problem_once(
                 "correction_invalid",
                 logical_stem=unit.logical_stem,
                 error_code=unit.error_code,
@@ -394,9 +454,11 @@ class DownstreamDistributor:
                 last_error_code="INCOMPLETE_CORRECTION_PAIR",
                 last_error="Correction pair requires both .txt and .json files",
             )
-            self._log_event(
+            self._log_repeating_problem_once(
                 "correction_incomplete",
                 logical_stem=unit.logical_stem,
+                error_code="INCOMPLETE_CORRECTION_PAIR",
+                error_message="Correction pair requires both .txt and .json files",
                 txt_present=bool(unit.txt_path),
                 json_present=bool(unit.json_path),
             )
@@ -434,9 +496,12 @@ class DownstreamDistributor:
                     last_error_code="ROLLBACK_FAILED",
                     last_error=f"{exc}; rollback failed: {rollback_error}",
                 )
-                self._log_event(
+                self._log_repeating_problem_once(
                     "correction_rollback_failed",
                     logical_stem=unit.logical_stem,
+                    error_code="ROLLBACK_FAILED",
+                    error_message=f"{exc}; rollback failed: {rollback_error}",
+                    reason=str(exc.dst),
                     conflict_destination=str(exc.dst),
                     rollback_error=str(rollback_error),
                 )
@@ -455,9 +520,12 @@ class DownstreamDistributor:
                 last_error_code="CONFLICT",
                 last_error=str(exc),
             )
-            self._log_event(
+            self._log_repeating_problem_once(
                 "correction_conflict",
                 logical_stem=unit.logical_stem,
+                error_code="CONFLICT",
+                error_message=str(exc),
+                reason=str(exc.dst),
                 destination=str(exc.dst),
             )
             return "conflicts"
@@ -479,10 +547,11 @@ class DownstreamDistributor:
                 last_error_code="UNEXPECTED_ERROR",
                 last_error=str(exc),
             )
-            self._log_event(
+            self._log_repeating_problem_once(
                 "correction_error",
                 logical_stem=unit.logical_stem,
-                error=str(exc),
+                error_code="UNEXPECTED_ERROR",
+                error_message=str(exc),
             )
             return "errors"
 
@@ -510,10 +579,11 @@ class DownstreamDistributor:
                     last_error_code="SOURCE_CLEANUP_FAILED",
                     last_error=str(exc),
                 )
-                self._log_event(
+                self._log_repeating_problem_once(
                     "correction_cleanup_failed",
                     logical_stem=unit.logical_stem,
-                    error=str(exc),
+                    error_code="SOURCE_CLEANUP_FAILED",
+                    error_message=str(exc),
                 )
                 return "errors"
 
@@ -554,7 +624,7 @@ class DownstreamDistributor:
                 last_error_code=unit.error_code,
                 last_error=unit.error_message,
             )
-            self._log_event(
+            self._log_repeating_problem_once(
                 "summary_invalid",
                 logical_stem=unit.logical_stem,
                 error_code=unit.error_code,
@@ -591,9 +661,11 @@ class DownstreamDistributor:
                 last_error_code=last_error_code,
                 last_error=last_error,
             )
-            self._log_event(
+            self._log_repeating_problem_once(
                 "summary_blocked",
                 logical_stem=unit.logical_stem,
+                error_code=last_error_code,
+                error_message=last_error,
                 reason="correction_not_ready",
             )
             return "blocked"
@@ -624,9 +696,12 @@ class DownstreamDistributor:
                 last_error_code="CONFLICT",
                 last_error=str(exc),
             )
-            self._log_event(
+            self._log_repeating_problem_once(
                 "summary_conflict",
                 logical_stem=unit.logical_stem,
+                error_code="CONFLICT",
+                error_message=str(exc),
+                reason=str(exc.dst),
                 destination=str(exc.dst),
             )
             return "conflicts"
@@ -644,10 +719,11 @@ class DownstreamDistributor:
                 last_error_code="UNEXPECTED_ERROR",
                 last_error=str(exc),
             )
-            self._log_event(
+            self._log_repeating_problem_once(
                 "summary_error",
                 logical_stem=unit.logical_stem,
-                error=str(exc),
+                error_code="UNEXPECTED_ERROR",
+                error_message=str(exc),
             )
             return "errors"
 
@@ -675,10 +751,11 @@ class DownstreamDistributor:
                     last_error_code="SOURCE_CLEANUP_FAILED",
                     last_error=str(exc),
                 )
-                self._log_event(
+                self._log_repeating_problem_once(
                     "summary_cleanup_failed",
                     logical_stem=unit.logical_stem,
-                    error=str(exc),
+                    error_code="SOURCE_CLEANUP_FAILED",
+                    error_message=str(exc),
                 )
                 return "errors"
         self._save_delivery(
@@ -801,5 +878,19 @@ class DownstreamDistributor:
         return rollback_error
 
     def _log_event(self, event: str, **payload: object) -> None:
-        logger.info("%s %s", event, payload)
+        if self.config.log_routine_scan_events or event not in {"scan_started", "scan_completed"}:
+            logger.info("%s %s", event, payload)
         self.jsonl.write(event=event, **payload)
+
+    def _log_repeating_problem_once(self, event: str, **payload: object) -> None:
+        logical_stem = str(payload.get("logical_stem") or "")
+        error_code = str(payload.get("error_code") or "")
+        error_message = str(payload.get("error_message") or "")
+        reason = str(payload.get("reason") or "")
+        key = (event, logical_stem, error_code, error_message, reason)
+        if key in self._logged_repeating_problem_events:
+            return
+        self._logged_repeating_problem_events[key] = None
+        while len(self._logged_repeating_problem_events) > self._log_suppression_max_keys:
+            self._logged_repeating_problem_events.popitem(last=False)
+        self._log_event(event, **payload)

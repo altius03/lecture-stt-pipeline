@@ -66,6 +66,18 @@ def fetch_status_counts(conn: sqlite3.Connection, column: str) -> list[tuple[str
     return [(str(row[0]), int(row[1])) for row in rows]
 
 
+def fetch_problem_reason_counts(conn: sqlite3.Connection) -> list[tuple[str, int]]:
+    rows = conn.execute(
+        "SELECT last_error_code, COUNT(*) AS cnt FROM deliveries WHERE "
+        "(correction_status IN ('INCOMPLETE', 'CONFLICT', 'ERROR') "
+        "OR summary_status IN ('BLOCKED', 'CONFLICT', 'ERROR') "
+        "OR last_error_code IS NOT NULL) "
+        "AND last_error_code IS NOT NULL "
+        "GROUP BY last_error_code ORDER BY cnt DESC, last_error_code ASC"
+    ).fetchall()
+    return [(str(row[0]), int(row[1])) for row in rows]
+
+
 def fetch_deliveries(
     conn: sqlite3.Connection,
     *,
@@ -139,6 +151,13 @@ def print_summary(conn: sqlite3.Connection, *, limit: int) -> int:
     print("Summary status counts")
     for status, count in fetch_status_counts(conn, "summary_status"):
         print(f"- {status}: {count}")
+
+    reason_counts = fetch_problem_reason_counts(conn)
+    if reason_counts:
+        print("")
+        print("Problem reason counts")
+        for reason, count in reason_counts:
+            print(f"- {reason}: {count}")
 
     rows = fetch_deliveries(conn, limit=limit, only_problems=True)
     if rows:

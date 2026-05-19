@@ -293,11 +293,11 @@ class SttPipelineBehaviorTests(unittest.TestCase):
     def test_main_acquires_single_instance_lock_in_state_dir(self) -> None:
         config_path = self.root / "config.yaml"
         config_path.write_text("{}", encoding="utf-8")
-        lock_paths: list[Path] = []
+        lock_args: list[tuple[Path, bool]] = []
 
         class _LockRecorder:
-            def __init__(self, path: Path):
-                lock_paths.append(path)
+            def __init__(self, path: Path, *, blocking: bool = False):
+                lock_args.append((path, blocking))
 
             def __enter__(self):
                 return self
@@ -312,6 +312,7 @@ class SttPipelineBehaviorTests(unittest.TestCase):
         pipeline_mock = mock.Mock()
         with (
             mock.patch.object(sys, "argv", ["lecture-stt", "--config", str(config_path)]),
+            mock.patch.dict(os.environ, {"LECTURE_STT_LOCK_WAIT": ""}, clear=False),
             mock.patch.object(stt_main, "load_config", return_value={}),
             mock.patch.object(stt_main, "validate_config", return_value=fake_config),
             mock.patch.object(stt_main, "setup_logging", return_value=self.logger),
@@ -320,5 +321,39 @@ class SttPipelineBehaviorTests(unittest.TestCase):
         ):
             stt_main.main()
 
-        self.assertEqual(lock_paths, [self.db_path.parent / "stt.lock"])
+        self.assertEqual(lock_args, [(self.db_path.parent / "stt.lock", False)])
+        pipeline_mock.run.assert_called_once_with(run_once=False)
+
+    def test_main_waits_for_single_instance_lock_when_env_enabled(self) -> None:
+        config_path = self.root / "config.yaml"
+        config_path.write_text("{}", encoding="utf-8")
+        lock_args: list[tuple[Path, bool]] = []
+
+        class _LockRecorder:
+            def __init__(self, path: Path, *, blocking: bool = False):
+                lock_args.append((path, blocking))
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return None
+
+        fake_config = {
+            "paths": {"db_path": str(self.db_path)},
+            "logging": {"file": str(self.root / "app.log"), "max_bytes": 1024, "backup_count": 1},
+        }
+        pipeline_mock = mock.Mock()
+        with (
+            mock.patch.object(sys, "argv", ["lecture-stt", "--config", str(config_path)]),
+            mock.patch.dict(os.environ, {"LECTURE_STT_LOCK_WAIT": "1"}, clear=False),
+            mock.patch.object(stt_main, "load_config", return_value={}),
+            mock.patch.object(stt_main, "validate_config", return_value=fake_config),
+            mock.patch.object(stt_main, "setup_logging", return_value=self.logger),
+            mock.patch.object(stt_main, "SingleInstanceLock", _LockRecorder),
+            mock.patch.object(stt_main, "STTPipeline", return_value=pipeline_mock),
+        ):
+            stt_main.main()
+
+        self.assertEqual(lock_args, [(self.db_path.parent / "stt.lock", True)])
         pipeline_mock.run.assert_called_once_with(run_once=False)

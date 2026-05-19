@@ -65,6 +65,18 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
     return merged
 
 
+def _parse_bool(value: Any, *, name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off"}:
+            return False
+    raise ValueError(f"downstream.{name} must be a boolean")
+
+
 def _default_config() -> dict[str, Any]:
     default_subjects = default_subject_routes()
     state_root = state_dir()
@@ -76,6 +88,11 @@ def _default_config() -> dict[str, Any]:
             "scan_interval_sec": 30,
             "stable_for_sec": 60,
             "log_jsonl_path": str(state_root / "logs" / "downstream.jsonl"),
+            "log_jsonl_max_bytes": 0,
+            "log_jsonl_backup_count": 3,
+            "stats_heartbeat_scans": 120,
+            "log_suppression_max_keys": 4096,
+            "log_routine_scan_events": False,
             "lock_path": str(state_root / "downstream.lock"),
             "subjects": {
                 abbr: {
@@ -128,12 +145,37 @@ def load_worker_config(config_path: str = "config/config.yaml") -> DownstreamCon
     log_jsonl_path = resolve_config_path(str(downstream_cfg["log_jsonl_path"]), env=env)
     lock_path = resolve_config_path(str(downstream_cfg["lock_path"]), env=env)
 
-    scan_interval_sec = int(downstream_cfg["scan_interval_sec"])
-    stable_for_sec = int(downstream_cfg["stable_for_sec"])
+    def parse_int(name: str) -> int:
+        try:
+            return int(downstream_cfg[name])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"downstream.{name} must be an integer") from exc
+
+    scan_interval_sec = parse_int("scan_interval_sec")
+    stable_for_sec = parse_int("stable_for_sec")
+    log_jsonl_max_bytes = parse_int("log_jsonl_max_bytes")
+    log_jsonl_backup_count = parse_int("log_jsonl_backup_count")
+    stats_heartbeat_scans = parse_int("stats_heartbeat_scans")
+    log_suppression_max_keys = parse_int("log_suppression_max_keys")
+    try:
+        log_routine_scan_events = _parse_bool(
+            downstream_cfg["log_routine_scan_events"],
+            name="log_routine_scan_events",
+        )
+    except KeyError as exc:
+        raise ValueError("downstream.log_routine_scan_events must be a boolean") from exc
     if scan_interval_sec <= 0:
         raise ValueError("downstream.scan_interval_sec must be greater than 0")
     if stable_for_sec <= 0:
         raise ValueError("downstream.stable_for_sec must be greater than 0")
+    if log_jsonl_max_bytes < 0:
+        raise ValueError("downstream.log_jsonl_max_bytes must be greater than or equal to 0")
+    if log_jsonl_backup_count < 0:
+        raise ValueError("downstream.log_jsonl_backup_count must be greater than or equal to 0")
+    if stats_heartbeat_scans <= 0:
+        raise ValueError("downstream.stats_heartbeat_scans must be greater than 0")
+    if log_suppression_max_keys <= 0:
+        raise ValueError("downstream.log_suppression_max_keys must be greater than 0")
 
     subjects_cfg = downstream_cfg.get("subjects") or {}
     if not isinstance(subjects_cfg, dict) or not subjects_cfg:
@@ -161,6 +203,11 @@ def load_worker_config(config_path: str = "config/config.yaml") -> DownstreamCon
         scan_interval_sec=scan_interval_sec,
         stable_for_sec=stable_for_sec,
         subjects=subjects,
+        log_jsonl_max_bytes=log_jsonl_max_bytes,
+        log_jsonl_backup_count=log_jsonl_backup_count,
+        stats_heartbeat_scans=stats_heartbeat_scans,
+        log_suppression_max_keys=log_suppression_max_keys,
+        log_routine_scan_events=log_routine_scan_events,
     )
 
 
@@ -184,13 +231,53 @@ def setup_logging() -> logging.Logger:
     return logger
 
 
+class ScanStatsReporter:
+    def __init__(self, target_logger: logging.Logger, *, heartbeat_scans: int = 120):
+        self.logger = target_logger
+        self.heartbeat_scans = max(1, int(heartbeat_scans))
+        self._last_stats: dict[str, int] | None = None
+        self._suppressed_scans = 0
+
+    def log(self, stats: dict[str, int], *, dry_run: bool) -> None:
+        normalized = dict(sorted((key, int(value)) for key, value in stats.items()))
+        if self._last_stats is None:
+            self._last_stats = normalized
+            self._suppressed_scans = 0
+            self.logger.info("downstream scan stats initial stats=%s dry_run=%s", normalized, dry_run)
+            return
+
+        if normalized != self._last_stats:
+            suppressed = self._suppressed_scans
+            self._last_stats = normalized
+            self._suppressed_scans = 0
+            self.logger.info(
+                "downstream scan stats changed stats=%s dry_run=%s suppressed_scans=%s",
+                normalized,
+                dry_run,
+                suppressed,
+            )
+            return
+
+        self._suppressed_scans += 1
+        if self._suppressed_scans >= self.heartbeat_scans:
+            suppressed = self._suppressed_scans
+            self._suppressed_scans = 0
+            self.logger.info(
+                "downstream scan stats heartbeat stats=%s dry_run=%s suppressed_scans=%s",
+                normalized,
+                dry_run,
+                suppressed,
+            )
+
+
 def run_worker(config: DownstreamConfig, *, dry_run: bool, run_once: bool) -> None:
     with SingleInstanceLock(config.lock_path):
         distributor = DownstreamDistributor(config, dry_run=dry_run)
+        reporter = ScanStatsReporter(logger, heartbeat_scans=config.stats_heartbeat_scans)
         try:
             while True:
                 stats = distributor.scan_once()
-                logger.info("downstream scan stats=%s dry_run=%s", stats, dry_run)
+                reporter.log(stats, dry_run=dry_run)
                 if run_once:
                     return
                 time.sleep(config.scan_interval_sec)

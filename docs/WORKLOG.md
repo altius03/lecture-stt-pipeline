@@ -3,6 +3,51 @@
 이 파일은 저장소에 반영된 변경을 날짜순으로 누적 기록한다.
 최신 항목을 위에 추가한다.
 
+## 2026-05-19
+
+### downstream 로그 폭주 완화와 모델 benchmark 초안
+- downstream worker가 반복 conflict/blocked/error 문제를 매 scan마다 다시 stdout/JSONL에 쓰지 않도록, 프로세스 생애 동안 동일 문제 이벤트를 1회만 기록하는 suppression을 추가했다.
+- scan 통계 stdout은 최초/변경/heartbeat 때만 출력하도록 `ScanStatsReporter`를 추가해 `downstream.out.log` 증가량을 줄였다.
+- `JsonlLogger`에 opt-in size guard/rotation 기능을 추가했다. 기본 example은 안전하게 비활성(`log_jsonl_max_bytes: 0`)으로 두고, 운영 config에서는 별도 승인 후 크기 제한을 켜는 방식으로 분리했다.
+- `downstream status summary`가 problem row 수와 `last_error_code`별 reason count를 함께 보여주도록 개선했다.
+- `scripts/benchmark_models.py` 초안을 추가했다. 기본은 현재 config의 `large-v3` baseline plan만 실행 가능하고, 후보 모델은 `--allow-candidate`, 다운로드/cache miss는 `--allow-download` 없이는 진행하지 않는다. 실제 benchmark 실행은 transcript payload가 stdout에 노출되지 않도록 `--output`을 필수로 요구한다.
+- 관련 unittest와 benchmark plan smoke check를 추가했다. 모델 다운로드/교체/실제 benchmark 실행은 수행하지 않았다.
+- 후속 보강으로 반복 문제 suppression cache를 bounded set으로 바꾸고, `backup_count=0` JSONL rotation도 UUID suffix로 충돌 없이 여러 번 회전되도록 했다.
+- `config/config.example.yaml`에는 downstream 로그 관련 안전 기본값을 문서화했고, gitignored 운영 `config/config.yaml`에는 승인된 범위에서 `log_jsonl_max_bytes: 10485760`, `log_jsonl_backup_count: 5`, `log_suppression_max_keys: 4096`, `log_routine_scan_events: false`를 적용했다.
+- 기존 대용량 downstream 로그는 삭제하지 않고 `state/logs/archive/20260519T045929Z/` 아래 gzip으로 보존한 뒤 원본을 truncate했으며, `com.geonha.lecture-stt-distribute`를 재시작해 stdout 반복 폭주가 멈춘 것을 확인했다.
+- 모델 변경은 baseline freeze → 실사용 sample shadow benchmark → 수동 품질판정 → 제한 canary 순서로 검증하도록 `docs/MODELS.md`에 절차를 추가했다.
+- `large-v3-turbo`, `deepdml` turbo, `distil-large-v3`, `ghost613` Korean turbo 후보를 실제 짧은/중간 샘플로 비교했고, 속도 이득은 있었지만 전공 용어 오류·누락·hallucination 징후 때문에 canonical STT 기본값으로는 탈락시켰다.
+- isolated `faster-whisper==1.2.1` 환경에서 같은 `large-v3`를 재측정했다. 속도는 개선됐지만 short sample 기준 출력 길이가 2338자에서 1742자로 줄고 도입부 누락/initial-prompt성 문장 삽입 징후가 있어 production `.venv` 업그레이드는 보류한다.
+
+### runtime inventory 및 모델 최신성 live 조회
+- read-only inventory 결과를 `docs/RUNTIME_INVENTORY_2026-05-19.md`에 저장했다.
+- iCloud `lecture_recordings` 실제 구조, repo runtime 폴더, legacy `/Users/geonha/lecture_stt`, launchd/process, DB/deliveries 상태를 정리했다.
+- 모델/패키지 최신성 조회 결과와 benchmark 후보를 `docs/MODELS.md`에 저장했다.
+- 현행 `faster-whisper==1.1.0` 대비 최신 `1.2.1`이 있음을 확인했고, `large-v3-turbo`, CT2 turbo, MLX, Korean fine-tune 후보를 benchmark 후보로 분리했다.
+- 삭제/이동/launchd 재시작/DB 변경/모델 변경은 수행하지 않았다.
+
+### lecture workflow 답변 반영 및 handoff 갱신
+- 사용자 답변을 바탕으로 iPhone 녹음 → iCloud `lecture_recordings/00_inbox` 업로드 → STT 전사 → 수동 LLM 교정/요약 흐름을 `docs/HANDOFF_RESTRUCTURE_AND_MODEL_UPGRADE.md`에 반영했다.
+- Claude/Anthropic 제거 범위는 correction 단계 삭제가 아니라 Claude API 구현 제거로 조정하고, raw/corrected transcript와 summary는 계속 유지하는 방향으로 정리했다.
+- Web panel 개편은 이번 작업 범위에서 제외하고, 모델 고도화는 정확도 최우선 + 컴퓨터 수용 가능성 제약 + 최신 후보 live 확인을 필수 gate로 갱신했다.
+- canonical output의 의미와 iCloud/GH_archive/Obsidian 역할 확인 질문을 추가했다.
+
+### 구조 정리 및 모델 고도화 handoff 문서 추가
+- 장기 작업을 세션 간 이어가기 위해 `docs/HANDOFF_RESTRUCTURE_AND_MODEL_UPGRADE.md`를 추가했다.
+- 사용자가 결정해야 할 경로 정책, Claude 제거 범위, downstream/summary 워크플로우, 모델 benchmark 기준을 분리해 기록했다.
+- 삭제/이동/launchd 재시작/DB 변경은 승인 후 진행하도록 안전장치를 명시했다.
+
+## 2026-04-29
+
+### launchd 중복 STT worker 재시작 루프 완화
+- `com.geonha.lecture-stt` LaunchAgent가 기존 외부 STT worker의 `state/stt.lock`을 만나면 10초마다 재실행 로그를 남기던 문제를 확인했다.
+- launchd로 실행된 `scripts/run_worker.sh`는 `LECTURE_STT_LOCK_WAIT=1`을 기본 설정하도록 바꿨다.
+- STT main lock은 해당 환경변수가 켜진 경우 non-blocking 실패로 종료하지 않고 lock을 기다리도록 확장했다.
+- launchd job이 대기 프로세스 하나로 유지되므로 반복 로그를 멈추고, 기존 worker가 종료되면 새 job이 자연스럽게 lock을 이어받는다.
+- lock 대기 모드 회귀 테스트를 추가했다.
+- 전체 점검 중 downstream이 같은 invalid/incomplete/blocked 항목을 30초마다 반복 기록해 로그가 커지는 문제를 확인했다.
+- downstream worker 프로세스 생애 동안 같은 반복 문제 이벤트는 한 번만 남기도록 줄이고 회귀 테스트를 추가했다.
+
 ## 2026-03-29
 
 ### 메인 워커 선점 레이스 완화와 로컬 staging 추가

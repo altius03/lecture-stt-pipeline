@@ -41,15 +41,19 @@ except ImportError:  # pragma: no cover - macOS worker path uses fcntl.
 
 
 class SingleInstanceLock:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, blocking: bool = False):
         self.path = path
+        self.blocking = blocking
         self._handle = None
 
     def __enter__(self) -> "SingleInstanceLock":
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._handle = self.path.open("a+", encoding="utf-8")
         if fcntl is not None:
-            fcntl.flock(self._handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            operation = fcntl.LOCK_EX
+            if not self.blocking:
+                operation |= fcntl.LOCK_NB
+            fcntl.flock(self._handle.fileno(), operation)
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -58,6 +62,11 @@ class SingleInstanceLock:
         if fcntl is not None:
             fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
         self._handle.close()
+
+
+def _env_flag(name: str) -> bool:
+    value = os.environ.get(name, "")
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 # 설정 파일을 읽고 기본 형식 유효성을 검사한다.
@@ -1329,8 +1338,11 @@ def main() -> None:
 
     logger.info("Loaded and validated configuration from %s", args.config)
     lock_path = Path(config["paths"]["db_path"]).parent / "stt.lock"
+    wait_for_lock = _env_flag("LECTURE_STT_LOCK_WAIT")
     try:
-        with SingleInstanceLock(lock_path):
+        if wait_for_lock:
+            logger.info("Waiting for main worker lock at %s", lock_path)
+        with SingleInstanceLock(lock_path, blocking=wait_for_lock):
             logger.info("Acquired main worker lock at %s", lock_path)
             STTPipeline(config=config, logger=logger).run(run_once=args.once)
     except BlockingIOError:
