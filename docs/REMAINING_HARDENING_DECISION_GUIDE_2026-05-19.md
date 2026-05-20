@@ -4,9 +4,11 @@
 
 중요: 이 문서를 작성하거나 읽는 것만으로 실제 운영 변경을 승인한 것이 아니다. DB row 삭제, 파일 이동/삭제/덮어쓰기, launchd 재시작, runtime path migration, package upgrade, push/tag/release는 별도 명시 승인 전에는 하지 않는다.
 
+2026-05-20 closeout note: 아래 결정 가이드는 2026-05-19 당시 남은 작업을 설명하는 이력 문서다. 현재 운영 source of truth는 `docs/WORKLOG.md`와 `docs/OPERATIONS.md`이며, approved closeout 이후 downstream problem rows는 `0`, runtime cleanup은 preserve-first archive 방식으로 적용 완료, GitHub Actions workflow는 추가 완료 상태다.
+
 ## 0. 현재 상태 요약
 
-Post-final live 확인 기준:
+Post-final live 확인 기준(2026-05-19 당시 snapshot, 2026-05-20 closeout으로 일부 수치 superseded):
 
 - repo: `/Users/geonha/DEV/lecture_stt`
 - branch: `main`
@@ -44,7 +46,7 @@ Post-final live 확인 기준:
 - downstream safe repair 적용 후 problem rows 4건까지 축소
 - `docs/OPERATIONS.md` 운영 runbook 추가 및 post-final 정합성 업데이트
 
-지금 남은 핵심은 “다음 실제 강의 canary”, “downstream invalid stem 3건 파일별 결정”, “cleanup apply 여부”, “문서/commit 정리”다.
+이 문서 작성 당시 남은 핵심은 “다음 실제 강의 canary”, “downstream invalid stem 3건 파일별 결정”, “cleanup apply 여부”, “문서/commit 정리”였다. 2026-05-20 approved closeout 이후 canary/scorecard/log-noise/downstream cleanup/runtime cleanup/CI bootstrap 결과는 `docs/WORKLOG.md`와 `docs/OPERATIONS.md`를 우선한다.
 
 ---
 
@@ -464,9 +466,9 @@ O1=1, O2=1, O3=1
 
 ## 4. D — Downstream problem rows 정리
 
-### 남은 일
+### 당시 남은 일 / 2026-05-20 closeout 결과
 
-현재 problem rows는 4건이다.
+2026-05-19 당시 problem rows는 4건이었다. 2026-05-20 approved closeout에서 destination overwrite 없이 before-state/DB backup/manifest를 남기고 invalid/manual artifacts를 archive한 뒤 현재 problem rows는 `0`이다.
 
 - `INVALID_STEM`: 3건
   - `선형대수학_시험출제포인트_전체정리`
@@ -475,11 +477,11 @@ O1=1, O2=1, O3=1
 - `CONFLICT`: 1건
   - `260422LC`, document-only 보호 대상
 
-가능한 작업 단계:
+당시 가능한 작업 단계:
 
 1. read-only report/manual table 생성
 2. invalid stem 3건의 rename/exclude/document-only 여부 파일별 결정
-3. `260422LC`는 그대로 두고 문서화만 유지
+3. `260422LC`는 destination overwrite 없이 before-state/DB backup을 보존
 4. 승인 후에만 DB row clear, destination overwrite, rename, route change 진행
 
 ### 결정 질문

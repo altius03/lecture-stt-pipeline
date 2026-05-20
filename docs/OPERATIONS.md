@@ -6,14 +6,15 @@
 
 - 운영 repo: `/Users/geonha/DEV/lecture_stt`
 - 운영 branch: `main`
+- GitHub Actions workflow: `.github/workflows/ci.yml`에서 Python unittest/compileall과 web-panel test/build를 실행한다.
 - 운영 모델: `large-v3` 유지. 모델 교체 금지.
 - runtime package: production `.venv`와 `requirements.txt`는 `faster-whisper==1.2.1`로 정렬되어 있다. 이는 package-only 변경이며 canonical STT model 변경이 아니다.
 - runtime path migration: 적용 완료. STT tmp는 `~/Library/Caches/lecture_stt/tmp`, app/downstream/launchd logs는 `~/Library/Logs/lecture_stt`, DB는 repo `state/jobs.sqlite3`에 유지한다.
 - installed LaunchAgents stdout/stderr: `~/Library/Logs/lecture_stt/*.out.log`, `~/Library/Logs/lecture_stt/*.err.log` 기준으로 확인됐다.
-- downstream worker: 켜둔 상태 유지. 현재 downstream problem rows는 4건(`INVALID_STEM` 3, `CONFLICT` 1)이며, `260422LC`는 document-only 보존 대상이다.
+- downstream worker: 켜둔 상태 유지. 2026-05-20 approved closeout cleanup 이후 downstream problem rows는 `0`이다. 이전 4건의 before-state/backup/manifest는 `state/reports/downstream-resolve-20260520T014011Z`와 iCloud manual-review archive에 보존했다.
 - latest real lecture canary: `260504DS_2` job `203` reached `DONE` under launchd. Operationally pass, but quality metadata is `warn` with score `61/100` due to high repetition ratio.
 - quality scorecard sidecar: new jobs with quality metadata write `02_transcripts/<stem>.quality.json`. The sidecar is metadata-only and must not include transcript body or segment arrays. `260504DS_2.quality.json` was later backfilled and validated as metadata-only.
-- runtime cleanup: dry-run/list만 완료. iCloud audio/transcript bulk cleanup, old archive prune, legacy root cleanup은 apply하지 않았다.
+- runtime cleanup: 2026-05-20 approved closeout에서 preserve-first apply 완료. old raw audio/transcript candidates는 영구삭제 대신 iCloud `lecture_recordings/90_cleanup_archive/cleanup-20260520T014307Z`로 이동했고, repo-local stale tmp/log payloads와 legacy root는 `~/Library/Application Support/lecture_stt/cleanup_archives/cleanup-20260520T014307Z`에 보존했다.
 - main branch push는 final hardening에서 완료됐지만, tag/release는 하지 않았다. 앞으로도 push/tag/release는 별도 명시 요청 없이는 하지 않는다.
 - destructive DB/file/config/launchd/package/model 작업은 plan/rollback 보고 후 명시 승인 없이 하지 않는다.
 - 기존 미커밋 변경은 항상 `git status`/`git diff`로 확인하고 보존한다.
@@ -101,19 +102,18 @@ launchctl kickstart -k "gui/$uid/com.geonha.lecture-stt-distribute"
 - conflict가 있을 때 canonical source는 `03_correction`이다.
 - destination에 다른 내용이 있으면 blind overwrite하지 않는다.
 - destination을 바꿔야 하면 dry-run 표, backup, before/after hash를 먼저 확인한다.
-- `260422LC`는 현재 그대로 두고 문서화만 한다.
+- 이전 `260422LC` conflict는 2026-05-20 cleanup에서 destination overwrite 없이 before-state/DB backup을 보존한 뒤 tracking row를 제거했다. 같은 유형이 재발하면 blind overwrite하지 않는다.
 - invalid stem rename은 파일별 확인 후 진행한다.
 
-현재 live 상태(2026-05-19 final hardening 이후):
+현재 live 상태(2026-05-20 approved closeout cleanup 이후):
 
-- delivery rows: total `152`, problem rows `4`
-- 남은 problem reason: `INVALID_STEM=3`, `CONFLICT=1`
-- invalid/manual review 대상:
-  - `선형대수학_시험출제포인트_전체정리`
-  - `BOSS_SPECIAL_LECTURE`
-  - `2603034LA_2`
-- preserved conflict/document-only 대상: `260422LC`
-- 이전 41건 triage 문구가 다른 문서에 남아 있으면 pre-execution 이력으로 보고, 현재 판단은 `downstream.status summary/diagnose` live 출력과 `docs/WORKLOG.md`를 우선한다.
+- delivery rows: total `148`, problem rows `0`
+- correction status: `DELIVERED=148`
+- summary status: `DELIVERED=126`, `MISSING=22`
+- 이전 41건 또는 4건 triage 문구가 다른 문서에 남아 있으면 pre-execution 이력으로 보고, 현재 판단은 `downstream.status summary/diagnose` live 출력과 `docs/WORKLOG.md`를 우선한다.
+- 2026-05-20 cleanup evidence:
+  - report/DB backup: `state/reports/downstream-resolve-20260520T014011Z`
+  - manual-review archive: iCloud `lecture_recordings/90_manual_review/downstream-excluded-20260520T014011Z`
 
 ### D5: subject route/rename 기준 설명
 
@@ -207,9 +207,9 @@ Launchd stdout/stderr rotation dry-run:
 - app log는 `~/Library/Logs/lecture_stt/app.log` 사용.
 - downstream JSONL은 `~/Library/Logs/lecture_stt/downstream.jsonl` 사용.
 - installed LaunchAgents stdout/stderr는 `~/Library/Logs/lecture_stt/*.out.log`, `~/Library/Logs/lecture_stt/*.err.log` 기준으로 확인됐다.
-- legacy `/Users/geonha/lecture_stt`는 존재하지만 read-only inventory만 했고 cleanup/delete apply는 하지 않았다.
+- legacy `/Users/geonha/lecture_stt`는 2026-05-20 cleanup에서 삭제하지 않고 `~/Library/Application Support/lecture_stt/cleanup_archives/cleanup-20260520T014307Z/legacy_root`로 이동 보존했다.
 - repo 안 empty runtime folders는 placeholder로 유지한다.
-- repo-local stale tmp/log/archive 후보와 iCloud audio/transcript cleanup 후보는 dry-run/list만 했고 apply하지 않았다.
+- repo-local stale tmp/log/state-log payloads는 2026-05-20 cleanup에서 `~/Library/Application Support/lecture_stt/cleanup_archives/cleanup-20260520T014307Z`로 이동 보존했다. iCloud audio/transcript cleanup 후보도 영구삭제하지 않고 `lecture_recordings/90_cleanup_archive/cleanup-20260520T014307Z`로 이동 보존했다.
 - Transcript cleanup retention은 `{stem}.txt`, `{stem}.json`, `{stem}.quality.json`을 한 transcript set으로 묶어 판단한다. `retain_min_transcripts`는 파일 개수가 아니라 primary transcript set 개수 기준이며, apply 시 sidecar만 남거나 primary transcript만 삭제되는 상태가 되지 않도록 함께 보존/정리한다. Orphan-only `{stem}.quality.json`은 최소 보존 슬롯을 소비하지 않는다.
 
 관련 이력/rollback 문서:
@@ -217,6 +217,7 @@ Launchd stdout/stderr rotation dry-run:
 - `docs/RUNTIME_MIGRATION_PLAN_2026-05-19.md`
 - migration backup: `state/backups/runtime-migration-20260519T114522Z`
 - runtime cleanup dry-run/list report: `state/reports/runtime-cleanup-20260519T123847Z`
+- runtime cleanup apply report: `state/reports/runtime-cleanup-apply-20260520T014307Z`
 
 추가 runtime cleanup 또는 rollback은 운영 파일 변경/launchd 영향이 있으므로 다음을 먼저 보고한 뒤 승인받는다.
 
@@ -276,7 +277,7 @@ Benchmark artifact 정책:
    - `com.geonha.lecture-stt-distribute`가 running
    - cleanup/webpanel은 보조 서비스이며, cleanup이 실행 중이 아니어도 canary 자체의 blocker는 아님
 4. inbox가 비어 있거나, 다음 실제 강의 파일 1개만 들어오는 controlled 상태일 것.
-5. 기존 downstream problem rows는 canary blocker가 아니다. 단, known 4 problem rows는 별도 manual/document-only 작업으로 남겨두고, canary 중 destination overwrite/DB clear를 하지 않는다.
+5. 기존 downstream problem rows는 canary blocker가 아니다. 2026-05-20 기준 known problem rows는 `0`이며, canary 중에는 destination overwrite/DB clear 같은 별도 cleanup 작업을 섞지 않는다.
 6. runtime path migration은 이미 적용 완료 상태다. canary 중에는 새 config 변경, cleanup apply, launchd restart를 하지 않고 현재 운영 기준으로 관찰한다.
 
 Canary 실행/판정은 자동으로 강의를 넣는 것이 아니라 다음 실제 강의 입력을 기다리는 방식이다.
