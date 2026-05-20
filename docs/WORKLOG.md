@@ -3,6 +3,19 @@
 이 파일은 저장소에 반영된 변경을 날짜순으로 누적 기록한다.
 최신 항목을 위에 추가한다.
 
+## 2026-05-20
+
+### Real lecture canary scorecard and downstream routine log-noise closeout
+- Next real lecture canary `260504DS_2` was observed through the installed launchd-backed worker as job `203` and reached terminal `DONE`. Expected artifacts exist under iCloud `01_audio/260504DS_2.m4a` and `02_transcripts/260504DS_2.txt` / `.json`; canonical STT model remained `large-v3` with runtime package `faster-whisper==1.2.1`.
+- The canary is an immediate operational pass, but its metadata quality report is `warn` with score `61/100` because repetition ratio is high. This is recorded as a quality-review note, not an infrastructure failure. Raw transcript text is not recorded in docs or reports.
+- Added metadata-only quality scorecard sidecar support: future STT jobs, including duplicate-result replay jobs, whose transcript metadata contains a quality report now atomically write `02_transcripts/<stem>.quality.json` with `schema_version`, `kind`, `canonical_base`, `health`, `quality_score`, `summary`, metrics, timings, model fields, and artifact paths. Output validation now also parses the sidecar, enforces the metadata-only contract, and checks schema/kind plus key artifact links. The sidecar deliberately excludes transcript body and segment arrays.
+- `_validate_output_files()` now treats a missing or malformed quality sidecar as an output validation failure when transcript metadata includes quality information. The already-completed job `203` predates this code path, so `260504DS_2.quality.json` was not backfilled.
+- Tightened downstream routine logging: by default, routine `scan_started` is not written to stdout or JSONL, and routine scan stats/stdout plus routine `scan_completed` JSONL entries are suppressed unless stats change or the bounded heartbeat emits `suppressed_scan_count`. Problem events and opt-in `log_routine_scan_events=True` remain available.
+- Runtime cleanup stayed conservative. Dry-run report `state/reports/runtime-cleanup-20260519T153859Z` found broad audio/transcript deletion candidates, so no cleanup apply, source deletion, transcript deletion, DB clear, or destination overwrite was performed. Launchd log rotation dry-run found no apply-needed files.
+- Downstream live status remains total rows `152`, problem rows `4` (`INVALID_STEM=3`, `CONFLICT=1` for preserved `260422LC`). These are existing manual/document-only rows and were not mutated.
+- After code changes, only the named launchd jobs `com.geonha.lecture-stt` and `com.geonha.lecture-stt-distribute` were restarted; `com.geonha.lecture-stt`, `com.geonha.lecture-stt-distribute`, and `com.geonha.lecture-stt-webpanel` are running, while cleanup remains a calendar/on-demand job.
+- Final local verification report was written under gitignored `state/reports/final-verification-20260520T000551Z`: unittest discovery `115` tests OK, compileall OK, `git diff --check` OK, DB `integrity_check=ok`, and downstream problem rows remained `4`.
+
 ## 2026-05-19
 
 ### Post-final docs 정합성 및 downstream manual table

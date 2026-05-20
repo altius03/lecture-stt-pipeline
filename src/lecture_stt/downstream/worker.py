@@ -234,13 +234,22 @@ def setup_logging() -> logging.Logger:
 
 
 class ScanStatsReporter:
-    def __init__(self, target_logger: logging.Logger, *, heartbeat_scans: int = 120):
+    def __init__(
+        self,
+        target_logger: logging.Logger,
+        *,
+        heartbeat_scans: int = 120,
+        emit_stdout: bool = True,
+    ):
         self.logger = target_logger
         self.heartbeat_scans = max(1, int(heartbeat_scans))
+        self.emit_stdout = emit_stdout
         self._last_stats: dict[str, int] | None = None
         self._suppressed_scans = 0
 
     def log(self, stats: dict[str, int], *, dry_run: bool) -> None:
+        if not self.emit_stdout:
+            return
         normalized = dict(sorted((key, int(value)) for key, value in stats.items()))
         if self._last_stats is None:
             self._last_stats = normalized
@@ -275,7 +284,11 @@ class ScanStatsReporter:
 def run_worker(config: DownstreamConfig, *, dry_run: bool, run_once: bool) -> None:
     with SingleInstanceLock(config.lock_path):
         distributor = DownstreamDistributor(config, dry_run=dry_run)
-        reporter = ScanStatsReporter(logger, heartbeat_scans=config.stats_heartbeat_scans)
+        reporter = ScanStatsReporter(
+            logger,
+            heartbeat_scans=config.stats_heartbeat_scans,
+            emit_stdout=config.log_routine_scan_events,
+        )
         try:
             while True:
                 stats = distributor.scan_once()

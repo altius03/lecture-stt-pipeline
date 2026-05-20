@@ -255,6 +255,9 @@ class DownstreamDistributor:
         self._correction_ready_stems: set[str] = set()
         self._log_suppression_max_keys = max(1, int(self.config.log_suppression_max_keys))
         self._logged_repeating_problem_events: OrderedDict[tuple[str, str, str, str, str], None] = OrderedDict()
+        self._stats_heartbeat_scans = max(1, int(self.config.stats_heartbeat_scans))
+        self._last_routine_scan_signature: tuple[tuple[str, str], ...] | None = None
+        self._suppressed_routine_scan_completed = 0
 
         if conn is not None:
             self.conn = conn
@@ -877,10 +880,51 @@ class DownstreamDistributor:
                 logger.warning("Failed to roll back copied destination %s", destination, exc_info=True)
         return rollback_error
 
+    @staticmethod
+    def _routine_scan_signature(payload: dict[str, object]) -> tuple[tuple[str, str], ...]:
+        stats = payload.get("stats")
+        if isinstance(stats, dict):
+            return tuple(sorted((str(key), str(value)) for key, value in stats.items()))
+        return tuple(
+            sorted(
+                (str(key), repr(value))
+                for key, value in payload.items()
+                if key not in {"dry_run"}
+            )
+        )
+
+    def _routine_scan_completed_payload(self, payload: dict[str, object]) -> tuple[bool, dict[str, object]]:
+        signature = self._routine_scan_signature(payload)
+        if self._last_routine_scan_signature is None:
+            self._last_routine_scan_signature = signature
+            self._suppressed_routine_scan_completed = 0
+            return True, dict(payload)
+        if signature != self._last_routine_scan_signature:
+            enriched = dict(payload)
+            if self._suppressed_routine_scan_completed:
+                enriched["suppressed_scan_count"] = self._suppressed_routine_scan_completed
+            self._last_routine_scan_signature = signature
+            self._suppressed_routine_scan_completed = 0
+            return True, enriched
+
+        self._suppressed_routine_scan_completed += 1
+        if self._suppressed_routine_scan_completed >= self._stats_heartbeat_scans:
+            enriched = dict(payload)
+            enriched["suppressed_scan_count"] = self._suppressed_routine_scan_completed
+            self._suppressed_routine_scan_completed = 0
+            return True, enriched
+        return False, dict(payload)
+
     def _log_event(self, event: str, **payload: object) -> None:
-        if self.config.log_routine_scan_events or event not in {"scan_started", "scan_completed"}:
+        routine_events = {"scan_started", "scan_completed"}
+        if self.config.log_routine_scan_events or event not in routine_events:
             logger.info("%s %s", event, payload)
-        self.jsonl.write(event=event, **payload)
+            self.jsonl.write(event=event, **payload)
+            return
+        if event == "scan_completed":
+            should_emit, emitted_payload = self._routine_scan_completed_payload(dict(payload))
+            if should_emit:
+                self.jsonl.write(event=event, **emitted_payload)
 
     def _log_repeating_problem_once(self, event: str, **payload: object) -> None:
         logical_stem = str(payload.get("logical_stem") or "")

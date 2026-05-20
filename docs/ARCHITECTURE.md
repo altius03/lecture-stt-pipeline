@@ -37,7 +37,7 @@
 - 중복이 아니면 `STTWorker`가 ffmpeg로 WAV 전처리 후 faster-whisper 전사를 수행한다.
 - 전사 결과는 `postprocess()`로 반복/노이즈/오인식 용어를 정리한다.
 - `quality_gate.evaluate()`가 반복도 기반 건강도를 계산해 메타데이터에 포함한다.
-- 최종 산출물은 `02_transcripts` 아래 `{base}.txt`, `{base}.json`으로 저장된다.
+- 최종 산출물은 `02_transcripts` 아래 `{base}.txt`, `{base}.json`으로 저장되고, 품질 메타데이터가 있으면 `{base}.quality.json` scorecard sidecar도 함께 저장된다. Scorecard는 transcript 본문과 segment 배열을 제외한 metadata-only artifact다.
 - STT 실행 실패는 기본 2회까지 retryable 상태(`전사 재시도 대기 n/2`)로 DB에 남기고, 다음 scan에서 즉시 재시도한다.
 - retry 한도 초과 후 terminal failure가 되면 오디오는 `99_errors`로 이동하고 DB 상태는 `ERROR`로 기록된다.
 - DB `engine_params`에는 `transcription_failures`, `transcription_max_retries`, `last_error_message`를 secret-redacted 형태로 남긴다.
@@ -49,7 +49,7 @@
 - `src/lecture_stt/stt/watcher.py`: 안정 파일 감시
 - `src/lecture_stt/stt/transcribe.py`: ffmpeg 전처리, Whisper 전사
 - `src/lecture_stt/stt/postprocess.py`: 반복/점 노이즈 제거, 용어 교정
-- `src/lecture_stt/stt/quality_gate.py`: 품질 보고서 생성
+- `src/lecture_stt/stt/quality_gate.py`: 품질 보고서와 metadata-only quality scorecard 생성
 - `src/lecture_stt/stt/notifier.py`: Telegram/Discord notifier, 중복 방지 마커, provider 팩토리
 - `src/lecture_stt/shared/utils.py`: 파일 이동, atomic write, hash, pause flag 등 공용 함수
 - 메인 워커는 `state/stt.lock` 파일 락으로 단일 인스턴스를 보장하고, claim 전에 원본이 사라진 경우는 다른 워커 선점 또는 외부 rename 가능성으로 보고 경고 후 skip한다.
@@ -94,8 +94,8 @@
 - summary는 correction 전달 완료가 확인된 경우에만 배포된다.
 - 동일 내용은 hash 비교로 idempotent하게 처리하고, 다른 내용이 있으면 overwrite하지 않고 conflict로 남긴다.
 - 반복되는 invalid/incomplete/blocked/conflict/error 이벤트는 같은 worker 프로세스 안에서 bounded suppression cache의 동일 key 기준 1회만 stdout/JSONL에 남겨 로그 폭주를 줄인다.
-- scan 통계 로그는 최초, 통계 변화, 설정된 heartbeat 주기 때만 출력한다.
-- `downstream.log_jsonl_max_bytes`를 0보다 크게 설정하면 `state/logs/downstream.jsonl`에 size guard/rotation을 적용한다. `downstream.log_suppression_max_keys`는 장기 실행 중 suppression cache 상한을 정한다. `downstream.log_routine_scan_events: false`이면 routine `scan_started`/`scan_completed`는 JSONL에만 남기고 stdout에는 내보내지 않는다. 기존 `downstream.out.log` truncate/delete나 launchd 재시작은 운영 승인 후 별도 절차로 처리한다.
+- scan 통계 로그는 최초, 통계 변화, 설정된 heartbeat 주기 때만 JSONL에 남기고 routine stdout은 기본적으로 끈다.
+- `downstream.log_jsonl_max_bytes`를 0보다 크게 설정하면 `state/logs/downstream.jsonl`에 size guard/rotation을 적용한다. `downstream.log_suppression_max_keys`는 장기 실행 중 suppression cache 상한을 정한다. `downstream.log_routine_scan_events: false`이면 routine `scan_started`는 stdout/JSONL 모두 생략하고, routine `scan_completed`는 최초/변경/heartbeat만 JSONL에 남긴다. 기존 `downstream.out.log` truncate/delete나 launchd 재시작은 운영 승인 후 별도 절차로 처리한다.
 
 ## Downstream 상태 저장
 - downstream 상태는 `deliveries` 테이블에 기록된다.
@@ -130,7 +130,7 @@
 - `tests/test_correction_manual.py`: 자동 correction provider 제거, API key 불필요, manual mode pending skip 회귀 테스트
 - `tests/test_benchmark_models.py`: benchmark plan safety와 segment quality metric 회귀 테스트
 - `tests/test_distribute_status.py`: deliveries CLI 출력과 삭제 동작
-- `tests/test_stt_main.py`: pause/resume/status control command 회귀 테스트
+- `tests/test_stt_main.py`: pause/resume/status control command, STT retry/failure, quality scorecard sidecar 회귀 테스트
 - `tests/test_web_panel.py`: 웹 제어판 종료 동작 회귀 테스트
 - `tests/test_web_panel_state.py`: React 친화형 snapshot 계약과 로그 stream reset 회귀 테스트
 - `src/lecture_stt/stt/transcribe.py`는 아직 자동 테스트가 없다.

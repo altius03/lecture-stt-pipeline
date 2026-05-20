@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 import tempfile
 import unittest
@@ -298,15 +299,44 @@ class DownstreamDistributorTests(unittest.TestCase):
         self.assertEqual(content.count('"event": "manual_problem"'), 4)
         self.assertLessEqual(len(distributor._logged_repeating_problem_events), 2)
 
-    def test_routine_scan_events_skip_stdout_by_default_but_stay_in_jsonl(self) -> None:
+    def test_routine_scan_events_skip_stdout_and_jsonl_by_default(self) -> None:
         distributor = self._make_distributor()
         with mock.patch("lecture_stt.downstream.lib.logger") as mocked_logger:
             distributor._log_event("scan_started", dry_run=False)
         distributor.close()
 
         mocked_logger.info.assert_not_called()
-        content = self.log_jsonl.read_text(encoding="utf-8")
-        self.assertIn('"event": "scan_started"', content)
+        self.assertFalse(self.log_jsonl.exists())
+
+    def test_scan_completed_jsonl_logs_initial_changed_and_heartbeat_only(self) -> None:
+        quiet_config = replace(self.config, stats_heartbeat_scans=2)
+        distributor = DownstreamDistributor(quiet_config, conn=self.conn)
+        base_stats = {
+            "correction_delivered": 0,
+            "summary_delivered": 0,
+            "blocked": 0,
+            "incomplete": 0,
+            "conflicts": 0,
+            "errors": 4,
+        }
+        changed_stats = {**base_stats, "errors": 5}
+
+        distributor._log_event("scan_completed", dry_run=False, stats=base_stats)
+        distributor._log_event("scan_completed", dry_run=False, stats=base_stats)
+        distributor._log_event("scan_completed", dry_run=False, stats=base_stats)
+        distributor._log_event("scan_completed", dry_run=False, stats=changed_stats)
+        distributor.close()
+
+        records = [
+            json.loads(line)
+            for line in self.log_jsonl.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        self.assertEqual([record["event"] for record in records], ["scan_completed"] * 3)
+        self.assertEqual(records[0]["stats"], base_stats)
+        self.assertEqual(records[1]["stats"], base_stats)
+        self.assertEqual(records[1]["suppressed_scan_count"], 2)
+        self.assertEqual(records[2]["stats"], changed_stats)
 
     def test_routine_scan_events_can_be_logged_to_stdout(self) -> None:
         noisy_config = replace(self.config, log_routine_scan_events=True)

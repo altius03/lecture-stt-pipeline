@@ -34,7 +34,11 @@ from lecture_stt.shared.paths import (
 )
 from lecture_stt.stt.notifier import SUPPORTED_PROVIDERS, build_notifier
 from lecture_stt.stt.postprocess import postprocess
-from lecture_stt.stt.quality_gate import evaluate as quality_evaluate
+from lecture_stt.stt.quality_gate import (
+    evaluate as quality_evaluate,
+    validate_quality_scorecard,
+    write_quality_scorecard,
+)
 from lecture_stt.stt.transcribe import EngineParams, STTWorker
 from lecture_stt.stt.watcher import PollingWatcher
 
@@ -834,6 +838,8 @@ class STTPipeline:
         self.transcript_dir.mkdir(parents=True, exist_ok=True)
         utils.atomic_write(txt_path, text)
         utils.atomic_write(json_path, {"segments": segments, "metadata": metadata})
+        if isinstance(metadata.get("quality"), dict):
+            write_quality_scorecard(json_path, metadata)
 
     # 산출물 존재/구조를 최소 검증해 손상된 결과를 바로 감지한다.
     def _validate_output_files(self, txt_path: Path, json_path: Path) -> None:
@@ -846,6 +852,9 @@ class STTPipeline:
         segments = payload.get("segments")
         if not isinstance(segments, list):
             raise ValueError("Transcript JSON missing segments array")
+        metadata = payload.get("metadata")
+        if isinstance(metadata, dict) and isinstance(metadata.get("quality"), dict):
+            validate_quality_scorecard(json_path, metadata)
 
     def _replay_existing_job(self, job_id: int, canonical_base: str, source_path: Path,
                             canonical_audio_path: Path, txt_path: Path, json_path: Path,
@@ -893,6 +902,16 @@ class STTPipeline:
                 deduped_from_job_id=int(duplicate["id"]),
                 source_sha256=duplicate["sha256"],
             )
+            prior_metadata = prior_payload.get("metadata")
+            prior_quality = (
+                prior_metadata.get("quality")
+                if isinstance(prior_metadata, dict)
+                else None
+            )
+            if isinstance(prior_quality, dict):
+                metadata["quality"] = dict(prior_quality)
+            else:
+                metadata["quality"] = quality_evaluate(segments, text).to_dict()
 
             self._write_output(txt_path, json_path, segments, text, metadata)
             self._validate_output_files(txt_path, json_path)

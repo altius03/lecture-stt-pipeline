@@ -11,6 +11,8 @@
 - runtime path migration: 적용 완료. STT tmp는 `~/Library/Caches/lecture_stt/tmp`, app/downstream/launchd logs는 `~/Library/Logs/lecture_stt`, DB는 repo `state/jobs.sqlite3`에 유지한다.
 - installed LaunchAgents stdout/stderr: `~/Library/Logs/lecture_stt/*.out.log`, `~/Library/Logs/lecture_stt/*.err.log` 기준으로 확인됐다.
 - downstream worker: 켜둔 상태 유지. 현재 downstream problem rows는 4건(`INVALID_STEM` 3, `CONFLICT` 1)이며, `260422LC`는 document-only 보존 대상이다.
+- latest real lecture canary: `260504DS_2` job `203` reached `DONE` under launchd. Operationally pass, but quality metadata is `warn` with score `61/100` due to high repetition ratio.
+- quality scorecard sidecar: new jobs with quality metadata write `02_transcripts/<stem>.quality.json`. The sidecar is metadata-only and must not include transcript body or segment arrays.
 - runtime cleanup: dry-run/list만 완료. iCloud audio/transcript bulk cleanup, old archive prune, legacy root cleanup은 apply하지 않았다.
 - main branch push는 final hardening에서 완료됐지만, tag/release는 하지 않았다. 앞으로도 push/tag/release는 별도 명시 요청 없이는 하지 않는다.
 - destructive DB/file/config/launchd/package/model 작업은 plan/rollback 보고 후 명시 승인 없이 하지 않는다.
@@ -77,10 +79,11 @@ launchctl kickstart -k "gui/$uid/com.geonha.lecture-stt-distribute"
 1. 새 오디오가 iCloud `lecture_recordings/00_inbox`에 들어온다.
 2. 안정 시간 이후 worker가 처리 대상으로 인식한다.
 3. 원본은 `01_audio`로 이동/보관된다.
-4. raw transcript는 `02_transcripts`에 생성된다.
-5. 사용자가 검토한 correction은 `03_correction`에 둔다.
-6. summary는 `04_summarize`에 둔다.
-7. downstream worker가 GH archive/Obsidian 목적지로 배포한다.
+4. raw transcript는 `02_transcripts`에 `{stem}.txt`와 `{stem}.json`으로 생성된다.
+5. 품질 metadata가 있으면 `{stem}.quality.json` sidecar도 함께 생성된다. 이 파일은 score/health/metrics/timings/model/artifact path만 담고 transcript 본문이나 segment 배열은 담지 않는다.
+6. 사용자가 검토한 correction은 `03_correction`에 둔다.
+7. summary는 `04_summarize`에 둔다.
+8. downstream worker가 GH archive/Obsidian 목적지로 배포한다.
 
 현재 구현된 retry/failure 정책:
 
@@ -172,7 +175,7 @@ PYTHONPATH=src .venv/bin/python -m lecture_stt.downstream.status clear-stale STE
 - downstream JSONL: 10MB x 5
 - launchd stdout/stderr: 10MB x 3
 - compressed archive 보존: 30일
-- routine scan stdout 로그: 기본 비활성화
+- routine scan 로그: 기본값에서 `scan_started`는 stdout/JSONL 모두 비활성화하고, `scan_completed`는 최초/변경/heartbeat만 JSONL에 남긴다.
 - old log archive/cleanup: 그 시점에 다시 확인 후 진행
 
 이미 적용/준비된 운영값:
@@ -180,7 +183,7 @@ PYTHONPATH=src .venv/bin/python -m lecture_stt.downstream.status clear-stale STE
 - STT app log 기본값: `logging.max_bytes: 10485760`, `logging.backup_count: 5`
 - downstream JSONL 기본값: `downstream.log_jsonl_max_bytes: 10485760`, `downstream.log_jsonl_backup_count: 5`
 - downstream 반복 문제 suppression: `downstream.log_suppression_max_keys: 4096`
-- downstream routine scan stdout: `downstream.log_routine_scan_events: false`
+- downstream routine scan logging: `downstream.log_routine_scan_events: false`이면 routine stdout은 비활성화되고, JSONL은 초기/변경/heartbeat 중심으로 제한된다.
 - launchd stdout/stderr plain log rotation helper: `scripts/rotate_logs.py` (`--apply` 없이는 dry-run)
 
 Launchd stdout/stderr rotation dry-run:
@@ -279,6 +282,13 @@ Canary 실행/판정은 자동으로 강의를 넣는 것이 아니라 다음 �
 
 - immediate pass: 실제 강의 1개가 launchd worker로 end-to-end 완료되고, DB `DONE`, transcript txt/json 생성, 알림 동작, error/log spam 없음.
 - stability gate: 이후 24h idle 관찰 또는 다음 실제 강의 2개까지 문제 없음.
+
+현재 기록된 latest immediate pass:
+
+- `260504DS_2` / job `203` / `DONE`
+- outputs: `01_audio/260504DS_2.m4a`, `02_transcripts/260504DS_2.txt`, `02_transcripts/260504DS_2.json`
+- quality: `warn`, `61/100`, high repetition ratio
+- note: job `203` completed before quality sidecar support was deployed, so `260504DS_2.quality.json` was not backfilled.
 
 ### C2: launchd vs `run_once` 설명
 

@@ -473,6 +473,27 @@ Still not approved unless explicitly requested later:
 - Broad audio/transcript cleanup apply, old log archive deletion/prune, or legacy root deletion beyond dry-run/list.
 - Model switch away from `large-v3`.
 
+## Post-overnight STT closeout status — 2026-05-20
+
+The next real lecture canary has now been observed and the remaining STT observability/log-noise batch was executed under later explicit approval.
+
+Completed in this batch:
+
+- Real lecture canary `260504DS_2` reached job `203` terminal `DONE` through the installed launchd worker. Artifacts exist at `01_audio/260504DS_2.m4a` and `02_transcripts/260504DS_2.txt` / `.json`.
+- Canary quality metadata is `warn` with score `61/100` because repetition ratio is high. This is an output-quality note; the infrastructure canary is still an immediate pass.
+- Quality scorecard sidecar support was added with strict TDD. Future jobs write `02_transcripts/<stem>.quality.json` when metadata includes a quality report. The sidecar is metadata-only and excludes transcript body/segments.
+- Downstream routine JSONL/stdout log noise was tightened with strict TDD. Default behavior suppresses routine `scan_started`, and emits routine `scan_completed` only for initial stats, stats changes, or bounded heartbeat with `suppressed_scan_count`.
+- Runtime cleanup stayed dry-run/list only. Broad raw audio/transcript candidates were not applied, and no DB/file destination mutation was performed.
+- Named launchd jobs were restarted only after the code batch: `com.geonha.lecture-stt` and `com.geonha.lecture-stt-distribute`. Webpanel remained running; cleanup remains calendar/on-demand.
+
+Current live baseline after this closeout preflight:
+
+- Branch: `main`, `HEAD=948d320` before committing this batch, `origin/main` matching.
+- STT jobs: `DONE=31`, `ERROR=1`.
+- Downstream: total rows `152`, problem rows `4` (`INVALID_STEM=3`, `CONFLICT=1`), all preserved/manual/document-only.
+- `260504DS_2.quality.json` is absent because job `203` completed before sidecar support was deployed; no retroactive transcript artifact backfill was performed.
+- Tag/release remain out of scope; canonical model remains `large-v3`.
+
 ## C — Canary / live observation
 
 - C1=1: Canary input is the next real lecture only. Do not copy an old sample into the inbox as a test canary.

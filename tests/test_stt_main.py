@@ -205,6 +205,29 @@ class SttPipelineBehaviorTests(unittest.TestCase):
         self.pipeline.conn.close()
         self.tmpdir.cleanup()
 
+    def _quality_metadata(self, canonical_base: str, txt_path: Path, json_path: Path) -> dict:
+        return {
+            "canonical_base": canonical_base,
+            "orig_name": f"{canonical_base}.m4a",
+            "canonical_audio_path": str(self.audio_dir / f"{canonical_base}.m4a"),
+            "transcript_txt_path": str(txt_path),
+            "transcript_json_path": str(json_path),
+            "quality": {
+                "quality_score": 99,
+                "health": "good",
+                "summary": "정상 (점수 99/100).",
+                "total_segments": 1,
+                "empty_segments": 0,
+                "dot_noise_segments": 0,
+                "short_segments": 0,
+                "rep_mass": 0.0,
+                "avg_segment_length": 8.0,
+                "empty_ratio": 0.0,
+                "dot_noise_ratio": 0.0,
+                "short_segment_ratio": 0.0,
+            },
+        }
+
     def test_process_job_uses_local_staging_before_canonical_move(self) -> None:
         source_path = self.watch_dir / "sample.m4a"
         source_path.write_bytes(b"fake-audio")
@@ -224,6 +247,97 @@ class SttPipelineBehaviorTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["status"], stt_main.STATUS_DONE)
         self.assertEqual(rows[0]["current_step"], "전체 완료")
+
+    def test_process_job_writes_quality_scorecard_without_transcript_body(self) -> None:
+        source_path = self.watch_dir / "scorecard.m4a"
+        source_path.write_bytes(b"fake-audio")
+
+        self.pipeline.process_job(source_path)
+
+        transcript_json_path = self.transcript_dir / "scorecard.json"
+        scorecard_path = self.transcript_dir / "scorecard.quality.json"
+        self.assertTrue(transcript_json_path.exists())
+        self.assertTrue(scorecard_path.exists())
+
+        scorecard_text = scorecard_path.read_text(encoding="utf-8")
+        scorecard = json.loads(scorecard_text)
+        self.assertEqual(scorecard["schema_version"], 1)
+        self.assertEqual(scorecard["kind"], "lecture_stt_quality_scorecard")
+        self.assertEqual(scorecard["canonical_base"], "scorecard")
+        self.assertIn(scorecard["health"], {"good", "warn", "bad"})
+        self.assertIsInstance(scorecard["quality_score"], int)
+        self.assertEqual(scorecard["artifacts"]["transcript_json_path"], str(transcript_json_path))
+        self.assertNotIn("segments", scorecard)
+        self.assertNotIn("테스트", scorecard_text)
+
+    def test_validate_output_requires_quality_scorecard_sidecar(self) -> None:
+        txt_path = self.transcript_dir / "missing-sidecar.txt"
+        json_path = self.transcript_dir / "missing-sidecar.json"
+        metadata = self._quality_metadata("missing-sidecar", txt_path, json_path)
+        txt_path.write_text("metadata-only validation", encoding="utf-8")
+        json_path.write_text(
+            json.dumps({"segments": [{"text": "검증"}], "metadata": metadata}),
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(FileNotFoundError):
+            self.pipeline._validate_output_files(txt_path, json_path)
+
+    def test_validate_output_rejects_malformed_quality_scorecard(self) -> None:
+        txt_path = self.transcript_dir / "malformed-sidecar.txt"
+        json_path = self.transcript_dir / "malformed-sidecar.json"
+        scorecard_path = self.transcript_dir / "malformed-sidecar.quality.json"
+        metadata = self._quality_metadata("malformed-sidecar", txt_path, json_path)
+        txt_path.write_text("metadata-only validation", encoding="utf-8")
+        json_path.write_text(
+            json.dumps({"segments": [{"text": "검증"}], "metadata": metadata}),
+            encoding="utf-8",
+        )
+        scorecard_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "kind": "lecture_stt_quality_scorecard",
+                    "canonical_base": "wrong-stem",
+                    "segments": [{"text": "raw transcript must not be here"}],
+                    "artifacts": {"transcript_json_path": str(json_path)},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(ValueError):
+            self.pipeline._validate_output_files(txt_path, json_path)
+
+    def test_deduped_job_writes_quality_scorecard_without_transcript_body(self) -> None:
+        original_path = self.watch_dir / "dedupe-original.m4a"
+        original_path.write_bytes(b"same-audio")
+        self.pipeline.process_job(original_path)
+
+        duplicate_path = self.watch_dir / "dedupe-copy.m4a"
+        duplicate_path.write_bytes(b"same-audio")
+        with mock.patch.object(
+            self.pipeline.worker,
+            "transcribe_file",
+            wraps=self.pipeline.worker.transcribe_file,
+        ) as transcribe_file:
+            self.pipeline.process_job(duplicate_path)
+
+        self.assertEqual(transcribe_file.call_count, 0)
+        duplicate_json_path = self.transcript_dir / "dedupe-copy.json"
+        duplicate_scorecard_path = self.transcript_dir / "dedupe-copy.quality.json"
+        self.assertTrue(duplicate_json_path.exists())
+        self.assertTrue(duplicate_scorecard_path.exists())
+
+        duplicate_payload = json.loads(duplicate_json_path.read_text(encoding="utf-8"))
+        self.assertTrue(duplicate_payload["metadata"]["deduped"])
+        self.assertIn("quality", duplicate_payload["metadata"])
+
+        scorecard_text = duplicate_scorecard_path.read_text(encoding="utf-8")
+        scorecard = json.loads(scorecard_text)
+        self.assertEqual(scorecard["canonical_base"], "dedupe-copy")
+        self.assertNotIn("segments", scorecard)
+        self.assertNotIn("테스트", scorecard_text)
 
     def test_process_job_skips_missing_source_when_competing_job_exists(self) -> None:
         source_path = self.watch_dir / "race.m4a"
