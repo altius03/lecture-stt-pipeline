@@ -1,34 +1,37 @@
-# macOS
+# macOS metadata
 .DS_Store
 **/.DS_Store
 
-# secrets
+# Secrets and local machine config
 .env
+config/config.yaml
+config/config.yaml.bak
 
-# runtime artifacts
+# Python/dev environments and caches
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Runtime artifacts
 logs/
 state/
 tmp/
 models/
+/src/logs/
+/audio/
+/inbox/
+/transcripts/
+/errors/
 
-# local config (keep example only)
-config/config.yaml
-
-# local tooling / backups
+# Local tooling / IDE / backups
 .claude/
+.idea/
 *.bak*
 
-# python
-__pycache__/
-*.pyc
-.venv/
-.env
-config/config.yaml
-state/
-tmp/
-.venv/
-.idea/
-.DS_Store
+# Frontend dependencies/build artifacts
 frontend/web-panel/node_modules/
 frontend/web-panel/dist/
 frontend/web-panel/*.tsbuildinfo

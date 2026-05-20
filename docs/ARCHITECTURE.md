@@ -1,22 +1,26 @@
 # Lecture STT Architecture
 
-기준일: 2026-03-23
+기준일: 2026-05-20
 
 ## 목적
 - iCloud inbox에 들어오는 강의 음성 파일을 자동으로 전사한다.
-- 전사 결과를 TXT/JSON으로 저장하고, 후단 correction/summary 산출물을 별도 배포한다.
+- 전사 결과를 TXT/JSON과 metadata-only quality sidecar로 저장한다.
+- 후단 correction/summary 산출물을 별도 배포하고, Hermes operator가 교정/요약 자동화를 앱 외부 계층에서 수행할 수 있게 한다.
 
 ## 최상위 디렉터리
 - `src/`: 애플리케이션 본체
 - `frontend/`: React 웹 패널 소스(Vite 기반)
 - `scripts/`: 수동 실행, 설치, 운영 보조 스크립트
 - `scripts/hermes_postprocess/`: Hermes cron/operator용 repo-local 후보 discovery, prompt loading, validator, review-only misrecognition queue, staging manifest, explicit promote helper
-- `launchd/`: macOS launchd 서비스 정의
-- `config/`: YAML 설정
-- `tests/`: downstream 배포 계층 테스트
-- `state/`: SQLite DB, pause flag, 구조화 로그
-- `tmp/`: ffmpeg 전처리 산출물 등 임시 파일
-- `tmp/inbox_staging/`: iCloud inbox에서 선점한 원본을 로컬로 잠시 옮겨 두는 staging 영역
+- `launchd/`: macOS launchd 서비스 정의 템플릿
+- `config/`: YAML 설정 템플릿. 운영 `config.yaml`은 gitignore 대상이다.
+- `tests/`: Python unittest suite
+- `docs/`: 운영 runbook, architecture, worklog, model/operator 문서
+- `.github/workflows/`: GitHub Actions CI
+- `.codex/agents/`: project-local Codex subagent 설정
+- `.hermes/plans/`: 승인/작업 계획 기록
+- `state/`: gitignored repo-local SQLite DB, operator staging, reports, lock/pause files
+- `tmp/`: gitignored legacy/local fallback tmp. 현재 운영 STT tmp/cache 기본값은 `~/Library/Caches/lecture_stt/tmp`다.
 
 ## 현재 소스 구조
 - 실제 구현 코드는 `src/lecture_stt/` 패키지 아래에 정리되어 있다.
@@ -90,7 +94,7 @@
 - `validators.py`는 correction JSON의 segment count, `id/start/end`, 전체 JSON key/order/array 구조, non-`text` metadata 보존, final overwrite 금지, summary required headings 및 `summary_too_short` guardrail을 검증한다.
 - `misrecognitions.py`는 교정 중 발견한 짧은 오인식 후보 phrase를 repo-local `state/hermes_postprocess/misrecognitions/pending.jsonl`에 dedupe append한다. raw transcript excerpt/context와 `05_prompt` 자동 변경은 금지한다.
 - `staging.py`는 metadata-only `manifest.json`과 explicit promote 인터페이스를 제공한다. Promote는 기본적으로 `promote_disabled`를 반환하며, `--allow-promote`가 없으면 final 경로에 쓰지 않는다. 허용된 promote도 candidate destination path를 재계산해 검증하고 validator를 재실행한 뒤 exclusive no-overwrite copy와 hash-checked rollback을 사용한다.
-- 이 패키지는 Gate A/B 개발·dry-run 검증 범위에서 시작했으며 cron 등록, launchd 변경, iCloud final write 운영 활성화는 별도 Gate C+ 승인 전 금지한다.
+- 이 패키지는 Gate A/B 개발·dry-run 검증 범위에서 시작했으며, 이후 승인된 Gate C+ promote canary와 Hermes cron 등록까지 반영됐다. 현재 활성화 범위와 금지사항은 `docs/operators/hermes-postprocess/README.md`와 `docs/OPERATIONS.md`를 우선한다.
 - 2026-05-20 후속 승인으로 live stem `260504DS_1` 1건의 content staging, validation, Gate C+ promote canary를 수행했고, script-only Hermes cron job `lecture_stt_postprocess_operator`를 등록했다. Cron은 `state/hermes_postprocess/cron-baseline.json`의 activation-time backlog skip list를 사용해 기존 backlog를 건너뛰며, no-candidate일 때 stdout/delivery 없이 조용히 종료한다.
 - `--lecture-root`는 iCloud가 아니어도 된다. 같은 폴더 구조의 local canary root를 넘기면 postprocess helper는 완전히 로컬에서 동작한다. iCloud는 현재 실제 transcript/prompt 정본 위치라 Gate B에서 read-only inventory 대상으로만 사용한다.
 
@@ -138,17 +142,16 @@
 - launchd plist는 저장소에 절대경로를 고정하지 않고 `scripts/setup_launchd.sh`가 현재 repo 위치로 템플릿을 렌더링해 등록한다.
 
 ## 테스트 범위
-- 현재 자동 테스트는 downstream 계층에 집중되어 있다.
+- 현재 자동 테스트는 STT pipeline, downstream, web panel state/backend, script entrypoints, cleanup/log retention, Hermes postprocess operator를 함께 검증한다.
+- `tests/test_stt_main.py`: pause/resume/status control command, STT retry/failure, dedupe/replay, quality scorecard sidecar 회귀 테스트
+- `tests/test_transcribe_worker.py`, `tests/test_transcribe_progress.py`, `tests/test_quality_gate.py`: transcribe worker/progress/quality scoring 회귀 테스트
 - `tests/test_distribute_lib.py`: pair 처리, block/unblock, idempotency, conflict, cleanup failure, 반복 문제 로그 suppression, JSONL rotation
 - `tests/test_downstream_worker.py`: scan stats heartbeat/suppression 회귀 테스트
 - `tests/test_correction_manual.py`: 자동 correction provider 제거, API key 불필요, manual mode pending skip 회귀 테스트
-- `tests/test_benchmark_models.py`: benchmark plan safety와 segment quality metric 회귀 테스트
 - `tests/test_distribute_status.py`: deliveries CLI 출력과 삭제 동작
-- `tests/test_stt_main.py`: pause/resume/status control command, STT retry/failure, quality scorecard sidecar 회귀 테스트
-- `tests/test_web_panel.py`: 웹 제어판 종료 동작 회귀 테스트
-- `tests/test_web_panel_state.py`: React 친화형 snapshot 계약과 로그 stream reset 회귀 테스트
+- `tests/test_web_panel.py`, `tests/test_web_panel_state.py`: 웹 제어판 종료 동작, React 친화형 snapshot 계약, 로그 stream reset 회귀 테스트
 - `tests/test_hermes_postprocess.py`: Hermes postprocess candidate discovery, action plan, path resolution, raw-body leak prevention, prompt loader, staging manifest, review-only misrecognition queue, promote safety/rollback/path validation, correction/summary validators
-- `src/lecture_stt/stt/transcribe.py`는 아직 자동 테스트가 없다.
+- `tests/test_script_entrypoints.py`, `tests/test_rotate_logs_script.py`, `tests/test_log_retention.py`, `tests/test_paths.py`, `tests/test_runtime_migration_config.py`, `tests/test_notifier.py`, `tests/test_benchmark_models.py`: entrypoint portability, log cleanup, path/default config, notification, benchmark safety 회귀 테스트
 
 ## 유지 규칙
 - 구조가 바뀌면 이 문서를 먼저 최신 구조에 맞게 수정한다.
