@@ -50,9 +50,13 @@ class ScriptEntrypointTests(unittest.TestCase):
 
             env = dict(os.environ)
             env["PYTHONPATH"] = ""
+            python_bin = REPO_ROOT / ".venv" / "bin" / "python"
+            if not python_bin.exists():
+                python_bin = Path(sys.executable)
+
             result = subprocess.run(
                 [
-                    str(REPO_ROOT / ".venv" / "bin" / "python"),
+                    str(python_bin),
                     str(REPO_ROOT / "scripts" / "cleanup.py"),
                     "--dry-run",
                     "--config",
