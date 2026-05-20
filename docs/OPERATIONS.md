@@ -12,7 +12,7 @@
 - installed LaunchAgents stdout/stderr: `~/Library/Logs/lecture_stt/*.out.log`, `~/Library/Logs/lecture_stt/*.err.log` 기준으로 확인됐다.
 - downstream worker: 켜둔 상태 유지. 현재 downstream problem rows는 4건(`INVALID_STEM` 3, `CONFLICT` 1)이며, `260422LC`는 document-only 보존 대상이다.
 - latest real lecture canary: `260504DS_2` job `203` reached `DONE` under launchd. Operationally pass, but quality metadata is `warn` with score `61/100` due to high repetition ratio.
-- quality scorecard sidecar: new jobs with quality metadata write `02_transcripts/<stem>.quality.json`. The sidecar is metadata-only and must not include transcript body or segment arrays.
+- quality scorecard sidecar: new jobs with quality metadata write `02_transcripts/<stem>.quality.json`. The sidecar is metadata-only and must not include transcript body or segment arrays. `260504DS_2.quality.json` was later backfilled and validated as metadata-only.
 - runtime cleanup: dry-run/list만 완료. iCloud audio/transcript bulk cleanup, old archive prune, legacy root cleanup은 apply하지 않았다.
 - main branch push는 final hardening에서 완료됐지만, tag/release는 하지 않았다. 앞으로도 push/tag/release는 별도 명시 요청 없이는 하지 않는다.
 - destructive DB/file/config/launchd/package/model 작업은 plan/rollback 보고 후 명시 승인 없이 하지 않는다.
@@ -287,9 +287,9 @@ Canary 실행/판정은 자동으로 강의를 넣는 것이 아니라 다음 �
 현재 기록된 latest immediate pass:
 
 - `260504DS_2` / job `203` / `DONE`
-- outputs: `01_audio/260504DS_2.m4a`, `02_transcripts/260504DS_2.txt`, `02_transcripts/260504DS_2.json`
+- outputs: `01_audio/260504DS_2.m4a`, `02_transcripts/260504DS_2.txt`, `02_transcripts/260504DS_2.json`, `02_transcripts/260504DS_2.quality.json`
 - quality: `warn`, `61/100`, high repetition ratio
-- note: job `203` completed before quality sidecar support was deployed, so `260504DS_2.quality.json` was not backfilled.
+- note: job `203` completed before quality sidecar support was deployed, so `260504DS_2.quality.json` was later backfilled and validated from existing metadata; it remains metadata-only.
 
 ### C2: launchd vs `run_once` 설명
 

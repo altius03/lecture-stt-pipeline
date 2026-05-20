@@ -491,7 +491,7 @@ Current live baseline after this closeout preflight:
 - Branch: `main`, `HEAD=948d320` before committing this batch, `origin/main` matching.
 - STT jobs: `DONE=31`, `ERROR=1`.
 - Downstream: total rows `152`, problem rows `4` (`INVALID_STEM=3`, `CONFLICT=1`), all preserved/manual/document-only.
-- `260504DS_2.quality.json` is absent because job `203` completed before sidecar support was deployed; no retroactive transcript artifact backfill was performed.
+- `260504DS_2.quality.json` was initially absent because job `203` completed before sidecar support was deployed; it was later backfilled from existing metadata and validated as metadata-only.
 - Tag/release remain out of scope; canonical model remains `large-v3`.
 
 ## C — Canary / live observation
