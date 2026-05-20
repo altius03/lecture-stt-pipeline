@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 
@@ -89,6 +90,82 @@ class ScriptEntrypointTests(unittest.TestCase):
             self.assertEqual(deleted, 1)
             self.assertTrue(staging_dir.exists())
             self.assertTrue((staging_dir / "claimed.m4a").exists())
+
+    def test_cleanup_transcripts_keeps_scorecard_with_latest_transcript_set(self) -> None:
+        module = _load_module("cleanup_script", REPO_ROOT / "scripts" / "cleanup.py")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            transcript_dir = Path(temp_dir)
+            now = time.time()
+
+            for index, name in enumerate(
+                [
+                    "old_lecture.txt",
+                    "old_lecture.json",
+                    "old_lecture.quality.json",
+                    "new_lecture.txt",
+                    "new_lecture.json",
+                    "new_lecture.quality.json",
+                ]
+            ):
+                path = transcript_dir / name
+                path.write_text("{}", encoding="utf-8")
+                # Make the new lecture set newer than the old set, while still
+                # older than the cutoff so min_keep is the only thing preserving it.
+                mtime = now - 600 + index
+                if name.startswith("new_lecture"):
+                    mtime = now - 60 + index
+                os.utime(path, (mtime, mtime))
+
+            deleted, kept = module._cleanup_transcripts(
+                transcript_dir,
+                cutoff_ts=now + 1,
+                dry_run=False,
+                min_keep=1,
+            )
+
+            self.assertEqual(deleted, 3)
+            self.assertEqual(kept, 3)
+            self.assertFalse((transcript_dir / "old_lecture.txt").exists())
+            self.assertFalse((transcript_dir / "old_lecture.json").exists())
+            self.assertFalse((transcript_dir / "old_lecture.quality.json").exists())
+            self.assertTrue((transcript_dir / "new_lecture.txt").exists())
+            self.assertTrue((transcript_dir / "new_lecture.json").exists())
+            self.assertTrue((transcript_dir / "new_lecture.quality.json").exists())
+
+    def test_cleanup_transcripts_orphan_scorecard_does_not_consume_min_keep(self) -> None:
+        module = _load_module("cleanup_script", REPO_ROOT / "scripts" / "cleanup.py")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            transcript_dir = Path(temp_dir)
+            now = time.time()
+
+            for index, name in enumerate(
+                [
+                    "real_lecture.txt",
+                    "real_lecture.json",
+                    "real_lecture.quality.json",
+                    "orphan.quality.json",
+                ]
+            ):
+                path = transcript_dir / name
+                path.write_text("{}", encoding="utf-8")
+                mtime = now - 600 + index
+                if name == "orphan.quality.json":
+                    mtime = now - 60
+                os.utime(path, (mtime, mtime))
+
+            deleted, kept = module._cleanup_transcripts(
+                transcript_dir,
+                cutoff_ts=now + 1,
+                dry_run=False,
+                min_keep=1,
+            )
+
+            self.assertEqual(deleted, 1)
+            self.assertEqual(kept, 3)
+            self.assertTrue((transcript_dir / "real_lecture.txt").exists())
+            self.assertTrue((transcript_dir / "real_lecture.json").exists())
+            self.assertTrue((transcript_dir / "real_lecture.quality.json").exists())
+            self.assertFalse((transcript_dir / "orphan.quality.json").exists())
 
     def test_rotate_logs_script_is_dry_run_by_default(self) -> None:
         module = _load_module("rotate_logs_script", REPO_ROOT / "scripts" / "rotate_logs.py")

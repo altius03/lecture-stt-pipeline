@@ -80,7 +80,7 @@ launchctl kickstart -k "gui/$uid/com.geonha.lecture-stt-distribute"
 2. 안정 시간 이후 worker가 처리 대상으로 인식한다.
 3. 원본은 `01_audio`로 이동/보관된다.
 4. raw transcript는 `02_transcripts`에 `{stem}.txt`와 `{stem}.json`으로 생성된다.
-5. 품질 metadata가 있으면 `{stem}.quality.json` sidecar도 함께 생성된다. 이 파일은 score/health/metrics/timings/model/artifact path만 담고 transcript 본문이나 segment 배열은 담지 않는다.
+5. 품질 metadata가 있으면 `{stem}.quality.json` sidecar도 함께 생성된다. 이 파일은 score/health/metrics/timings/model/artifact path만 담고 transcript 본문이나 segment 배열은 담지 않는다. 운영 패널의 transcript count와 cleanup retention은 이 sidecar를 별도 전사 건수로 세지 않고 `{stem}.txt`/`{stem}.json`과 같은 transcript set으로 취급한다.
 6. 사용자가 검토한 correction은 `03_correction`에 둔다.
 7. summary는 `04_summarize`에 둔다.
 8. downstream worker가 GH archive/Obsidian 목적지로 배포한다.
@@ -210,6 +210,7 @@ Launchd stdout/stderr rotation dry-run:
 - legacy `/Users/geonha/lecture_stt`는 존재하지만 read-only inventory만 했고 cleanup/delete apply는 하지 않았다.
 - repo 안 empty runtime folders는 placeholder로 유지한다.
 - repo-local stale tmp/log/archive 후보와 iCloud audio/transcript cleanup 후보는 dry-run/list만 했고 apply하지 않았다.
+- Transcript cleanup retention은 `{stem}.txt`, `{stem}.json`, `{stem}.quality.json`을 한 transcript set으로 묶어 판단한다. `retain_min_transcripts`는 파일 개수가 아니라 primary transcript set 개수 기준이며, apply 시 sidecar만 남거나 primary transcript만 삭제되는 상태가 되지 않도록 함께 보존/정리한다. Orphan-only `{stem}.quality.json`은 최소 보존 슬롯을 소비하지 않는다.
 
 관련 이력/rollback 문서:
 

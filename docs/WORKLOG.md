@@ -15,6 +15,7 @@
 - Downstream live status remains total rows `152`, problem rows `4` (`INVALID_STEM=3`, `CONFLICT=1` for preserved `260422LC`). These are existing manual/document-only rows and were not mutated.
 - After code changes, only the named launchd jobs `com.geonha.lecture-stt` and `com.geonha.lecture-stt-distribute` were restarted; `com.geonha.lecture-stt`, `com.geonha.lecture-stt-distribute`, and `com.geonha.lecture-stt-webpanel` are running, while cleanup remains a calendar/on-demand job.
 - Final local verification report was written under gitignored `state/reports/final-verification-20260520T000551Z`: unittest discovery `115` tests OK, compileall OK, `git diff --check` OK, DB `integrity_check=ok`, and downstream problem rows remained `4`.
+- Independent review of pushed commit `8312890` found no blockers. As a follow-up TDD hardening, the web panel transcript count now ignores `<stem>.quality.json` sidecars and orphan scorecards, and cleanup retention groups `<stem>.txt`, `<stem>.json`, and `<stem>.quality.json` as one transcript set so `retain_min_transcripts` preserves/deletes sidecars with their primary transcript artifacts. Orphan-only scorecards do not consume `retain_min_transcripts` slots.
 
 ## 2026-05-19
 
