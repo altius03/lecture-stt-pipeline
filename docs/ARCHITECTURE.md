@@ -10,6 +10,7 @@
 - `src/`: 애플리케이션 본체
 - `frontend/`: React 웹 패널 소스(Vite 기반)
 - `scripts/`: 수동 실행, 설치, 운영 보조 스크립트
+- `scripts/hermes_postprocess/`: Hermes cron/operator용 repo-local 후보 discovery, prompt loading, validator, review-only misrecognition queue, staging manifest, explicit promote helper
 - `launchd/`: macOS launchd 서비스 정의
 - `config/`: YAML 설정
 - `tests/`: downstream 배포 계층 테스트
@@ -81,6 +82,18 @@
 - pause/resume는 별도 IPC 대신 `state/paused` 플래그 파일로 제어한다.
 - Tk 기반 구형 GUI는 제거했고, 운영 제어면은 웹 패널로 단일화한다.
 
+## Hermes postprocess operator package
+- `scripts/hermes_postprocess/`는 앱 내부 LLM provider를 되살리지 않고 Hermes cron/operator 계층에서 쓸 결정적 보조 기능만 제공한다.
+- `dry-run` CLI는 `02_transcripts`의 txt/json pair 중 final correction/summary가 완성되지 않은 stem 하나를 metadata-only JSON으로 반환한다. raw transcript body와 segment 배열은 stdout/report에 싣지 않는다.
+- `paths.py`는 `02_transcripts`, `03_correction`, `04_summarize`, `05_prompt`, repo-local `state/hermes_postprocess/{staging,claims}` 경로를 계산하고 subject code를 longest-match로 추출한다.
+- `prompts.py`는 existing iCloud `05_prompt/00_base_prompt.txt`, `01_common_glossary.txt`, 선택 subject glossary를 source of truth로 로드한다.
+- `validators.py`는 correction JSON의 segment count, `id/start/end`, 전체 JSON key/order/array 구조, non-`text` metadata 보존, final overwrite 금지, summary required headings 및 `summary_too_short` guardrail을 검증한다.
+- `misrecognitions.py`는 교정 중 발견한 짧은 오인식 후보 phrase를 repo-local `state/hermes_postprocess/misrecognitions/pending.jsonl`에 dedupe append한다. raw transcript excerpt/context와 `05_prompt` 자동 변경은 금지한다.
+- `staging.py`는 metadata-only `manifest.json`과 explicit promote 인터페이스를 제공한다. Promote는 기본적으로 `promote_disabled`를 반환하며, `--allow-promote`가 없으면 final 경로에 쓰지 않는다. 허용된 promote도 candidate destination path를 재계산해 검증하고 validator를 재실행한 뒤 exclusive no-overwrite copy와 hash-checked rollback을 사용한다.
+- 이 패키지는 Gate A/B 개발·dry-run 검증 범위에서 시작했으며 cron 등록, launchd 변경, iCloud final write 운영 활성화는 별도 Gate C+ 승인 전 금지한다.
+- 2026-05-20 후속 승인으로 live stem `260504DS_1` 1건의 content staging, validation, Gate C+ promote canary를 수행했고, script-only Hermes cron job `lecture_stt_postprocess_operator`를 등록했다. Cron은 `state/hermes_postprocess/cron-baseline.json`의 activation-time backlog skip list를 사용해 기존 backlog를 건너뛰며, no-candidate일 때 stdout/delivery 없이 조용히 종료한다.
+- `--lecture-root`는 iCloud가 아니어도 된다. 같은 폴더 구조의 local canary root를 넘기면 postprocess helper는 완전히 로컬에서 동작한다. iCloud는 현재 실제 transcript/prompt 정본 위치라 Gate B에서 read-only inventory 대상으로만 사용한다.
+
 ## Downstream 배포 파이프라인
 - API-backed 자동 correction provider는 현재 비활성화되어 있으며, `src/lecture_stt/correction/worker.py`는 `02_transcripts`의 pending pair를 manual correction 대기 상태로만 보고한다.
 - `CorrectionConfig`에는 API key/model/max token 필드가 없고, `correction.mode: manual`을 기본 운영 모드로 둔다.
@@ -111,6 +124,7 @@
 - `scripts/benchmark_models.py`: baseline/current model과 승인된 후보 STT 모델을 비교하는 benchmark CLI 초안
 - `scripts/setup_launchd.sh`: venv, 의존성, 모델, 폴더, launchd를 한 번에 설정
 - `scripts/cleanup.py`: 오래된 audio/transcript/tmp 정리
+- `scripts/hermes_postprocess/`: Hermes postprocess operator CLI. `python3 -m scripts.hermes_postprocess dry-run`으로 metadata-only 후보 discovery를 수행하고, `validate-correction`, `validate-summary`, `record-misrecognitions`, `promote` subcommand를 제공한다. Promote는 `--allow-promote` 없이는 final write를 하지 않는다.
 - `launchd/com.geonha.lecture-stt.plist`: 메인 워커 상시 실행
 - `launchd/com.geonha.lecture-stt-webpanel.plist`: 웹 제어판 상시 실행
 - `launchd/com.geonha.lecture-stt-distribute.plist`: downstream 워커 상시 실행
@@ -133,6 +147,7 @@
 - `tests/test_stt_main.py`: pause/resume/status control command, STT retry/failure, quality scorecard sidecar 회귀 테스트
 - `tests/test_web_panel.py`: 웹 제어판 종료 동작 회귀 테스트
 - `tests/test_web_panel_state.py`: React 친화형 snapshot 계약과 로그 stream reset 회귀 테스트
+- `tests/test_hermes_postprocess.py`: Hermes postprocess candidate discovery, action plan, path resolution, raw-body leak prevention, prompt loader, staging manifest, review-only misrecognition queue, promote safety/rollback/path validation, correction/summary validators
 - `src/lecture_stt/stt/transcribe.py`는 아직 자동 테스트가 없다.
 
 ## 유지 규칙
