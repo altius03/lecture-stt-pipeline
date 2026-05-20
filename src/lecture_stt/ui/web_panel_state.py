@@ -677,7 +677,7 @@ class ControlState:
 
     @staticmethod
     def _count_transcript_sets(path: Path) -> str:
-        """transcript 폴더의 txt+json 2파일을 1쌍으로 세어 실제 전사 건수를 반환한다."""
+        """transcript 폴더의 주 전사 산출물(txt/json)을 기준으로 실제 전사 건수를 반환한다."""
         if not path:
             return "-"
         if not path.exists() or not path.is_dir():
@@ -686,11 +686,14 @@ class ControlState:
             stems = set()
             for item in path.iterdir():
                 if (
-                    item.is_file()
-                    and not item.name.startswith(".")
-                    and not item.name.startswith("~")
+                    not item.is_file()
+                    or item.name.startswith(".")
+                    or item.name.startswith("~")
+                    or item.name.endswith(".quality.json")
+                    or item.suffix not in {".txt", ".json"}
                 ):
-                    stems.add(item.stem)
+                    continue
+                stems.add(item.stem)
             return str(len(stems))
         except Exception:
             return "오류"

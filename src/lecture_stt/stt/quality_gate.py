@@ -4,13 +4,20 @@ segments는 dict 리스트: seg["text"] (NOT seg.text)
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 import zlib
 from dataclasses import dataclass
-from typing import List
+from pathlib import Path
+from typing import Any, List, Mapping
+
+from lecture_stt.shared import utils
 
 logger = logging.getLogger(__name__)
+
+QUALITY_SCORECARD_SCHEMA_VERSION = 1
+QUALITY_SCORECARD_KIND = "lecture_stt_quality_scorecard"
 
 
 @dataclass
@@ -44,6 +51,140 @@ class QualityReport:
             "health": self.health,
             "summary": self.summary,
         }
+
+
+def quality_scorecard_path(transcript_json_path: str | Path) -> Path:
+    """Return the sidecar path for a transcript JSON quality scorecard."""
+    path = Path(transcript_json_path)
+    return path.with_name(f"{path.stem}.quality.json")
+
+
+def _copy_present(mapping: Mapping[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
+    return {key: mapping[key] for key in keys if key in mapping and mapping[key] is not None}
+
+
+def build_quality_scorecard(
+    metadata: Mapping[str, Any],
+    *,
+    transcript_json_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Build a metadata-only quality scorecard without transcript body/segments."""
+    quality = metadata.get("quality")
+    if not isinstance(quality, Mapping):
+        raise ValueError("metadata missing quality report")
+    for key in ("quality_score", "health", "summary"):
+        if key not in quality:
+            raise ValueError(f"metadata quality report missing {key}")
+
+    artifacts = _copy_present(
+        metadata,
+        ("canonical_audio_path", "transcript_txt_path", "transcript_json_path"),
+    )
+    if transcript_json_path is not None:
+        artifacts["transcript_json_path"] = str(Path(transcript_json_path))
+    artifacts = {key: str(value) for key, value in artifacts.items()}
+
+    metrics = _copy_present(
+        quality,
+        (
+            "total_segments",
+            "empty_segments",
+            "dot_noise_segments",
+            "short_segments",
+            "rep_mass",
+            "avg_segment_length",
+            "empty_ratio",
+            "dot_noise_ratio",
+            "short_segment_ratio",
+        ),
+    )
+    model = _copy_present(
+        metadata,
+        (
+            "engine",
+            "model_size",
+            "device",
+            "compute_type",
+            "language",
+            "task",
+            "beam_size",
+            "vad_filter",
+            "word_timestamps",
+            "condition_on_previous_text",
+            "keep_model_loaded",
+        ),
+    )
+
+    return {
+        "schema_version": QUALITY_SCORECARD_SCHEMA_VERSION,
+        "kind": QUALITY_SCORECARD_KIND,
+        "canonical_base": str(metadata.get("canonical_base") or ""),
+        "orig_name": str(metadata.get("orig_name") or ""),
+        "health": str(quality["health"]),
+        "quality_score": int(quality["quality_score"]),
+        "summary": str(quality["summary"]),
+        "metrics": metrics,
+        "timings": dict(metadata.get("timings") or {}),
+        "model": model,
+        "artifacts": artifacts,
+    }
+
+
+def write_quality_scorecard(transcript_json_path: str | Path, metadata: Mapping[str, Any]) -> Path:
+    """Write the sidecar quality scorecard and return its path."""
+    path = quality_scorecard_path(transcript_json_path)
+    utils.atomic_write(path, build_quality_scorecard(metadata, transcript_json_path=transcript_json_path))
+    return path
+
+
+def _contains_forbidden_scorecard_key(value: Any) -> bool:
+    forbidden_keys = {"segments", "transcript_text", "transcript_body", "transcript"}
+    if isinstance(value, Mapping):
+        for key, nested in value.items():
+            if str(key) in forbidden_keys:
+                return True
+            if _contains_forbidden_scorecard_key(nested):
+                return True
+    elif isinstance(value, list):
+        return any(_contains_forbidden_scorecard_key(item) for item in value)
+    return False
+
+
+def validate_quality_scorecard(transcript_json_path: str | Path, metadata: Mapping[str, Any]) -> None:
+    """Validate that the quality scorecard exists and matches transcript metadata."""
+    path = quality_scorecard_path(transcript_json_path)
+    if not path.exists():
+        raise FileNotFoundError("Missing quality scorecard output file after write")
+
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            scorecard = json.load(handle)
+    except json.JSONDecodeError as exc:
+        raise ValueError("Quality scorecard is not valid JSON") from exc
+    if not isinstance(scorecard, dict):
+        raise ValueError("Quality scorecard payload is not a dict")
+    if _contains_forbidden_scorecard_key(scorecard):
+        raise ValueError("Quality scorecard must be metadata-only")
+
+    expected = build_quality_scorecard(metadata, transcript_json_path=transcript_json_path)
+    for key in (
+        "schema_version",
+        "kind",
+        "canonical_base",
+        "orig_name",
+        "health",
+        "quality_score",
+        "summary",
+    ):
+        if scorecard.get(key) != expected[key]:
+            raise ValueError(f"Quality scorecard {key} does not match transcript metadata")
+
+    artifacts = scorecard.get("artifacts")
+    if not isinstance(artifacts, dict):
+        raise ValueError("Quality scorecard missing artifacts object")
+    for key, expected_value in expected["artifacts"].items():
+        if str(artifacts.get(key)) != str(expected_value):
+            raise ValueError(f"Quality scorecard artifact {key} does not match transcript metadata")
 
 
 def _compression_ratio(text: str) -> float:

@@ -92,28 +92,58 @@ def _cleanup_audio(audio_dir: Path, cutoff_ts: float, dry_run: bool) -> tuple[in
     return deleted, kept
 
 
+def _is_quality_scorecard(path: Path) -> bool:
+    return path.name.endswith(".quality.json")
+
+
+def _is_primary_transcript_artifact(path: Path) -> bool:
+    return not _is_quality_scorecard(path) and path.suffix in {".txt", ".json"}
+
+
+def _transcript_artifact_stem(path: Path) -> str:
+    # 품질 scorecard는 <stem>.quality.json 형식이라 Path.stem만 쓰면 stem이 달라진다.
+    if _is_quality_scorecard(path):
+        return path.name[: -len(".quality.json")]
+    return path.stem
+
+
 def _cleanup_transcripts(transcript_dir: Path, cutoff_ts: float, dry_run: bool, min_keep: int) -> tuple[int, int]:
-    # 유지할 최소 개수를 제외하고 오래된 트랜스크립트만 정리한다.
+    # 유지할 최소 전사 세트 수를 제외하고 오래된 트랜스크립트 세트(txt/json/quality)를 정리한다.
     if not transcript_dir.exists():
         return 0, 0
     if not transcript_dir.is_dir():
         raise ValueError(f"Transcript path is not a directory: {transcript_dir}")
 
-    files = [entry for entry in transcript_dir.iterdir() if entry.is_file()]
-    files.sort(key=lambda item: item.stat().st_mtime, reverse=True)
-    keep_paths = set(files[:min_keep]) if min_keep > 0 else set()
+    grouped: dict[str, list[Path]] = {}
+    for entry in transcript_dir.iterdir():
+        if not entry.is_file():
+            continue
+        _assert_under_base(entry, transcript_dir)
+        grouped.setdefault(_transcript_artifact_stem(entry), []).append(entry)
+
+    groups = sorted(
+        grouped.values(),
+        key=lambda group: max(item.stat().st_mtime for item in group),
+        reverse=True,
+    )
+    primary_groups = [
+        group for group in groups if any(_is_primary_transcript_artifact(item) for item in group)
+    ]
+    keep_groups = primary_groups[:min_keep] if min_keep > 0 else []
+    keep_paths = {item for group in keep_groups for item in group}
 
     deleted = 0
     kept = len(keep_paths)
-    for item in files:
-        _assert_under_base(item, transcript_dir)
-        if item in keep_paths:
-            continue
-        if item.stat().st_mtime < cutoff_ts:
-            if _delete_path(item, dry_run):
-                deleted += 1
-            continue
-        kept += 1
+    for group in groups:
+        group_mtime = max(item.stat().st_mtime for item in group)
+        for item in group:
+            if item in keep_paths:
+                continue
+            if group_mtime < cutoff_ts:
+                if _delete_path(item, dry_run):
+                    deleted += 1
+                continue
+            kept += 1
 
     return deleted, kept
 
@@ -196,8 +226,8 @@ def main() -> None:
 
     print(
         f"audio removed={removed_audio}, kept={kept_audio}, "
-        f"tmp removed={removed_tmp}, transcript removed={removed_transcript}, "
-        f"transcripts kept(min={min_transcripts})={kept_transcript}",
+        f"tmp removed={removed_tmp}, transcript files removed={removed_transcript}, "
+        f"transcript files kept(min_sets={min_transcripts})={kept_transcript}",
     )
 
 

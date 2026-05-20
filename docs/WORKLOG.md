@@ -3,7 +3,134 @@
 이 파일은 저장소에 반영된 변경을 날짜순으로 누적 기록한다.
 최신 항목을 위에 추가한다.
 
+## 2026-05-20
+
+### Repository README and structure cleanup
+- Replaced the stale root README with the current `/Users/geonha/DEV/lecture_stt` operating path, remote/branch/CI summary, repository tree, runtime-data boundary, common commands, Hermes postprocess operator entrypoints, documentation priority, and safety rules. The README no longer uses the archived `/Users/geonha/lecture_stt` path for active commands.
+- Cleaned repository ignore policy by consolidating duplicate `.gitignore` entries and adding explicit root-level ignores for legacy local runtime folders (`/audio/`, `/inbox/`, `/transcripts/`, `/errors/`) plus generated frontend artifacts and `/src/logs/`.
+- Removed the obsolete tracked root `correct_unix.py` one-off hard-coded Unix correction script. Current correction/summary automation lives under `scripts/hermes_postprocess/` with metadata-only staging, validators, explicit promote, and no raw transcript body in reports.
+- Removed local-only ignored clutter from the working tree: `.DS_Store` files, Python `__pycache__/` directories, stale `.bak` files, generated TypeScript build-info/Vite JS artifacts, empty legacy local runtime folders, and stale `src/logs/app.log`. This did not remove `.venv/`, `node_modules/`, `frontend/web-panel/dist/`, `state/`, `models/`, local `config/config.yaml`, or any iCloud/GH archive/Obsidian runtime payload.
+- Updated `docs/ARCHITECTURE.md` to reflect the current 2026-05-20 top-level structure, gitignored runtime boundary, active Hermes operator status, and broadened test coverage.
+- Verification passed with static added-line security scan (`0` findings), `git diff --check`, `PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v` (`139` tests), `.venv/bin/python -m compileall -q scripts tests src`, frontend `npm test -- --run` (`21` tests), frontend `npm run build`, and independent pre-commit review with no blockers.
+
+### Hermes postprocess operator Phase 2~4 repo-local implementation
+- Added the repo-local Hermes postprocess helper package under `scripts/hermes_postprocess/` with metadata-only candidate discovery, prompt loading from the existing `05_prompt` surface, canonical path resolution, output contract schemas, correction/summary validators, review-only misrecognition candidate accumulation, metadata-only staging manifest support, and an explicit promote interface that is disabled unless `--allow-promote` is passed. The promote path now also validates candidate destination paths, re-runs deterministic validators before final writes, uses exclusive no-overwrite file creation, and rolls back files created earlier in the same promote attempt after hash verification if a later copy fails.
+- Candidate discovery processes at most one stem per tick and reports only metadata/action-plan fields. It does not print raw transcript bodies or segment arrays. Summary-only candidates can use an existing final correction pair; blocked candidates such as partial final correction output are refused before promote.
+- Added operator docs under `docs/operators/hermes-postprocess/`: README, runbook, correction prompt policy, summary prompt policy, output contract, failure policy, and cron prompt source. The docs keep iCloud `lecture_recordings/05_prompt` as the correction prompt source of truth and keep cron/promote/iCloud final writes behind later approval gates.
+- After later approval in the same session, ran a content staging canary for live stem `260504DS_1`, validated staged correction/summary artifacts, and promoted exactly that one staged candidate to iCloud final paths without overwrite. The metadata-only promote report verified source/final existence, size, and SHA-256 matches for `03_correction/260504DS_1.txt`, `03_correction/260504DS_1.json`, and `04_summarize/260504DS_1.md`; raw transcript and generated bodies were not copied into reports.
+- Registered active Hermes script-only cron job `lecture_stt_postprocess_operator` (`job_id=977667876027`, `every 30m`, `workdir=/Users/geonha/DEV/lecture_stt`, `script=lecture_stt_postprocess_operator.py`, `no_agent=true`, delivery `discord:#운영-보안`). The wrapper records an activation baseline in `state/hermes_postprocess/cron-baseline.json` and skips those backlog stems, processing only future candidates; direct wrapper and scheduled run verification showed no-candidate stdout remains empty.
+- Added fixture-based tests in `tests/test_hermes_postprocess.py` for candidate selection, action planning, path resolution, raw-body leak prevention, prompt loading, staging manifest privacy, review-only misrecognition queue append/dedupe, invalid raw-excerpt rejection without echoing raw values, promote safety, final overwrite prevention, summary-only promote, blocked candidate refusal, candidate destination tamper rejection, stale pass-report revalidation, promote rollback, unresolved `${LECTURE_RECORDINGS_ROOT}` config placeholders, and validator failures such as `segment_metadata_changed`, `correction_non_text_metadata_changed`, and `summary_too_short`.
+- Verification passed with `PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v` (`138` tests), `.venv/bin/python -m unittest tests.test_hermes_postprocess -v` (`20` tests), `.venv/bin/python -m compileall -q scripts tests src`, `git diff --check`, added-line static scan (`0` findings), and explicit read-only iCloud candidate discovery via `PYTHONPATH=src .venv/bin/python -m scripts.hermes_postprocess dry-run --lecture-root "/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings" --repo-root /Users/geonha/DEV/lecture_stt --stable-for-sec 60`. The live dry-run returned candidate stem `260504DS_1` with correction and summary both needed; it wrote no iCloud final artifacts.
+- Not performed: launchd changes, existing-output overwrite, bulk backlog processing, `05_prompt` automatic edits, cleanup/delete/move, Hermes provider/privacy changes, push/tag/release.
+
+### Approved downstream cleanup, runtime archive cleanup, and CI bootstrap
+- Resumed the approved overnight closeout from live state rather than handoff assumptions: `main` and `origin/main` were both at `6392762`, the worktree was clean before this batch, GitHub Actions runs for `main` were still `[]`, DB `integrity_check` was `ok`, `foreign_key_check` was empty, STT jobs were `DONE=31` / `ERROR=1`, and downstream started at total rows `152` with problem rows `4`.
+- The remaining downstream problem rows were resolved without overwriting destination content or deleting source evidence. A DB backup was written to `state/reports/downstream-resolve-20260520T014011Z/jobs-before-downstream-resolve.sqlite3`, invalid/manual source artifacts were moved to iCloud manual review archive `lecture_recordings/90_manual_review/downstream-excluded-20260520T014011Z`, and the four delivery rows were removed from tracking after manifesting their before state. Follow-up summary reported total rows `148`, problem rows `0`, correction `DELIVERED=148`, and summary `DELIVERED=126` / `MISSING=22`.
+- Runtime cleanup was applied in preserve-first mode. Instead of permanent raw deletion, `469` old raw candidates (`01_audio=158`, `02_transcripts=311`, about `8.24GB`) were moved to iCloud `lecture_recordings/90_cleanup_archive/cleanup-20260520T014307Z`; repo-local tmp/log/state-log payloads and legacy `/Users/geonha/lecture_stt` were moved to `~/Library/Application Support/lecture_stt/cleanup_archives/cleanup-20260520T014307Z`. Post-cleanup `cleanup.py --apply` and dry-run both reported no remaining removal candidates beyond the preserved `inbox_staging`; launchd stdout/stderr rotation apply found all active logs under threshold and left them unchanged.
+- Added `.github/workflows/ci.yml` because the repo still had no Actions workflow/run history. The workflow runs Python dependency install, unittest discovery, compileall, and web-panel `npm test` / `npm run build` on push, pull request, or manual dispatch. Local workflow YAML parsing, web-panel tests, and web-panel build passed before the final verification batch. Stale 2026-05-19 decision-guide wording was marked as superseded by the 2026-05-20 closeout results.
+- Final local verification report was written under gitignored `state/reports/final-closeout-verification-20260520T015436Z`: `git diff --check` OK, workflow YAML parse OK, unittest discovery `118` tests OK, compileall OK, web-panel `21` tests OK, web-panel build OK, DB `integrity_check=ok`, `foreign_key_check=[]`, downstream problem rows `0`, and STT/downstream/webpanel launchd jobs active.
+- First remote GitHub Actions run for commit `3d5925c` created the new `CI` workflow but failed because `tests/test_script_entrypoints.py` assumed repo-local `.venv/bin/python`, which does not exist on the GitHub runner. The test harness was made CI-portable by falling back to `sys.executable` when `.venv` is absent; follow-up local verification report `state/reports/ci-fix-verification-20260520T020333Z` passed targeted regression, unittest discovery, compileall, web-panel tests/build, DB integrity/FK, and downstream problem row checks before the fix push.
+
+### Real lecture canary scorecard and downstream routine log-noise closeout
+- Next real lecture canary `260504DS_2` was observed through the installed launchd-backed worker as job `203` and reached terminal `DONE`. Expected artifacts exist under iCloud `01_audio/260504DS_2.m4a` and `02_transcripts/260504DS_2.txt` / `.json`; canonical STT model remained `large-v3` with runtime package `faster-whisper==1.2.1`.
+- The canary is an immediate operational pass, but its metadata quality report is `warn` with score `61/100` because repetition ratio is high. This is recorded as a quality-review note, not an infrastructure failure. Raw transcript text is not recorded in docs or reports.
+- Added metadata-only quality scorecard sidecar support: future STT jobs, including duplicate-result replay jobs, whose transcript metadata contains a quality report now atomically write `02_transcripts/<stem>.quality.json` with `schema_version`, `kind`, `canonical_base`, `health`, `quality_score`, `summary`, metrics, timings, model fields, and artifact paths. Output validation now also parses the sidecar, enforces the metadata-only contract, and checks schema/kind plus key artifact links. The sidecar deliberately excludes transcript body and segment arrays.
+- `_validate_output_files()` now treats a missing or malformed quality sidecar as an output validation failure when transcript metadata includes quality information. The already-completed job `203` predates this code path, so `260504DS_2.quality.json` was not created during the original run; it was backfilled later in the remaining-item follow-up below.
+- Tightened downstream routine logging: by default, routine `scan_started` is not written to stdout or JSONL, and routine scan stats/stdout plus routine `scan_completed` JSONL entries are suppressed unless stats change or the bounded heartbeat emits `suppressed_scan_count`. Problem events and opt-in `log_routine_scan_events=True` remain available.
+- Runtime cleanup stayed conservative. Dry-run report `state/reports/runtime-cleanup-20260519T153859Z` found broad audio/transcript deletion candidates, so no cleanup apply, source deletion, transcript deletion, DB clear, or destination overwrite was performed. Launchd log rotation dry-run found no apply-needed files.
+- Downstream live status remains total rows `152`, problem rows `4` (`INVALID_STEM=3`, `CONFLICT=1` for preserved `260422LC`). These are existing manual/document-only rows and were not mutated.
+- After code changes, only the named launchd jobs `com.geonha.lecture-stt` and `com.geonha.lecture-stt-distribute` were restarted; `com.geonha.lecture-stt`, `com.geonha.lecture-stt-distribute`, and `com.geonha.lecture-stt-webpanel` are running, while cleanup remains a calendar/on-demand job.
+- Final local verification report was written under gitignored `state/reports/final-verification-20260520T000551Z`: unittest discovery `115` tests OK, compileall OK, `git diff --check` OK, DB `integrity_check=ok`, and downstream problem rows remained `4`.
+- Independent review of pushed commit `8312890` found no blockers. As a follow-up TDD hardening, the web panel transcript count now ignores `<stem>.quality.json` sidecars and orphan scorecards, and cleanup retention groups `<stem>.txt`, `<stem>.json`, and `<stem>.quality.json` as one transcript set so `retain_min_transcripts` preserves/deletes sidecars with their primary transcript artifacts. Orphan-only scorecards do not consume `retain_min_transcripts` slots.
+- Remaining-item follow-up: `260504DS_2.quality.json` was backfilled with metadata-only content and validated; downstream problem rows were re-diagnosed into `state/reports/downstream-diagnose-20260520T010747Z.json` plus manual action table `state/reports/downstream-manual-actions-20260520T010747Z.{json,csv}` with no deterministic automatic repair available; cleanup was re-run as dry-run only under `state/reports/runtime-cleanup-20260520T011046Z` and not applied because it would remove broad raw audio/transcript artifacts; a silent hourly stability monitor was installed for the 24h/next-2-lectures gate and will report only state changes, alerts, or PASS.
+
 ## 2026-05-19
+
+### Post-final docs 정합성 및 downstream manual table
+- Read-only baseline에서 `main`/`origin/main`이 `48be5a4`로 일치하고 worktree clean, DB `integrity_check=ok`, STT jobs `DONE=30`, `ERROR=1`임을 확인했다.
+- 현재 runtime 적용 상태에 맞춰 `docs/OPERATIONS.md`, `docs/MODELS.md`, `docs/RUNTIME_MIGRATION_PLAN_2026-05-19.md`의 stale pre-execution wording을 정리했다.
+- 현재 production `.venv`와 `requirements.txt`는 `faster-whisper==1.2.1`이며, canonical STT model은 계속 `large-v3`임을 문서에 재확인했다.
+- Downstream problem rows는 total `4`로, `INVALID_STEM` 3건과 document-only `260422LC` 1건만 남아 있다. 파일별 판단용 report는 `state/reports/downstream-manual-table-20260519T131110Z.json` 및 `.csv`에 생성했다.
+- Runtime cleanup은 계속 dry-run/list 상태만 유지한다. DB/file/config/launchd/package/model 변경, cleanup apply, push/tag/release는 수행하지 않았다.
+
+### Final downstream cleanup, preserved failure evidence, runtime cleanup dry-run
+- Later explicit execution request에 따라 남은 downstream problem 16건 중 safe 자동 수리 가능한 항목을 백업 후 적용했다. Backup은 `state/backups/downstream-repair-20260519T123211Z`, manifest는 `state/reports/downstream-repair-apply-20260519T123211Z.json`이다.
+- Source canonical/rename-needed correction pair 9건은 canonical stem으로 rename했고 downstream worker가 처리해 9건 모두 `DELIVERED`가 됐다. DB-only stale rows `zztest`, `test123`, `tmp_260330DStr_2`는 backup 후 삭제했다.
+- 정책상 보존 대상인 `260422LC`는 그대로 두었다. 남은 downstream problem rows는 invalid/manual review 3건과 document-only conflict 1건이다.
+- Canary 실패 job `201`은 terminal `ERROR` DB row와 `99_errors/260519OOP_1.m4a`를 증거로 보존했다. 관련 stale tmp wav는 backup 후 제거했고 report는 `state/reports/stt-error-cleanup-20260519T123547Z.json`이다.
+- Runtime cleanup은 destructive apply 없이 dry-run/list만 수행했다. Report directory는 `state/reports/runtime-cleanup-20260519T123847Z`이며 repo-local stale tmp 6 files, legacy root `/Users/geonha/lecture_stt`, repo/state/runtime logs inventory를 기록했다. iCloud audio/transcript bulk deletion과 log/archive prune은 적용하지 않았다.
+- canonical STT model은 계속 `large-v3`다.
+
+### Runtime migration, VAD compatibility fix, launchd canary 완료
+- 승인된 runtime migration을 적용해 STT tmp는 `~/Library/Caches/lecture_stt/tmp`, STT/downstream/webpanel/cleanup launchd stdout/stderr와 app/downstream logs는 `~/Library/Logs/lecture_stt`로 이동했다. DB는 계속 repo 내부 `state/jobs.sqlite3`에 유지한다.
+- migration backup은 `state/backups/runtime-migration-20260519T114522Z`에 보존했다. post-migration log rotation은 dry-run만 수행했고 결과는 `state/reports/log-rotation-post-migration-dry-run-20260519T114610Z.txt`에 남겼다.
+- runtime package workstream 결과로 production `.venv`와 `requirements.txt`는 `faster-whisper==1.2.1`로 정렬됐다. 이는 package-only 변경이며 canonical STT model은 계속 `large-v3`다.
+- 1차 copied canary `260519OOP_1`은 launchd가 처리했지만 현재 `faster-whisper`의 `VadOptions` API가 `onset/offset` 대신 `threshold`를 받는 차이로 job `201`이 terminal `ERROR`가 됐다. 실패 row와 `99_errors/260519OOP_1.m4a`는 증거로 보존하고 정리하지 않았다.
+- 회귀 테스트를 먼저 추가한 뒤 `STTWorker` VAD parameter builder가 faster-whisper 1.1/1.2 계열 signature를 모두 지원하도록 수정했다.
+- 승인 후 `com.geonha.lecture-stt`만 kickstart 재시작했고, 2차 copied canary `260519OOP_2`는 job `202`로 `DONE` 처리됐다. 산출물은 `01_audio/260519OOP_2.m4a`, `02_transcripts/260519OOP_2.txt`, `02_transcripts/260519OOP_2.json`이며 preview는 `컴퓨터공학 전공 수업입니다.`다.
+- canary report는 `state/reports/canary-20260519T120017Z.json`에 저장했다. 처리 시간은 total `7.93s`, transcribe `7.87s`, 관찰 elapsed `110.1s`였다.
+- 최종 verification은 `state/reports/verification-unittest-20260519T121554Z.log` 기준 unittest 108개 통과, compileall 통과, `git diff --check` 통과, added-line static scan finding 0건이다. 2차 독립 review도 blocking issue 없이 통과했다.
+
+### 남은 고도화 사용자 결정 반영
+- 사용자가 지정한 `C/D/R/L/P/B/O` 결정값을 `.hermes/plans/2026-05-19_160615-lecture-stt-remaining-hardening.md`의 `User Decision Snapshot`에 반영했다.
+- 결정 경계는 read-only/dry-run 우선, canary 선행, downstream은 report/manual table만, runtime migration은 canary 이후, log cleanup은 dry-run/manifest만, benchmark 확대는 보류로 정리했다.
+- `P1=2`, `P2=2`, `P3=3`에 따라 `faster-whisper==1.2.1`은 production `.venv` upgrade 후보로 계획/rollback까지 검토하되, 실제 package 변경은 별도 승인 전 금지로 명시했다.
+- canonical STT model은 계속 `large-v3`로 유지하며, DB/file/config/launchd/package/model 변경, local commit, push/tag/release는 수행하지 않았다.
+
+### 남은 고도화 업무 결정 가이드 추가
+- 최초 고도화 계획에서 남은 canary, downstream 정리, runtime path migration, log cleanup, runtime package update, benchmark 확대, 문서/commit 정책 결정을 한 번에 검토할 수 있는 `docs/REMAINING_HARDENING_DECISION_GUIDE_2026-05-19.md`를 추가했다.
+- canary, launchd, downstream, canonical, hash-conflict, route/rename-needed, dry-run/apply, runtime path migration, copytruncate, `.venv`, benchmark 같은 운영 용어를 사용자 결정용으로 풀어 설명했다.
+- 이 문서는 의사결정 보조 자료이며, DB/file/config/launchd/package/git remote에 대한 실제 변경 승인은 포함하지 않는다.
+
+### Pre-commit review blocker fixes
+- 독립 리뷰에서 지적된 3개 blocker를 TDD로 재현한 뒤 수정했다.
+- secret redaction은 `Authorization: Bearer ...`, `authorization=Bearer ...`, JWT-like token, `sk-...` 표면을 모두 `[REDACTED]` 처리하도록 보강했다.
+- launchd plain log rotation은 active fd가 열린 상태에서도 정책이 맞도록 rename+touch 대신 copytruncate 방식으로 바꿨다.
+- PROCESSING 상태에서 죽은 retry job은 `engine_params.transcription_failures/transcription_max_retries`를 기준으로 `전사 재시도 대기 n/max`를 복원해 다음 scan에서 즉시 재시도되게 했다.
+- 관련 regression test 3개를 추가했고 전체 unittest/compileall/diff-check가 통과했다.
+
+### Launchd canary readiness read-only 점검
+- launchd read-only check에서 `com.geonha.lecture-stt`와 `com.geonha.lecture-stt-distribute`는 PID가 있는 running 상태로 확인했다. cleanup은 상시 PID가 없는 보조 서비스로 보이며 canary blocker로 보지 않는다.
+- DB read-only check는 `integrity_check=ok`, `foreign_key_check=[]`, job status는 `DONE=29`, `PROCESSING=0`, retry 대기 row `0`, ERROR row `0`로 확인했다.
+- downstream 기존 problem row 41건은 별도 conflict/rename 작업으로 남아 있으며, canary 중 DB clear/destination overwrite를 하지 않는 조건으로 blocker에서 제외한다.
+- 현재 inbox는 비어 있어 다음 실제 강의 1개를 canary input으로 기다릴 수 있는 상태다.
+- installed LaunchAgents와 운영 config는 아직 repo-local log/tmp path를 사용하므로, runtime path migration/restart 없이 현재 운영 기준으로 canary를 기다리는 것으로 문서화했다.
+
+### Runtime path default와 migration/rollback 계획 보강
+- macOS 표준 위치 정책에 맞춰 기본 log/tmp/cache helper를 추가했다. 기본 log는 `~/Library/Logs/lecture_stt`, 기본 tmp/cache는 `~/Library/Caches/lecture_stt/tmp`를 사용하고 DB는 repo 내부 `state/jobs.sqlite3`에 유지한다.
+- STT/downstream default config와 `config/config.example.yaml`을 위 정책에 맞춰 보강했다.
+- `docs/RUNTIME_MIGRATION_PLAN_2026-05-19.md`에 승인 전 read-only preflight, 승인 후 migration 초안, rollback 절차, 아직 하지 않는 작업을 분리해 문서화했다.
+- 운영 `config/config.yaml`, installed LaunchAgents, 기존 repo log/tmp 파일, DB에는 손대지 않았다.
+
+### Downstream conflict dry-run/report/repair flow 보강
+- `lecture_stt.downstream.status diagnose`에 live source/destination existence/hash 기반 classification을 추가했다.
+- classification은 `same-content-now`, `source-missing`, `dest-missing`, `hash-conflict`, `route/rename-needed`, `manual-review`로 나뉘며, route suffix가 붙은 stem은 proposed stem을 계산한다.
+- `diagnose --json --report-path ...`로 machine-readable dry-run report를 `state/reports/` 같은 gitignored 경로에 저장할 수 있게 했다.
+- DB-only/source-missing row clear는 `clear-stale`로 분리했다. 실제 적용은 `--yes`와 `--backup-path`가 모두 필요하며, DB backup을 만든 뒤 row 1개만 삭제한다.
+- `260422LC`는 D3 결정에 맞춰 `clear-stale`에서도 document-only 예외로 거부한다.
+- live read-only diagnose 결과는 41 problem rows로, 기존 triage와 동일하게 `260422LC`는 source-missing/document-only, 나머지는 hash conflict 또는 route/rename-needed로 분류됐다.
+- 운영 DB/file에 대한 clear, overwrite, delete, migration은 수행하지 않았다.
+
+### 로그 retention/rotation 정책 보강
+- app log와 downstream JSONL 기본 rotation 값을 확정 정책에 맞춰 10MB x 5로 맞췄다.
+- launchd stdout/stderr plain log에 대해 10MB x 3 정책을 dry-run/apply로 실행할 수 있는 `scripts/rotate_logs.py`를 추가했다. 기본은 dry-run이며, `--apply` 없이는 로그 파일을 변경하지 않는다.
+- 압축 archive(`*.gz`)는 30일 보존 기준으로 dry-run/prune 할 수 있는 공통 helper를 추가했다.
+- rotation helper, compressed archive retention, downstream 기본값, rotate script dry-run/apply 회귀 테스트를 추가했다.
+- 기존 운영 로그 archive/cleanup, launchd restart, 실제 로그 변경은 수행하지 않았다.
+
+### STT retry/failure policy 구현
+- STT 실행 실패 job을 기본 2회까지 `PENDING` + `전사 재시도 대기 n/2` 상태로 남기고, 다음 scan에서 즉시 재시도하도록 구현했다.
+- retryable job은 canonical audio를 `01_audio`에 유지하며, retry 한도 초과 시 terminal `ERROR`로 확정하고 원본 오디오는 `99_errors`로 이동한다.
+- 실패 메시지/trace/알림 payload에는 secret-like 문자열을 `[REDACTED]`로 마스킹하도록 방어 로직을 추가했다.
+- retry 상태 metadata는 DB schema migration 없이 `engine_params`의 `transcription_failures`, `transcription_max_retries`, `last_error_message`에 기록한다.
+- transient success, terminal failure, startup recovery가 retryable job을 보존하는 회귀 테스트를 추가했다.
+- 모델은 변경하지 않았고, launchd/운영 DB/iCloud 실제 artifact에는 손대지 않았다.
+
+### 운영 결정사항 정리와 OPERATIONS runbook 추가
+- 남은 고도화 workstream의 사용자 결정사항을 `.hermes/plans/2026-05-19_160615-lecture-stt-remaining-hardening.md`에 반영했다.
+- `docs/OPERATIONS.md`를 현재 운영 기준 문서로 추가했다. quick checklist와 상세 runbook을 함께 두고, downstream conflict, retry/failure, log retention, runtime path, model/package, canary 기준을 분리해 정리했다.
+- README 상단에 `docs/OPERATIONS.md` 링크와 legacy 경로 주의 문구를 추가했다.
+- 코드, DB, launchd, production `.venv`는 변경하지 않았다.
 
 ### Claude/Anthropic 자동 교정 제거와 downstream problem row 전수 분류
 - correction 단계는 유지하되 API-backed 자동 교정 provider를 비활성화하고 manual/provider-neutral 모드로 전환했다.

@@ -6,6 +6,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
+import re
 import shutil
 import time
 import traceback
@@ -21,8 +22,11 @@ from lecture_stt.shared.db import (
     STATUS_PENDING,
     STATUS_PROCESSING,
 )
+from lecture_stt.shared.log_retention import DEFAULT_APP_BACKUP_COUNT, DEFAULT_LOG_MAX_BYTES
 from lecture_stt.shared.paths import (
     default_db_path,
+    default_log_dir,
+    default_tmp_dir,
     env_file,
     repo_root,
     resolve_config_path,
@@ -30,7 +34,11 @@ from lecture_stt.shared.paths import (
 )
 from lecture_stt.stt.notifier import SUPPORTED_PROVIDERS, build_notifier
 from lecture_stt.stt.postprocess import postprocess
-from lecture_stt.stt.quality_gate import evaluate as quality_evaluate
+from lecture_stt.stt.quality_gate import (
+    evaluate as quality_evaluate,
+    validate_quality_scorecard,
+    write_quality_scorecard,
+)
 from lecture_stt.stt.transcribe import EngineParams, STTWorker
 from lecture_stt.stt.watcher import PollingWatcher
 
@@ -67,6 +75,28 @@ class SingleInstanceLock:
 def _env_flag(name: str) -> bool:
     value = os.environ.get(name, "")
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+_SENSITIVE_TEXT_PATTERNS = (
+    (
+        re.compile(r"(?i)\b(authorization)\s*[:=]\s*(?:bearer\s+)?([^\s,;\)\]\}\"']+)"),
+        r"\1=[REDACTED]",
+    ),
+    (
+        re.compile(r"(?i)\b(api[_-]?key|token|password|passwd|secret)\s*[:=]\s*(?:bearer\s+)?([^\s,;\)\]\}\"']+)"),
+        r"\1=[REDACTED]",
+    ),
+    (re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+\-/=]+"), r"\1[REDACTED]"),
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{3,}\b"), "[REDACTED]"),
+    (re.compile(r"sk-[A-Za-z0-9_\-]{8,}"), "[REDACTED]"),
+)
+
+
+def _redact_sensitive_text(value: Any) -> str:
+    text = str(value)
+    for pattern, replacement in _SENSITIVE_TEXT_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
 
 
 # 설정 파일을 읽고 기본 형식 유효성을 검사한다.
@@ -148,6 +178,13 @@ def validate_config(config_path: str, config: dict) -> dict:
     app["polling_interval_sec"] = polling_interval_sec
     app["stable_for_sec"] = stable_for_sec
     app["stale_processing_hours"] = stale_processing_hours
+    try:
+        transcribe_max_retries = int(app.get("transcribe_max_retries", 2))
+    except Exception as exc:
+        raise ValueError("Config error: app.transcribe_max_retries must be an integer") from exc
+    if transcribe_max_retries < 0:
+        raise ValueError("Config error: app.transcribe_max_retries must be greater than or equal to 0")
+    app["transcribe_max_retries"] = transcribe_max_retries
 
     required_paths = [
         "watch_folder",
@@ -290,15 +327,15 @@ def validate_config(config_path: str, config: dict) -> dict:
 
 # 환경설정에서 누락된 값은 기본값으로 채워 코드 실행 안정성을 높인다.
 def _ensure_config_defaults(config: dict) -> dict:
-    root = repo_root()
     defaults = {
         "app": {
             "polling_interval_sec": 10,
             "stable_for_sec": 90,
             "stale_processing_hours": 6,
+            "transcribe_max_retries": 2,
         },
         "paths": {
-            "tmp_dir": str(root / "tmp"),
+            "tmp_dir": str(default_tmp_dir()),
             "db_path": str(default_db_path()),
         },
         "engine": {"engine": "faster-whisper"},
@@ -316,9 +353,9 @@ def _ensure_config_defaults(config: dict) -> dict:
         },
         "ffmpeg": {"binary_path": "ffmpeg"},
         "logging": {
-            "file": "logs/app.log",
-            "max_bytes": 5 * 1024 * 1024,
-            "backup_count": 5,
+            "file": str(default_log_dir() / "app.log"),
+            "max_bytes": DEFAULT_LOG_MAX_BYTES,
+            "backup_count": DEFAULT_APP_BACKUP_COUNT,
         },
         "cleanup": {
             "retain_days": 7,
@@ -433,6 +470,7 @@ class STTPipeline:
         self.polling_interval_sec = int(app_cfg["polling_interval_sec"])
         self.stable_for_sec = int(app_cfg["stable_for_sec"])
         self.stale_processing_hours = int(app_cfg["stale_processing_hours"])
+        self.transcribe_max_retries = max(0, int(app_cfg.get("transcribe_max_retries", 2)))
 
         trans = self.config["transcribe"]
         self.params = EngineParams(
@@ -734,8 +772,8 @@ class STTPipeline:
 
         rows = self.conn.execute(
             "SELECT id, orig_inbox_path, canonical_audio_path, transcript_txt_path, transcript_json_path "
-            "FROM jobs WHERE status = ? ORDER BY id ASC",
-            (STATUS_PENDING,),
+            "FROM jobs WHERE status = ? AND (current_step IS NULL OR current_step NOT LIKE ?) ORDER BY id ASC",
+            (STATUS_PENDING, "전사 재시도 대기 %"),
         ).fetchall()
         for row in rows:
             canonical_audio_raw = str(row["canonical_audio_path"] or "")
@@ -800,6 +838,8 @@ class STTPipeline:
         self.transcript_dir.mkdir(parents=True, exist_ok=True)
         utils.atomic_write(txt_path, text)
         utils.atomic_write(json_path, {"segments": segments, "metadata": metadata})
+        if isinstance(metadata.get("quality"), dict):
+            write_quality_scorecard(json_path, metadata)
 
     # 산출물 존재/구조를 최소 검증해 손상된 결과를 바로 감지한다.
     def _validate_output_files(self, txt_path: Path, json_path: Path) -> None:
@@ -812,6 +852,9 @@ class STTPipeline:
         segments = payload.get("segments")
         if not isinstance(segments, list):
             raise ValueError("Transcript JSON missing segments array")
+        metadata = payload.get("metadata")
+        if isinstance(metadata, dict) and isinstance(metadata.get("quality"), dict):
+            validate_quality_scorecard(json_path, metadata)
 
     def _replay_existing_job(self, job_id: int, canonical_base: str, source_path: Path,
                             canonical_audio_path: Path, txt_path: Path, json_path: Path,
@@ -859,6 +902,16 @@ class STTPipeline:
                 deduped_from_job_id=int(duplicate["id"]),
                 source_sha256=duplicate["sha256"],
             )
+            prior_metadata = prior_payload.get("metadata")
+            prior_quality = (
+                prior_metadata.get("quality")
+                if isinstance(prior_metadata, dict)
+                else None
+            )
+            if isinstance(prior_quality, dict):
+                metadata["quality"] = dict(prior_quality)
+            else:
+                metadata["quality"] = quality_evaluate(segments, text).to_dict()
 
             self._write_output(txt_path, json_path, segments, text, metadata)
             self._validate_output_files(txt_path, json_path)
@@ -927,6 +980,113 @@ class STTPipeline:
             target = self.error_dir / f"{canonical_audio.stem}__error__{utils.short_id(6)}{canonical_audio.suffix}"
         utils.safe_move_file(canonical_audio, target)
         return target
+
+    @staticmethod
+    def _load_engine_params(raw: Any) -> dict[str, Any]:
+        if isinstance(raw, dict):
+            return dict(raw)
+        if not raw:
+            return {}
+        try:
+            loaded = json.loads(str(raw))
+        except (TypeError, json.JSONDecodeError):
+            return {}
+        return loaded if isinstance(loaded, dict) else {}
+
+    def _transcription_failure_metadata(self, job_id: int, safe_error: str) -> tuple[int, dict[str, Any]]:
+        row = db.get_job(self.conn, job_id)
+        metadata = self._load_engine_params(row["engine_params"] if row else None)
+        failures = int(metadata.get("transcription_failures", 0) or 0) + 1
+        metadata["transcription_failures"] = failures
+        metadata["transcription_max_retries"] = self.transcribe_max_retries
+        metadata["last_error_message"] = safe_error
+        metadata["last_error_at"] = utils.now_iso()
+        return failures, metadata
+
+    def _handle_job_failure(
+        self,
+        *,
+        exc: Exception,
+        fail_step: str,
+        job_id: int | None,
+        job_ctx: dict[str, str],
+        source_path: Path,
+        source_claim_path: Path | None,
+        canonical_audio: Path,
+        canonical_base: str,
+        txt_path: Path,
+        json_path: Path,
+    ) -> None:
+        tb = _redact_sensitive_text(traceback.format_exc())
+        safe_error = _redact_sensitive_text(exc)
+        fail_step = fail_step or "Unknown"
+        terminal_engine_params: str | None = None
+
+        if job_id is not None and fail_step == "전사 실행" and source_claim_path and source_claim_path.exists():
+            failures, metadata = self._transcription_failure_metadata(job_id, safe_error)
+            engine_params = json.dumps(metadata, ensure_ascii=False)
+            if failures <= self.transcribe_max_retries:
+                db.update_job(
+                    self.conn,
+                    job_id,
+                    status=STATUS_PENDING,
+                    started_at=None,
+                    ended_at=None,
+                    error_message=safe_error,
+                    error_trace=tb,
+                    engine_params=engine_params,
+                    canonical_audio_path=str(source_claim_path),
+                    current_step=f"전사 재시도 대기 {failures}/{self.transcribe_max_retries}",
+                    progress_pct=18,
+                    eta_sec=None,
+                )
+                self._log(
+                    logging.WARNING,
+                    "transcription retry scheduled (%s/%s): %s",
+                    job_ctx,
+                    failures,
+                    self.transcribe_max_retries,
+                    safe_error,
+                )
+                return
+            terminal_engine_params = engine_params
+
+        self._log(logging.ERROR, "job processing failed: %s\n%s", job_ctx, safe_error, tb)
+        error_audio = source_claim_path
+        if source_claim_path and source_claim_path.exists():
+            error_audio = self._move_to_errors(source_claim_path)
+
+        if job_id is not None:
+            update_fields: dict[str, Any] = {
+                "status": STATUS_ERROR,
+                "ended_at": utils.now_iso(),
+                "error_message": safe_error,
+                "error_trace": tb,
+                "canonical_audio_path": str(error_audio) if error_audio else str(canonical_audio),
+                "current_step": f"실패: {fail_step}",
+                "progress_pct": 0,
+                "eta_sec": None,
+            }
+            if terminal_engine_params is not None:
+                update_fields["engine_params"] = terminal_engine_params
+            db.update_job(self.conn, job_id, **update_fields)
+            self._update_progress(job_id, f"실패: {fail_step}", 0, None)
+            queue = self._queue_status()
+
+            self.notifier.notify_error({
+                "job_id": job_id,
+                "orig_name": source_path.name,
+                "canonical_base": canonical_base,
+                "orig_inbox_path": str(source_path),
+                "canonical_audio_path": str(error_audio) if error_audio else str(canonical_audio),
+                "transcript_txt_path": str(txt_path),
+                "transcript_json_path": str(json_path),
+                "error_message": safe_error,
+                "error_step": fail_step,
+                "pending_count": queue.get("PENDING", 0),
+                "processing_count": queue.get("PROCESSING", 0),
+            })
+        self._log(logging.ERROR, "failed", job_ctx)
 
     # 하나의 파일에 대해 이동, 중복 처리, 전사, 저장, 알림까지 수행한다.
     def process_job(self, source_path: Path) -> None:
@@ -1102,6 +1262,7 @@ class STTPipeline:
                 last_transcription_progress = progress_pct
                 last_transcription_eta = eta_remaining_sec
 
+            assert canonical_audio_final is not None
             segments, transcript_text, preprocess_sec, transcribe_sec, tmp_wav = self.worker.transcribe_file(
                 canonical_audio_final,
                 canonical_base,
@@ -1198,44 +1359,210 @@ class STTPipeline:
             self._log(logging.INFO, "done", job_ctx)
 
         except Exception as exc:
-            tb = traceback.format_exc()
-            self.logger.exception("job processing failed")
-            # 예상치 못한 예외는 방어적으로 Unknown으로 남겨 원인 분류가 누락되지 않게 한다.
-            fail_step = fail_step or "Unknown"
-            error_audio = source_claim_path
-            if source_claim_path and source_claim_path.exists():
-                error_audio = self._move_to_errors(source_claim_path)
+            self._handle_job_failure(
+                exc=exc,
+                fail_step=fail_step,
+                job_id=job_id,
+                job_ctx=job_ctx,
+                source_path=source_path,
+                source_claim_path=source_claim_path,
+                canonical_audio=canonical_audio,
+                canonical_base=canonical_base,
+                txt_path=txt_path,
+                json_path=json_path,
+            )
+        finally:
+            if tmp_wav:
+                self.worker.cleanup_tmp(tmp_wav)
+            self._release_worker_model_if_idle()
 
-            if job_id is not None:
-                db.update_job(
-                    self.conn,
-                    job_id,
-                    status=STATUS_ERROR,
-                    ended_at=utils.now_iso(),
-                    error_message=str(exc),
-                    error_trace=tb,
-                    canonical_audio_path=str(error_audio) if error_audio else str(canonical_audio),
-                    current_step=f"실패: {fail_step}",
-                    progress_pct=0,
-                    eta_sec=None,
+    def _retryable_transcription_rows(self) -> list[Any]:
+        return self.conn.execute(
+            "SELECT * FROM jobs WHERE status = ? AND current_step LIKE ? ORDER BY updated_at ASC, id ASC",
+            (STATUS_PENDING, "전사 재시도 대기 %"),
+        ).fetchall()
+
+    def process_retryable_jobs(self, *, limit: int | None = None) -> int:
+        processed = 0
+        for row in self._retryable_transcription_rows():
+            if limit is not None and processed >= limit:
+                break
+            self._process_retryable_transcription_job(row)
+            processed += 1
+        return processed
+
+    def _process_retryable_transcription_job(self, row: Any) -> None:
+        job_id = int(row["id"])
+        canonical_base = str(row["canonical_base"])
+        source_path = Path(str(row["orig_inbox_path"]))
+        canonical_audio = Path(str(row["canonical_audio_path"]))
+        txt_path = Path(str(row["transcript_txt_path"]))
+        json_path = Path(str(row["transcript_json_path"]))
+        source_claim_path: Path | None = canonical_audio
+        job_ctx = {"job_id": str(job_id), "canonical_base": canonical_base}
+        tmp_wav: Path | None = None
+        fail_step = "전사 실행"
+
+        try:
+            if not canonical_audio.exists():
+                fail_step = "전사 재시도 입력 확인"
+                raise FileNotFoundError(f"Missing retry input audio: {canonical_audio}")
+
+            if not db.claim_job_for_processing(self.conn, job_id):
+                self._log(logging.WARNING, "retry job was not claimable", job_ctx)
+                return
+
+            started_at = utils.now_iso()
+            eta = self._estimate_eta_sec()
+            self._update_progress(job_id, "전사 시작/진행", None, eta)
+            self._log(logging.INFO, "transcription retry started", job_ctx)
+
+            last_transcription_update_at = 0.0
+            last_transcription_progress = 0
+            last_transcription_eta: int | None = eta
+
+            def handle_transcription_progress(
+                processed_audio_sec: float,
+                audio_duration_sec: float | None,
+                eta_remaining_sec: int | None,
+            ) -> None:
+                nonlocal last_transcription_update_at, last_transcription_progress, last_transcription_eta
+
+                progress_pct = self._transcription_progress_pct(processed_audio_sec, audio_duration_sec)
+                now_mono = time.monotonic()
+                eta_changed = (
+                    eta_remaining_sec is not None
+                    and (
+                        last_transcription_eta is None
+                        or abs(eta_remaining_sec - last_transcription_eta) >= 15
+                    )
                 )
-                self._update_progress(job_id, f"실패: {fail_step}", 0, None)
-                queue = self._queue_status()
+                should_update = (
+                    progress_pct >= last_transcription_progress + 2
+                    or eta_changed
+                    or now_mono - last_transcription_update_at >= 3.0
+                )
+                if not should_update:
+                    return
 
-                self.notifier.notify_error({
-                    "job_id": job_id,
-                    "orig_name": source_path.name,
-                    "canonical_base": canonical_base,
-                    "orig_inbox_path": str(source_path),
-                    "canonical_audio_path": str(error_audio) if error_audio else str(canonical_audio),
-                    "transcript_txt_path": str(txt_path),
-                    "transcript_json_path": str(json_path),
-                    "error_message": str(exc),
-                    "error_step": fail_step,
-                    "pending_count": queue.get("PENDING", 0),
-                    "processing_count": queue.get("PROCESSING", 0),
-                })
-            self._log(logging.ERROR, "failed", job_ctx)
+                self._update_progress(
+                    job_id,
+                    "전사 시작/진행",
+                    progress=progress_pct,
+                    eta_sec=eta_remaining_sec,
+                )
+                last_transcription_update_at = now_mono
+                last_transcription_progress = progress_pct
+                last_transcription_eta = eta_remaining_sec
+
+            segments, transcript_text, preprocess_sec, transcribe_sec, tmp_wav = self.worker.transcribe_file(
+                canonical_audio,
+                canonical_base,
+                progress_callback=handle_transcription_progress,
+            )
+            total_sec = preprocess_sec + transcribe_sec
+            ended_at = utils.now_iso()
+
+            fail_step = "후처리"
+            self._update_progress(job_id, "후처리(반복/노이즈 제거)", 78, 12)
+            segments, transcript_text = postprocess(segments, transcript_text)
+
+            fail_step = "품질 검사"
+            self._update_progress(job_id, "품질 검사", 88, 6)
+            quality_report = quality_evaluate(segments, transcript_text)
+            self._log(
+                logging.WARNING if quality_report.health != "good" else logging.INFO,
+                f"quality: {quality_report.summary}",
+                job_ctx,
+            )
+
+            metadata = self._metadata(
+                canonical_base=canonical_base,
+                started_at=started_at,
+                ended_at=ended_at,
+                preprocess_sec=preprocess_sec,
+                transcribe_sec=transcribe_sec,
+                total_sec=total_sec,
+                orig_inbox_path=str(source_path),
+                orig_name=source_path.name,
+                canonical_audio_path=str(canonical_audio),
+                transcript_txt_path=str(txt_path),
+                transcript_json_path=str(json_path),
+                source_sha256=row["sha256"],
+            )
+            retry_metadata = self._load_engine_params(row["engine_params"])
+            if retry_metadata.get("transcription_failures") is not None:
+                metadata["transcription_failures_before_success"] = retry_metadata["transcription_failures"]
+            metadata["quality"] = quality_report.to_dict()
+
+            fail_step = "산출물 저장/검증"
+            self._update_progress(job_id, "전사문 생성(TXT/JSON)", 94, 3)
+            self._write_output(txt_path, json_path, segments, transcript_text, metadata)
+            self._validate_output_files(txt_path, json_path)
+            self.notifier.notify_transcript_generated({
+                "job_id": job_id,
+                "orig_name": source_path.name,
+                "canonical_base": canonical_base,
+                "pending_count": self._queue_status().get("PENDING", 0),
+                "processing_count": self._queue_status().get("PROCESSING", 0),
+            })
+
+            fail_step = "최종 상태 갱신"
+            db.update_job(
+                self.conn,
+                job_id,
+                status=STATUS_DONE,
+                ended_at=ended_at,
+                preprocess_sec=preprocess_sec,
+                transcribe_sec=transcribe_sec,
+                total_sec=total_sec,
+                engine_params=json.dumps(metadata, ensure_ascii=False),
+                error_message=None,
+                error_trace=None,
+                current_step="전체 완료",
+                progress_pct=100,
+                eta_sec=0,
+            )
+
+            fail_step = "알림 전송"
+            queue = self._queue_status()
+            self.notifier.notify_success({
+                "job_id": job_id,
+                "orig_name": source_path.name,
+                "canonical_base": canonical_base,
+                "orig_inbox_path": str(source_path),
+                "canonical_audio_path": str(canonical_audio),
+                "transcript_txt_path": str(txt_path),
+                "transcript_json_path": str(json_path),
+                "elapsed_sec": total_sec,
+                "pending_count": queue.get("PENDING", 0),
+                "processing_count": queue.get("PROCESSING", 0),
+                "updated_at": ended_at,
+                "quality_health": quality_report.health,
+                "quality_summary": quality_report.summary,
+            })
+            self.notifier.notify_completed({
+                "job_id": job_id,
+                "orig_name": source_path.name,
+                "canonical_base": canonical_base,
+                "pending_count": queue.get("PENDING", 0),
+                "processing_count": queue.get("PROCESSING", 0),
+            })
+            self._log(logging.INFO, "retry done", job_ctx)
+
+        except Exception as exc:
+            self._handle_job_failure(
+                exc=exc,
+                fail_step=fail_step,
+                job_id=job_id,
+                job_ctx=job_ctx,
+                source_path=source_path,
+                source_claim_path=source_claim_path,
+                canonical_audio=canonical_audio,
+                canonical_base=canonical_base,
+                txt_path=txt_path,
+                json_path=json_path,
+            )
         finally:
             if tmp_wav:
                 self.worker.cleanup_tmp(tmp_wav)
@@ -1270,6 +1597,13 @@ class STTPipeline:
                 self._last_pause_log_at = 0.0
                 self._log(logging.INFO, "pipeline resumed", {"job_id": "-", "canonical_base": "-"})
 
+            retry_limit = 1 if run_once else None
+            retry_count = self.process_retryable_jobs(limit=retry_limit)
+            if retry_count:
+                if run_once:
+                    return
+                continue
+
             stable_files = self.watcher.scan_stable_files()
             if not stable_files:
                 if run_once:
@@ -1283,6 +1617,8 @@ class STTPipeline:
                     return
 
             if not run_once:
+                if self._retryable_transcription_rows():
+                    continue
                 time.sleep(self.polling_interval_sec)
 
 

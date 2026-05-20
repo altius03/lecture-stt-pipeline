@@ -209,3 +209,13 @@ class WebPanelStateSnapshotTests(unittest.TestCase):
             self.assertTrue(next_reset)
             self.assertEqual(next_offset, 0)
             self.assertEqual(next_text, "")
+
+    def test_transcript_count_ignores_quality_scorecard_sidecars(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            transcript_dir = Path(temp_dir)
+            (transcript_dir / "260519OOP_2.txt").write_text("transcript", encoding="utf-8")
+            (transcript_dir / "260519OOP_2.json").write_text("{}", encoding="utf-8")
+            (transcript_dir / "260519OOP_2.quality.json").write_text("{}", encoding="utf-8")
+            (transcript_dir / "orphan.quality.json").write_text("{}", encoding="utf-8")
+
+            self.assertEqual(web_panel_state.ControlState._count_transcript_sets(transcript_dir), "1")

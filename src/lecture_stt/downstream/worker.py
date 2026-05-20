@@ -17,8 +17,10 @@ from lecture_stt.downstream.lib import (
     SubjectRoute,
     default_subject_routes,
 )
+from lecture_stt.shared.log_retention import DEFAULT_DOWNSTREAM_BACKUP_COUNT, DEFAULT_LOG_MAX_BYTES
 from lecture_stt.shared.paths import (
     default_db_path,
+    default_log_dir,
     env_file,
     repo_root,
     resolve_config_path,
@@ -87,9 +89,9 @@ def _default_config() -> dict[str, Any]:
         "downstream": {
             "scan_interval_sec": 30,
             "stable_for_sec": 60,
-            "log_jsonl_path": str(state_root / "logs" / "downstream.jsonl"),
-            "log_jsonl_max_bytes": 0,
-            "log_jsonl_backup_count": 3,
+            "log_jsonl_path": str(default_log_dir() / "downstream.jsonl"),
+            "log_jsonl_max_bytes": DEFAULT_LOG_MAX_BYTES,
+            "log_jsonl_backup_count": DEFAULT_DOWNSTREAM_BACKUP_COUNT,
             "stats_heartbeat_scans": 120,
             "log_suppression_max_keys": 4096,
             "log_routine_scan_events": False,
@@ -232,13 +234,22 @@ def setup_logging() -> logging.Logger:
 
 
 class ScanStatsReporter:
-    def __init__(self, target_logger: logging.Logger, *, heartbeat_scans: int = 120):
+    def __init__(
+        self,
+        target_logger: logging.Logger,
+        *,
+        heartbeat_scans: int = 120,
+        emit_stdout: bool = True,
+    ):
         self.logger = target_logger
         self.heartbeat_scans = max(1, int(heartbeat_scans))
+        self.emit_stdout = emit_stdout
         self._last_stats: dict[str, int] | None = None
         self._suppressed_scans = 0
 
     def log(self, stats: dict[str, int], *, dry_run: bool) -> None:
+        if not self.emit_stdout:
+            return
         normalized = dict(sorted((key, int(value)) for key, value in stats.items()))
         if self._last_stats is None:
             self._last_stats = normalized
@@ -273,7 +284,11 @@ class ScanStatsReporter:
 def run_worker(config: DownstreamConfig, *, dry_run: bool, run_once: bool) -> None:
     with SingleInstanceLock(config.lock_path):
         distributor = DownstreamDistributor(config, dry_run=dry_run)
-        reporter = ScanStatsReporter(logger, heartbeat_scans=config.stats_heartbeat_scans)
+        reporter = ScanStatsReporter(
+            logger,
+            heartbeat_scans=config.stats_heartbeat_scans,
+            emit_stdout=config.log_routine_scan_events,
+        )
         try:
             while True:
                 stats = distributor.scan_once()

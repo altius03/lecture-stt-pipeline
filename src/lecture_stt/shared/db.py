@@ -346,6 +346,25 @@ def _is_stale_processing(updated_at_raw: str | None, now: datetime, stale_second
         return True
 
 
+def _retry_step_from_engine_params(engine_params: str | None) -> str | None:
+    if not engine_params:
+        return None
+    try:
+        payload = json.loads(engine_params)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or "transcription_failures" not in payload:
+        return None
+    try:
+        failures = int(payload.get("transcription_failures", 0) or 0)
+        max_retries = int(payload.get("transcription_max_retries", failures) or failures)
+    except (TypeError, ValueError):
+        return None
+    if failures <= 0 or max_retries < failures:
+        return None
+    return f"전사 재시도 대기 {failures}/{max_retries}"
+
+
 def recover_processing_jobs(conn: sqlite3.Connection, stale_processing_hours: int = 6) -> Dict[str, int]:
     # 시작 시 끊긴 PROCESSING 작업을 정상 종료/재시도/오류로 복구한다.
     now = datetime.now().astimezone()
@@ -377,20 +396,29 @@ def recover_processing_jobs(conn: sqlite3.Connection, stale_processing_hours: in
             continue
 
         if Path(audio).exists():
-            update_job(
-                conn,
-                job_id,
-                status=STATUS_PENDING,
-                started_at=None,
-                ended_at=None,
-                preprocess_sec=None,
-                transcribe_sec=None,
-                total_sec=None,
-                error_message=None,
-                error_trace=None,
-                is_deduped=0,
-                deduped_from_job_id=None,
-            )
+            update_fields: dict[str, Any] = {
+                "status": STATUS_PENDING,
+                "started_at": None,
+                "ended_at": None,
+                "preprocess_sec": None,
+                "transcribe_sec": None,
+                "total_sec": None,
+                "is_deduped": 0,
+                "deduped_from_job_id": None,
+            }
+            retry_step = _retry_step_from_engine_params(row["engine_params"])
+            if retry_step:
+                update_fields.update(
+                    current_step=retry_step,
+                    progress_pct=18,
+                    eta_sec=None,
+                )
+            else:
+                update_fields.update(
+                    error_message=None,
+                    error_trace=None,
+                )
+            update_job(conn, job_id, **update_fields)
             counts["pending"] += 1
             continue
 

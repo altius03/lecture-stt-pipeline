@@ -26,8 +26,8 @@
         </dict>
     </array>
     <key>StandardOutPath</key>
-    <string>__REPO_ROOT__/state/logs/cleanup.out.log</string>
+    <string>__HOME__/Library/Logs/lecture_stt/cleanup.out.log</string>
     <key>StandardErrorPath</key>
-    <string>__REPO_ROOT__/state/logs/cleanup.err.log</string>
+    <string>__HOME__/Library/Logs/lecture_stt/cleanup.err.log</string>
 </dict>
 </plist>

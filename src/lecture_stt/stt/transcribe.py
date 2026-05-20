@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import inspect
 import logging
 import os
 import subprocess
@@ -8,7 +9,7 @@ import time
 import wave
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, List, Tuple
+from typing import Any, Callable, List, Tuple
 
 from lecture_stt.shared.utils import ensure_dir
 
@@ -37,14 +38,43 @@ class EngineParams:
     keep_model_loaded: bool = False
 
 
+def _load_vad_options_cls() -> Any | None:
+    try:
+        from faster_whisper.vad import VadOptions
+    except Exception:
+        return None
+    return VadOptions
+
+
+def build_vad_parameters(params: EngineParams, vad_options_cls: Any | None = None) -> dict[str, float | int]:
+    """Build faster-whisper VAD kwargs across 1.1.x and 1.2.x APIs."""
+
+    names: set[str] = set()
+    if vad_options_cls is not None:
+        names = set(inspect.signature(vad_options_cls).parameters)
+
+    threshold = float(params.vad_threshold)
+    vad_params: dict[str, float | int] = {}
+    if not names or "min_silence_duration_ms" in names:
+        vad_params["min_silence_duration_ms"] = int(params.min_silence_duration_ms)
+    if "onset" in names:
+        vad_params["onset"] = threshold
+    if "offset" in names:
+        vad_params["offset"] = threshold - 0.15
+    if not names or "threshold" in names:
+        vad_params["threshold"] = threshold
+    return vad_params
+
+
 class STTWorker:
     # 음성 전처리부터 전사, 임시 파일 정리에 이르는 실제 작업 실행기
-    def __init__(self, params: EngineParams, ffmpeg_path: str, tmp_dir: str):
+    def __init__(self, params: EngineParams, ffmpeg_path: str, tmp_dir: str, vad_options_cls: Any | None = None):
         self.params = params
         self.ffmpeg_path = ffmpeg_path
         self.tmp_dir = Path(tmp_dir)
         ensure_dir(self.tmp_dir)
         self._model = None
+        self._vad_options_cls = vad_options_cls
 
     @property
     def model(self):
@@ -158,11 +188,8 @@ class STTWorker:
         # v2: VAD 세부 설정 구성
         vad_params = None
         if self.params.vad_filter:
-            vad_params = {
-                "onset": self.params.vad_threshold,
-                "offset": self.params.vad_threshold - 0.15,
-                "min_silence_duration_ms": self.params.min_silence_duration_ms,
-            }
+            vad_options_cls = self._vad_options_cls or _load_vad_options_cls()
+            vad_params = build_vad_parameters(self.params, vad_options_cls)
 
         segments, _ = self.model.transcribe(
             str(wav_path),
