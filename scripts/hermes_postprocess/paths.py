@@ -4,10 +4,22 @@ import os
 from pathlib import Path
 from typing import Iterable
 
+from .contract import (
+    CLAIMS_DIR,
+    CORRECTION_DIR,
+    OPERATOR_DOCS_DIR,
+    POSTPROCESS_STATE_DIR,
+    PROMPT_DIR,
+    STAGING_DIR,
+    STATE_DIR,
+    SUBJECT_CODES,
+    SUMMARY_DIR,
+    TRANSCRIPT_DIR,
+)
 from .schemas import CandidatePaths
 
 
-DEFAULT_SUBJECT_CODES: tuple[str, ...] = ("DStr", "Unix", "OOP", "LC", "DS", "LA")
+DEFAULT_SUBJECT_CODES: tuple[str, ...] = SUBJECT_CODES
 
 
 def parse_subject_from_stem(stem: str, subject_codes: Iterable[str] = DEFAULT_SUBJECT_CODES) -> str | None:
@@ -43,15 +55,15 @@ def resolve_candidate_paths(
     return CandidatePaths(
         stem=stem,
         subject=subject,
-        raw_txt_path=lecture_root_path / "02_transcripts" / f"{stem}.txt",
-        raw_json_path=lecture_root_path / "02_transcripts" / f"{stem}.json",
-        correction_txt_path=lecture_root_path / "03_correction" / f"{stem}.txt",
-        correction_json_path=lecture_root_path / "03_correction" / f"{stem}.json",
-        summary_md_path=lecture_root_path / "04_summarize" / f"{stem}.md",
-        staging_dir=repo_root_path / "state" / "hermes_postprocess" / "staging" / stem,
-        claim_path=repo_root_path / "state" / "hermes_postprocess" / "claims" / f"{stem}.json",
-        prompt_dir=lecture_root_path / "05_prompt",
-        operator_docs_dir=repo_root_path / "docs" / "operators" / "hermes-postprocess",
+        raw_txt_path=lecture_root_path / TRANSCRIPT_DIR / f"{stem}.txt",
+        raw_json_path=lecture_root_path / TRANSCRIPT_DIR / f"{stem}.json",
+        correction_txt_path=lecture_root_path / CORRECTION_DIR / f"{stem}.txt",
+        correction_json_path=lecture_root_path / CORRECTION_DIR / f"{stem}.json",
+        summary_md_path=lecture_root_path / SUMMARY_DIR / f"{stem}.md",
+        staging_dir=repo_root_path / STATE_DIR / POSTPROCESS_STATE_DIR / STAGING_DIR / stem,
+        claim_path=repo_root_path / STATE_DIR / POSTPROCESS_STATE_DIR / CLAIMS_DIR / f"{stem}.json",
+        prompt_dir=lecture_root_path / PROMPT_DIR,
+        operator_docs_dir=repo_root_path.joinpath(*OPERATOR_DOCS_DIR),
     )
 
 

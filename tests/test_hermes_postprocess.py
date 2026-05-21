@@ -69,6 +69,20 @@ def _valid_summary_markdown() -> str:
     )
 
 
+def _passing_validation_report() -> str:
+    return json.dumps(
+        {
+            "schema_version": 1,
+            "passed": True,
+            "failure_class": None,
+            "message": "validation passed",
+            "details": {},
+            "raw_transcript_body_included": False,
+        },
+        ensure_ascii=False,
+    )
+
+
 def _write_summary(lecture_root: Path, stem: str) -> None:
     summary_dir = lecture_root / "04_summarize"
     summary_dir.mkdir(parents=True, exist_ok=True)
@@ -273,8 +287,8 @@ class HermesPostprocessPromptAndStagingTests(unittest.TestCase):
             (staging / "correction.txt").write_text("new correction", encoding="utf-8")
             (staging / "correction.json").write_text((lecture_root / "02_transcripts" / "260504DS_2.json").read_text(encoding="utf-8"), encoding="utf-8")
             (staging / "summary.md").write_text(_valid_summary_markdown(), encoding="utf-8")
-            (staging / "validation-correction.json").write_text('{"passed": true}', encoding="utf-8")
-            (staging / "validation-summary.json").write_text('{"passed": true}', encoding="utf-8")
+            (staging / "validation-correction.json").write_text(_passing_validation_report(), encoding="utf-8")
+            (staging / "validation-summary.json").write_text(_passing_validation_report(), encoding="utf-8")
 
             disabled = promote_candidate(candidate)
             self.assertFalse(disabled["passed"])
@@ -306,7 +320,7 @@ class HermesPostprocessPromptAndStagingTests(unittest.TestCase):
             staging = Path(candidate.staging_dir)
             staging.mkdir(parents=True, exist_ok=True)
             (staging / "summary.md").write_text(_valid_summary_markdown(), encoding="utf-8")
-            (staging / "validation-summary.json").write_text('{"passed": true}', encoding="utf-8")
+            (staging / "validation-summary.json").write_text(_passing_validation_report(), encoding="utf-8")
             correction_before = (lecture_root / "03_correction" / "260504DS_2.txt").read_text(encoding="utf-8")
 
             result = promote_candidate(candidate, allow_promote=True)
@@ -332,7 +346,7 @@ class HermesPostprocessPromptAndStagingTests(unittest.TestCase):
             staging = Path(candidate.staging_dir)
             staging.mkdir(parents=True, exist_ok=True)
             (staging / "summary.md").write_text(_valid_summary_markdown(), encoding="utf-8")
-            (staging / "validation-summary.json").write_text('{"passed": true}', encoding="utf-8")
+            (staging / "validation-summary.json").write_text(_passing_validation_report(), encoding="utf-8")
 
             with self.assertRaises(PromoteError) as raised:
                 promote_candidate(candidate, allow_promote=True)
@@ -356,8 +370,8 @@ class HermesPostprocessPromptAndStagingTests(unittest.TestCase):
             (staging / "correction.txt").write_text("new correction", encoding="utf-8")
             (staging / "correction.json").write_text((lecture_root / "02_transcripts" / "260504DS_2.json").read_text(encoding="utf-8"), encoding="utf-8")
             (staging / "summary.md").write_text(_valid_summary_markdown(), encoding="utf-8")
-            (staging / "validation-correction.json").write_text('{"passed": true}', encoding="utf-8")
-            (staging / "validation-summary.json").write_text('{"passed": true}', encoding="utf-8")
+            (staging / "validation-correction.json").write_text(_passing_validation_report(), encoding="utf-8")
+            (staging / "validation-summary.json").write_text(_passing_validation_report(), encoding="utf-8")
             original_copy = staging_module._atomic_copy_no_overwrite
             calls = 0
 
@@ -394,8 +408,8 @@ class HermesPostprocessPromptAndStagingTests(unittest.TestCase):
             (staging / "correction.txt").write_text("new correction", encoding="utf-8")
             (staging / "correction.json").write_text((lecture_root / "02_transcripts" / "260504DS_2.json").read_text(encoding="utf-8"), encoding="utf-8")
             (staging / "summary.md").write_text(_valid_summary_markdown(), encoding="utf-8")
-            (staging / "validation-correction.json").write_text('{"passed": true}', encoding="utf-8")
-            (staging / "validation-summary.json").write_text('{"passed": true}', encoding="utf-8")
+            (staging / "validation-correction.json").write_text(_passing_validation_report(), encoding="utf-8")
+            (staging / "validation-summary.json").write_text(_passing_validation_report(), encoding="utf-8")
             tampered = candidate.to_dict()
             tampered["correction_txt_path"] = str(root / "outside-final.txt")
 
@@ -427,8 +441,8 @@ class HermesPostprocessPromptAndStagingTests(unittest.TestCase):
             }
             (staging / "correction.json").write_text(json.dumps(changed), encoding="utf-8")
             (staging / "summary.md").write_text(_valid_summary_markdown(), encoding="utf-8")
-            (staging / "validation-correction.json").write_text('{"passed": true}', encoding="utf-8")
-            (staging / "validation-summary.json").write_text('{"passed": true}', encoding="utf-8")
+            (staging / "validation-correction.json").write_text(_passing_validation_report(), encoding="utf-8")
+            (staging / "validation-summary.json").write_text(_passing_validation_report(), encoding="utf-8")
 
             with self.assertRaises(PromoteError) as raised:
                 promote_candidate(candidate, allow_promote=True)

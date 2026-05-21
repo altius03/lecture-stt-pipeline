@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .contract import SCHEMA_VERSION
+
 
 @dataclass(frozen=True)
 class CandidatePaths:
@@ -87,7 +89,7 @@ class Candidate:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": 1,
+            "schema_version": SCHEMA_VERSION,
             "status": "candidate",
             **self.paths.to_dict(),
             "actions": self.actions,
@@ -125,11 +127,12 @@ class ValidationResult:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": 1,
+            "schema_version": SCHEMA_VERSION,
             "passed": self.passed,
             "failure_class": self.failure_class,
             "message": self.message,
             "details": self.details or {},
+            "raw_transcript_body_included": False,
         }
 
 

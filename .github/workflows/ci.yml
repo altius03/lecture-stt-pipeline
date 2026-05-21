@@ -33,8 +33,35 @@ jobs:
       - name: Run unit tests
         run: python -m unittest discover -s tests -p 'test_*.py' -v
 
+      - name: Smoke repo-tracked Hermes postprocess operator
+        run: |
+          mkdir -p "$RUNNER_TEMP/lecture_recordings"/{02_transcripts,03_correction,04_summarize,05_prompt}
+          python scripts/lecture_stt_postprocess_operator.py status \
+            --repo-root "$PWD" \
+            --lecture-root "$RUNNER_TEMP/lecture_recordings" \
+            --hermes-bin /bin/false
+
       - name: Compile Python sources
         run: python -m compileall -q scripts src tests
+
+  python-macos-smoke:
+    name: macOS postprocess smoke
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run Hermes postprocess hardening tests without live config
+        run: python -m unittest tests.test_hermes_postprocess_hardening -v
+
+      - name: Compile operator sources
+        run: python -m compileall -q scripts/hermes_postprocess scripts/lecture_stt_postprocess_operator.py tests/test_hermes_postprocess_hardening.py
 
   web-panel:
     name: Web panel tests
@@ -53,7 +80,7 @@ jobs:
           node-version: "22"
 
       - name: Install dependencies
-        run: npm install --no-audit --no-fund
+        run: npm ci --no-audit --no-fund
 
       - name: Run web panel tests
         run: npm test

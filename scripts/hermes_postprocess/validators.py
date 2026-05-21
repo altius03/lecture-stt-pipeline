@@ -4,19 +4,10 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .contract import REQUIRED_SUMMARY_HEADINGS, SUMMARY_FAILURE_PHRASES
+from .finals import final_entry_lexists
 from .schemas import ValidationResult
 
-
-REQUIRED_SUMMARY_HEADINGS: tuple[str, ...] = (
-    "# ",
-    "## 핵심 개요",
-    "## 주요 개념",
-    "## 세부 내용",
-    "## 예시 / 코드 / 수식",
-    "## 헷갈리기 쉬운 점",
-    "## 시험·과제·교수 강조사항",
-    "## 복습 질문",
-)
 
 _ASSISTANT_WRAPPER_PREFIXES = (
     "```",
@@ -103,7 +94,7 @@ def validate_correction_artifacts(
     final_txt = Path(final_txt_path)
     final_json = Path(final_json_path)
 
-    existing_finals = [str(path) for path in (final_txt, final_json) if path.exists()]
+    existing_finals = [str(path) for path in (final_txt, final_json) if final_entry_lexists(path)]
     if existing_finals:
         return _failure("output_already_exists", "final correction output already exists", paths=existing_finals)
 
@@ -173,7 +164,7 @@ def validate_summary_artifact(
     corrected_path = Path(corrected_txt_path)
     final_path = Path(final_md_path)
 
-    if final_path.exists():
+    if final_entry_lexists(final_path):
         return _failure("output_already_exists", "final summary output already exists", path=str(final_path))
     try:
         summary = summary_path.read_text(encoding="utf-8")
@@ -185,6 +176,14 @@ def validate_summary_artifact(
     missing = [heading for heading in REQUIRED_SUMMARY_HEADINGS if heading not in summary]
     if missing:
         return _failure("summary_required_heading_missing", "required summary headings are missing", missing=missing)
+
+    placeholder_phrases = [phrase for phrase in SUMMARY_FAILURE_PHRASES if phrase.casefold() in summary.casefold()]
+    if placeholder_phrases:
+        return _failure(
+            "summary_semantic_guard_failed",
+            "summary contains placeholder or failure language instead of lecture content",
+            phrases=placeholder_phrases,
+        )
 
     try:
         corrected = corrected_path.read_text(encoding="utf-8")

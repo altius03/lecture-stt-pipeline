@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .contract import MISRECOGNITIONS_DIR, SCHEMA_VERSION
 from .schemas import Candidate
 
 
@@ -41,7 +42,7 @@ class MisrecognitionError(RuntimeError):
 def default_pending_jsonl_path(candidate: Candidate) -> Path:
     staging_dir = Path(candidate.staging_dir)
     hermes_postprocess_dir = staging_dir.parent.parent
-    return hermes_postprocess_dir / "misrecognitions" / "pending.jsonl"
+    return hermes_postprocess_dir / MISRECOGNITIONS_DIR / "pending.jsonl"
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -89,6 +90,7 @@ def _clean_short_text(
     field: str,
     max_chars: int,
     allow_empty: bool = False,
+    reject_sentence_like: bool = False,
 ) -> str:
     if not isinstance(value, str):
         raise MisrecognitionError(
@@ -96,7 +98,14 @@ def _clean_short_text(
             f"{field} must be a string",
             {"field": field},
         )
-    text = " ".join(value.strip().split())
+    raw_text = value.strip()
+    if reject_sentence_like and ("\n" in raw_text or "\r" in raw_text):
+        raise MisrecognitionError(
+            "misrecognition_report_invalid",
+            f"{field} must be a short term, not transcript context",
+            {"field": field},
+        )
+    text = " ".join(raw_text.split())
     if not text and not allow_empty:
         raise MisrecognitionError(
             "misrecognition_report_invalid",
@@ -109,6 +118,14 @@ def _clean_short_text(
             f"{field} is too long for metadata-only review",
             {"field": field, "max_chars": max_chars},
         )
+    if reject_sentence_like:
+        sentence_markers = sum(text.count(marker) for marker in (".", "?", "!", "。", "？", "！", "다."))
+        if sentence_markers >= 2 or len(text.split()) > 8:
+            raise MisrecognitionError(
+                "misrecognition_report_invalid",
+                f"{field} must be a short term, not transcript context",
+                {"field": field},
+            )
     return text
 
 
@@ -126,11 +143,11 @@ def _normalize_candidates(payload: dict[str, Any], candidate: Candidate) -> list
             "raw_transcript_body_included must be false",
             {"field": "raw_transcript_body_included"},
         )
-    if payload.get("schema_version") != 1:
+    if payload.get("schema_version") != SCHEMA_VERSION:
         raise MisrecognitionError(
             "misrecognition_report_invalid",
-            "schema_version must be 1",
-            {"field": "schema_version"},
+            f"schema_version must be {SCHEMA_VERSION}",
+            {"field": "schema_version", "expected": SCHEMA_VERSION},
         )
     if payload.get("kind") != MISRECOGNITION_KIND:
         raise MisrecognitionError(
@@ -185,7 +202,7 @@ def _normalize_candidates(payload: dict[str, Any], candidate: Candidate) -> list
             )
         normalized.append(
             {
-                "schema_version": 1,
+                "schema_version": SCHEMA_VERSION,
                 "kind": "hermes_postprocess_misrecognition_pending_item",
                 "stem": candidate.stem,
                 "subject": candidate.subject,
@@ -194,11 +211,13 @@ def _normalize_candidates(payload: dict[str, Any], candidate: Candidate) -> list
                     item.get("suspected_wrong"),
                     field="suspected_wrong",
                     max_chars=MAX_TERM_CHARS,
+                    reject_sentence_like=True,
                 ),
                 "suggested_correct": _clean_short_text(
                     item.get("suggested_correct"),
                     field="suggested_correct",
                     max_chars=MAX_TERM_CHARS,
+                    reject_sentence_like=True,
                 ),
                 "confidence": confidence,
                 "reason": _clean_short_text(
@@ -320,7 +339,7 @@ def record_misrecognition_candidates(
     _write_review_markdown(review_path, candidate, items, len(new_items))
 
     report = {
-        "schema_version": 1,
+        "schema_version": SCHEMA_VERSION,
         "passed": True,
         "failure_class": None,
         "message": "misrecognition candidates recorded for manual review",

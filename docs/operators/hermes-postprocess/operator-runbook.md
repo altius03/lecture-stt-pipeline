@@ -31,6 +31,8 @@ Hermes cron이 `lecture_stt`의 raw transcript 하나를 선택해 Stage 3 corre
 - downstream distribution은 기존 downstream worker에게 맡긴다.
 - no candidate는 정상 상태이며 조용히 종료한다.
 - 활성 cron wrapper는 activation-time backlog를 건너뛰고 baseline 이후 새 후보만 처리한다.
+- active claim은 exclusive create로 획득한다. 이미 claim된 stem은 건너뛰며, `claimed`/`running` 상태가 stale threshold를 넘으면 stale claim을 해제한 뒤 다시 후보가 될 수 있다.
+- 운영 구현의 source of truth는 repo 안의 `scripts/hermes_postprocess/operator.py`와 `scripts/lecture_stt_postprocess_operator.py`이다. `~/.hermes/scripts/lecture_stt_postprocess_operator.py`는 repo-tracked operator를 호출하는 thin shim이다.
 
 ## Active Hermes cron registration
 
@@ -41,14 +43,37 @@ Hermes cron이 `lecture_stt`의 raw transcript 하나를 선택해 Stage 3 corre
 - schedule: `every 30m`
 - deliver: `discord:#운영-보안`
 - workdir: `/Users/geonha/DEV/lecture_stt`
-- script: `~/.hermes/scripts/lecture_stt_postprocess_operator.py`
+- script: `~/.hermes/scripts/lecture_stt_postprocess_operator.py` thin shim → repo-tracked `scripts/hermes_postprocess/operator.py`
 - mode: `no_agent=true`
+
+## Hardening canary evidence
+
+Latest local evidence file:
+
+- `/Users/geonha/DEV/lecture_stt/state/reports/hermes_postprocess/hardening-canary-20260521.json`
+
+Scope of that evidence:
+
+- local temporary fixture roots only
+- no iCloud final writes
+- no cron registration or schedule changes
+- active shim read/compile only
+
+Observed results:
+
+- empty local fixture `status`: exit 0, metadata-only JSON, `candidate_counts.pending=0`, `raw_transcript_body_included=false`
+- empty local fixture `run-once`: exit 0, stdout length 0
+- pending local fixture `status`: exit 0, metadata-only JSON, `candidate_counts.pending=1`, raw sentinel absent
+- pending local fixture `run-once` with `/bin/false` child: exit 0, short metadata-only failure alert, `failure=child_hermes_failed`, `raw_transcript_body_included=false`, no final entries created
+- active shim: `python3 -m py_compile /Users/geonha/.hermes/scripts/lecture_stt_postprocess_operator.py` exit 0
+
+This evidence proves the repo-local wrapper's quiet/no-candidate and metadata-only failure contracts for fixture runs. It does not prove semantic correction/summary quality and does not approve live iCloud promotion.
 
 Wrapper 동작:
 
 1. `state/hermes_postprocess/cron-baseline.json`의 `skip_stems`에 있는 activation-time backlog는 건너뛴다.
-2. baseline 이후 새 candidate 하나만 claim한다.
-3. child Hermes CLI를 repo root에서 실행해 docs/prompt를 읽고 staging artifact를 만든다.
+2. baseline 이후 새 candidate 하나만 exclusive claim한다. 이미 claim된 stem은 건너뛰며 stale active claim은 threshold 이후 해제된다.
+3. child Hermes CLI를 repo root에서 실행해 docs/prompt를 읽고 staging artifact를 만든다. Child stdout/stderr는 raw body 누출 방지를 위해 cron log에 저장하지 않는다.
 4. deterministic validator와 `--allow-promote` promote가 모두 통과하면 final paths와 pass/fail metadata만 짧게 출력한다.
 5. candidate가 없으면 stdout 없이 0으로 종료한다.
 
@@ -59,6 +84,42 @@ Wrapper 동작:
 `--lecture-root`가 없으면 helper는 `LECTURE_RECORDINGS_ROOT` 또는 `config/config.yaml`의 `paths.transcript_folder`에서 lecture root를 추론한다. 설정값에 `${LECTURE_RECORDINGS_ROOT}` 같은 미해결 환경변수가 남아 있으면 literal path로 조용히 스캔하지 않고 lecture root를 미해결 상태로 취급한다.
 
 The postprocess helper can run fully local: pass a local directory with the same `lecture_recordings/{02_transcripts,03_correction,04_summarize,05_prompt}` shape to `--lecture-root`. iCloud is not required by the program. We use iCloud read-only in Gate B only because the current real transcripts and prompt source of truth already live there. Code, staging state, review queue, and tests remain repo-local.
+
+Operator status is metadata-only and safe for routine inspection:
+
+```bash
+python3 scripts/lecture_stt_postprocess_operator.py status \
+  --repo-root /Users/geonha/DEV/lecture_stt \
+  --lecture-root "$LECTURE_RECORDINGS_ROOT" \
+  --hermes-bin /Users/geonha/.local/bin/hermes
+```
+
+Run at most one candidate through the repo-tracked operator. This command prints nothing when there is no candidate; it only prints a short metadata-only completion/failure alert when a candidate is actually processed or blocked.
+
+```bash
+python3 scripts/lecture_stt_postprocess_operator.py run-once \
+  --repo-root /Users/geonha/DEV/lecture_stt \
+  --lecture-root "$LECTURE_RECORDINGS_ROOT" \
+  --hermes-bin /Users/geonha/.local/bin/hermes
+```
+
+Operator containment rules:
+
+- The child Hermes process is untrusted generation only. The parent owns validation, promotion, claim writes, and final artifact writes.
+- On macOS, the child command is wrapped with `sandbox-exec` using deny-default plus explicit file-write allowlist for staging/log/temp/Hermes runtime paths. If `sandbox-exec` is unavailable on macOS, the operator fails closed instead of running the child unsandboxed.
+- Before child execution, the parent snapshots pre-existing regular final artifacts with lstat mode and content hash. After every child outcome (success, nonzero exit, timeout, wrapper exception), the parent quarantines newly-created final artifacts, restores modified/deleted/replaced pre-existing regular final artifacts, and writes metadata-only failure reports.
+- If a final path already contains a non-regular filesystem entry before the child runs (symlink, directory, device, socket, etc.), the operator fails as `preexisting_final_artifact_unsupported_type` without mutating that entry.
+- Quarantined unauthorized final entries live under `state/hermes_postprocess/staging/{stem}/unauthorized-final-artifacts/` and must be reviewed manually before any further action.
+
+## Platform matrix
+
+| Platform/runtime | Child execution mode | Expected behavior | Operator action if unavailable |
+| --- | --- | --- | --- |
+| macOS with `sandbox-exec` | Child command is wrapped with `sandbox-exec -f <generated-profile>`. | Child may read repo/prompt/raw inputs, but file writes are denied by default and explicitly allowed only for staging, cron logs, temp, and Hermes runtime paths. Child stdout/stderr go to `subprocess.DEVNULL`. | Continue only after parent-owned validation/promote checks. |
+| macOS without `sandbox-exec` | No child run. | Fail closed before running Hermes child. | Treat `sandbox_exec_missing`/wrapper failure as a platform failure. Do not run unsandboxed as a workaround. |
+| Non-Darwin without `sandbox-exec` | Child runs without macOS sandbox wrapper. | Still uses parent-owned validation, single-link regular-file staging checks, final snapshot/quarantine/restore, and `subprocess.DEVNULL` stdout/stderr suppression. | Only use for local fixture/CI-style verification unless a separate OS sandbox/container policy is approved. |
+| Any platform with unsupported final path entry | No child run. | Symlinks, directories, sockets, devices, or other non-regular final entries fail as `preexisting_final_artifact_unsupported_type`. | Manual cleanup/approval required; operator must not mutate those entries automatically. |
+| Any platform with unsafe staged artifact | Parent validation/promote stops before reading/copying the staged artifact. | Symlinks, hardlinks, broken symlinks, directories, FIFOs, sockets, devices, or missing staged files fail as `unsafe_staging_artifact`. | Recreate staging from a clean child run after review. |
 
 Read-only candidate discovery:
 

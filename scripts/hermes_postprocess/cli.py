@@ -12,6 +12,7 @@ try:
 except Exception:  # pragma: no cover - optional fallback for minimal envs
     yaml = None  # type: ignore
 
+from .contract import SCHEMA_VERSION, TRANSCRIPT_DIR
 from .misrecognitions import MisrecognitionError, record_misrecognition_candidates
 from .picker import dry_run_payload
 from .schemas import Candidate, candidate_from_dict
@@ -45,7 +46,7 @@ def _lecture_root_from_config(repo_root: Path) -> Path | None:
     if "$" in expanded:
         return None
     transcript_path = Path(expanded)
-    if transcript_path.name == "02_transcripts":
+    if transcript_path.name == TRANSCRIPT_DIR:
         return transcript_path.parent
     return None
 
@@ -113,7 +114,7 @@ def _write_optional_report(path: str | None, payload: dict[str, Any]) -> None:
 
 def _candidate_error(failure_class: str, message: str, path: str) -> dict[str, Any]:
     return {
-        "schema_version": 1,
+        "schema_version": SCHEMA_VERSION,
         "passed": False,
         "failure_class": failure_class,
         "message": message,
@@ -184,12 +185,13 @@ def main(argv: list[str] | None = None) -> int:
             result = promote_candidate(candidate, allow_promote=args.allow_promote)
         except PromoteError as exc:
             result = {
-                "schema_version": 1,
+                "schema_version": SCHEMA_VERSION,
                 "passed": False,
                 "failure_class": exc.failure_class,
                 "message": str(exc),
                 "details": exc.details,
                 "stem": candidate.stem,
+                "raw_transcript_body_included": False,
             }
         _write_optional_report(args.report_path, result)
         sys.stdout.write(_json_dump(result))
@@ -210,7 +212,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         except MisrecognitionError as exc:
             result = {
-                "schema_version": 1,
+                "schema_version": SCHEMA_VERSION,
                 "passed": False,
                 "failure_class": exc.failure_class,
                 "message": str(exc),
