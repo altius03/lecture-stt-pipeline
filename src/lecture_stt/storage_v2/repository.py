@@ -19,6 +19,7 @@ MIGRATION_VERSION = "storage_v2/0001_recording_store"
 _SchemaSignature = tuple[tuple[str, str, str, str | None], ...]
 _FileState = tuple[int, int, int, int, int, int, int]
 _WRITABLE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
+_EMPTY_FILE_SHA256 = hashlib.sha256(b"").hexdigest()
 
 
 @dataclass(frozen=True)
@@ -26,6 +27,7 @@ class _WritableTargetSnapshot:
     main: _FileState
     main_sha256: str
     sidecars: tuple[tuple[str, _FileState | None], ...]
+    durable_sidecar_sha256s: tuple[tuple[str, str | None], ...]
 
 
 def _configure(conn: sqlite3.Connection, *, writable: bool) -> sqlite3.Connection:
@@ -151,6 +153,21 @@ def _writable_target_snapshot(
         path,
         reject_active=reject_active,
     )
+    durable_sidecar_sha256s = tuple(
+        (
+            suffix,
+            (
+                None
+                if state is None
+                else _sha256_opened_regular_file(
+                    path.with_name(f"{path.name}{suffix}"),
+                    expected_state=state,
+                )
+            ),
+        )
+        for suffix, state in sidecars
+        if suffix in {"-wal", "-journal"}
+    )
     return _WritableTargetSnapshot(
         main=main,
         main_sha256=_sha256_opened_regular_file(
@@ -158,6 +175,7 @@ def _writable_target_snapshot(
             expected_state=main,
         ),
         sidecars=sidecars,
+        durable_sidecar_sha256s=durable_sidecar_sha256s,
     )
 
 
@@ -166,30 +184,101 @@ def _assert_writable_target_snapshot(
     expected: _WritableTargetSnapshot,
     *,
     reject_active: bool = False,
-    allow_shm_metadata_change: bool = False,
+    allow_sqlite_sidecar_churn: bool = False,
 ) -> None:
     current = _writable_target_snapshot(
         path,
         reject_active=reject_active,
     )
     snapshots_match = current == expected
-    if allow_shm_metadata_change and not snapshots_match:
+    if allow_sqlite_sidecar_churn and not snapshots_match:
         expected_sidecars = dict(expected.sidecars)
         current_sidecars = dict(current.sidecars)
+        expected_sidecar_sha256s = dict(
+            expected.durable_sidecar_sha256s
+        )
+        current_sidecar_sha256s = dict(
+            current.durable_sidecar_sha256s
+        )
+
+        def _is_quiescent_sidecar(state: _FileState | None) -> bool:
+            return state is None or state[4] == 0
+
+        def _quiescent_digest_matches(
+            state: _FileState | None,
+            digest: str | None,
+        ) -> bool:
+            if state is None:
+                return digest is None
+            return state[4] == 0 and digest == _EMPTY_FILE_SHA256
+
+        def _durable_sidecar_matches(suffix: str) -> bool:
+            expected_state = expected_sidecars[suffix]
+            current_state = current_sidecars[suffix]
+            expected_digest = expected_sidecar_sha256s[suffix]
+            current_digest = current_sidecar_sha256s[suffix]
+            if (
+                _is_quiescent_sidecar(expected_state)
+                and _is_quiescent_sidecar(current_state)
+            ):
+                return (
+                    _quiescent_digest_matches(
+                        expected_state,
+                        expected_digest,
+                    )
+                    and _quiescent_digest_matches(
+                        current_state,
+                        current_digest,
+                    )
+                )
+            return (
+                expected_state is not None
+                and current_state is not None
+                and expected_state[:6] == current_state[:6]
+                and expected_digest == current_digest
+            )
+
+        wal_matches = _durable_sidecar_matches("-wal")
+        expected_wal = expected_sidecars.pop("-wal")
+        current_wal = current_sidecars.pop("-wal")
+        wal_identity_churned = (
+            expected_wal != current_wal
+            and _is_quiescent_sidecar(expected_wal)
+            and _is_quiescent_sidecar(current_wal)
+            and (
+                expected_wal is None
+                or current_wal is None
+                or expected_wal[:5] != current_wal[:5]
+            )
+        )
+        expected_sidecar_sha256s.pop("-wal")
+        current_sidecar_sha256s.pop("-wal")
+
+        journal_matches = _durable_sidecar_matches("-journal")
+        expected_journal = expected_sidecars.pop("-journal")
+        current_journal = current_sidecars.pop("-journal")
+        expected_sidecar_sha256s.pop("-journal")
+        current_sidecar_sha256s.pop("-journal")
+
         expected_shm = expected_sidecars.pop("-shm")
         current_shm = current_sidecars.pop("-shm")
         shm_matches = (
-            expected_shm is None
-            and current_shm is None
-        ) or (
-            expected_shm is not None
-            and current_shm is not None
-            and expected_shm[:5] == current_shm[:5]
+            expected_shm == current_shm
+            or (
+                expected_shm is not None
+                and current_shm is not None
+                and expected_shm[:5] == current_shm[:5]
+            )
+            or wal_identity_churned
         )
         snapshots_match = (
             current.main == expected.main
             and current.main_sha256 == expected.main_sha256
             and current_sidecars == expected_sidecars
+            and not expected_sidecar_sha256s
+            and not current_sidecar_sha256s
+            and wal_matches
+            and journal_matches
             and shm_matches
         )
     if not snapshots_match:
@@ -259,7 +348,11 @@ def _connect_writable_bound(
     if hasattr(os, "O_NOFOLLOW"):
         guard_flags |= os.O_NOFOLLOW
     if not created:
-        _assert_writable_target_snapshot(path, expected_snapshot)
+        _assert_writable_target_snapshot(
+            path,
+            expected_snapshot,
+            allow_sqlite_sidecar_churn=True,
+        )
 
     guard_fd = os.open(path, guard_flags, 0o600)
     conn: sqlite3.Connection | None = None
@@ -317,7 +410,7 @@ def _connect_writable_bound(
         _assert_writable_target_snapshot(
             path,
             expected_before_write,
-            allow_shm_metadata_change=True,
+            allow_sqlite_sidecar_churn=True,
         )
 
         configured = _configure(conn, writable=True)
@@ -640,7 +733,7 @@ def _preflight_existing_target(
         path,
         baseline,
         reject_active=False,
-        allow_shm_metadata_change=True,
+        allow_sqlite_sidecar_churn=True,
     )
     return _writable_target_snapshot(path)
 

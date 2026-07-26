@@ -9,6 +9,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -616,6 +617,38 @@ class HermesPostprocessOperatorHardeningTests(unittest.TestCase):
             assert candidate is not None
             candidate_path, _manifest_path = write_candidate_and_manifest(candidate)
             captured: dict[str, object] = {}
+            expected_child_config = (
+                "model: test-model\n"
+                "mcp_servers: {}\n"
+                "security:\n"
+                "  tirith_enabled: false\n"
+            )
+            fake_yaml = types.ModuleType("yaml")
+
+            def fake_safe_load(text: str) -> dict[str, object]:
+                self.assertEqual(text, "model: test-model\n")
+                return {"model": "test-model"}
+
+            def fake_safe_dump(
+                payload: dict[str, object],
+                *,
+                allow_unicode: bool,
+                sort_keys: bool,
+            ) -> str:
+                self.assertEqual(
+                    payload,
+                    {
+                        "model": "test-model",
+                        "mcp_servers": {},
+                        "security": {"tirith_enabled": False},
+                    },
+                )
+                self.assertTrue(allow_unicode)
+                self.assertFalse(sort_keys)
+                return expected_child_config
+
+            fake_yaml.safe_load = fake_safe_load  # type: ignore[attr-defined]
+            fake_yaml.safe_dump = fake_safe_dump  # type: ignore[attr-defined]
 
             class FakeCompletedProcess:
                 returncode = 0
@@ -631,13 +664,9 @@ class HermesPostprocessOperatorHardeningTests(unittest.TestCase):
                 self.assertTrue((runtime_home / "logs").is_dir())
                 self.assertTrue((runtime_home / "sessions").is_dir())
                 self.assertTrue((runtime_home / "cache").is_dir())
-                import yaml
-
-                copied_config = yaml.safe_load((runtime_home / "config.yaml").read_text(encoding="utf-8"))
+                copied_config_text = (runtime_home / "config.yaml").read_text(encoding="utf-8")
                 copied_auth = json.loads((runtime_home / "auth.json").read_text(encoding="utf-8"))
-                self.assertEqual(copied_config["model"], "test-model")
-                self.assertEqual(copied_config["mcp_servers"], {})
-                self.assertEqual(copied_config["security"]["tirith_enabled"], False)
+                self.assertEqual(copied_config_text, expected_child_config)
                 self.assertEqual(copied_auth["active_provider"], "openai-codex")
                 self.assertEqual(sorted(copied_auth["providers"]), ["openai-codex"])
                 self.assertEqual(sorted(copied_auth["credential_pool"]), ["openai-codex"])
@@ -652,6 +681,7 @@ class HermesPostprocessOperatorHardeningTests(unittest.TestCase):
 
             with (
                 patch.dict(os.environ, {"HERMES_HOME": str(real_hermes_home), "UNRELATED_SECRET": "do-not-forward"}, clear=False),
+                patch.dict(sys.modules, {"yaml": fake_yaml}),
                 patch("scripts.hermes_postprocess.operator.shutil.which", return_value="/usr/bin/sandbox-exec"),
                 patch("scripts.hermes_postprocess.operator.subprocess.run", side_effect=fake_run),
             ):

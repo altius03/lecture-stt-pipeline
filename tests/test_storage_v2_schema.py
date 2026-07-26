@@ -4,6 +4,7 @@ import hashlib
 import os
 from pathlib import Path
 import sqlite3
+import stat
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -19,6 +20,7 @@ from lecture_stt.storage_v2.repository import (
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MIGRATION_PATH = REPO_ROOT / "migrations" / "v2" / "0001_recording_store.sql"
+EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 
 
 class StorageV2SchemaTests(unittest.TestCase):
@@ -652,6 +654,348 @@ class StorageV2SchemaTests(unittest.TestCase):
                 hashlib.sha256(victim.read_bytes()).hexdigest(),
                 victim_hash,
             )
+
+    def test_writable_snapshot_allows_quiescent_wal_and_shm_churn(self) -> None:
+        path = Path("/tmp/storage_v2.sqlite3")
+        main_state = (
+            1,
+            100,
+            stat.S_IFREG | 0o600,
+            1,
+            4096,
+            10,
+            10,
+        )
+        expected = storage_repository._WritableTargetSnapshot(
+            main=main_state,
+            main_sha256="main-digest",
+            sidecars=(
+                ("-wal", None),
+                ("-shm", None),
+                ("-journal", None),
+            ),
+            durable_sidecar_sha256s=(
+                ("-wal", None),
+                ("-journal", None),
+            ),
+        )
+        current = storage_repository._WritableTargetSnapshot(
+            main=main_state,
+            main_sha256="main-digest",
+            sidecars=(
+                (
+                    "-wal",
+                    (
+                        1,
+                        101,
+                        stat.S_IFREG | 0o600,
+                        1,
+                        0,
+                        20,
+                        20,
+                    ),
+                ),
+                (
+                    "-shm",
+                    (
+                        1,
+                        102,
+                        stat.S_IFREG | 0o600,
+                        1,
+                        32768,
+                        20,
+                        20,
+                    ),
+                ),
+                ("-journal", None),
+            ),
+            durable_sidecar_sha256s=(
+                ("-wal", EMPTY_SHA256),
+                ("-journal", None),
+            ),
+        )
+
+        with patch.object(
+            storage_repository,
+            "_writable_target_snapshot",
+            return_value=current,
+        ):
+            storage_repository._assert_writable_target_snapshot(
+                path,
+                expected,
+                allow_sqlite_sidecar_churn=True,
+            )
+
+    def test_writable_snapshot_rejects_non_quiescent_wal_churn(self) -> None:
+        path = Path("/tmp/storage_v2.sqlite3")
+        main_state = (
+            1,
+            100,
+            stat.S_IFREG | 0o600,
+            1,
+            4096,
+            10,
+            10,
+        )
+        expected = storage_repository._WritableTargetSnapshot(
+            main=main_state,
+            main_sha256="main-digest",
+            sidecars=(
+                ("-wal", None),
+                ("-shm", None),
+                ("-journal", None),
+            ),
+            durable_sidecar_sha256s=(
+                ("-wal", None),
+                ("-journal", None),
+            ),
+        )
+        current = storage_repository._WritableTargetSnapshot(
+            main=main_state,
+            main_sha256="main-digest",
+            sidecars=(
+                (
+                    "-wal",
+                    (
+                        1,
+                        101,
+                        stat.S_IFREG | 0o600,
+                        1,
+                        64,
+                        20,
+                        20,
+                    ),
+                ),
+                (
+                    "-shm",
+                    (
+                        1,
+                        102,
+                        stat.S_IFREG | 0o600,
+                        1,
+                        32768,
+                        20,
+                        20,
+                    ),
+                ),
+                ("-journal", None),
+            ),
+            durable_sidecar_sha256s=(
+                ("-wal", "changed-wal-digest"),
+                ("-journal", None),
+            ),
+        )
+
+        with patch.object(
+            storage_repository,
+            "_writable_target_snapshot",
+            return_value=current,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "Writable v2 DB or its sidecars changed during validation",
+            ):
+                storage_repository._assert_writable_target_snapshot(
+                    path,
+                    expected,
+                    allow_sqlite_sidecar_churn=True,
+                )
+
+    def test_writable_snapshot_rejects_shm_only_identity_churn(self) -> None:
+        path = Path("/tmp/storage_v2.sqlite3")
+        main_state = (
+            1,
+            100,
+            stat.S_IFREG | 0o600,
+            1,
+            4096,
+            10,
+            10,
+        )
+        expected = storage_repository._WritableTargetSnapshot(
+            main=main_state,
+            main_sha256="main-digest",
+            sidecars=(
+                ("-wal", None),
+                (
+                    "-shm",
+                    (
+                        1,
+                        101,
+                        stat.S_IFREG | 0o600,
+                        1,
+                        32768,
+                        10,
+                        10,
+                    ),
+                ),
+                ("-journal", None),
+            ),
+            durable_sidecar_sha256s=(
+                ("-wal", None),
+                ("-journal", None),
+            ),
+        )
+        current = storage_repository._WritableTargetSnapshot(
+            main=main_state,
+            main_sha256="main-digest",
+            sidecars=(
+                ("-wal", None),
+                (
+                    "-shm",
+                    (
+                        1,
+                        102,
+                        stat.S_IFREG | 0o600,
+                        1,
+                        32768,
+                        20,
+                        20,
+                    ),
+                ),
+                ("-journal", None),
+            ),
+            durable_sidecar_sha256s=(
+                ("-wal", None),
+                ("-journal", None),
+            ),
+        )
+
+        with patch.object(
+            storage_repository,
+            "_writable_target_snapshot",
+            return_value=current,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "Writable v2 DB or its sidecars changed during validation",
+            ):
+                storage_repository._assert_writable_target_snapshot(
+                    path,
+                    expected,
+                    allow_sqlite_sidecar_churn=True,
+                )
+
+    def test_writable_snapshot_allows_active_wal_ctime_only_churn(self) -> None:
+        path = Path("/tmp/storage_v2.sqlite3")
+        main_state = (
+            1,
+            100,
+            stat.S_IFREG | 0o600,
+            1,
+            4096,
+            10,
+            10,
+        )
+        expected_wal = (
+            1,
+            101,
+            stat.S_IFREG | 0o600,
+            1,
+            64,
+            10,
+            10,
+        )
+        current_wal = (*expected_wal[:6], 20)
+        expected = storage_repository._WritableTargetSnapshot(
+            main=main_state,
+            main_sha256="main-digest",
+            sidecars=(
+                ("-wal", expected_wal),
+                ("-shm", None),
+                ("-journal", None),
+            ),
+            durable_sidecar_sha256s=(
+                ("-wal", "same-wal-digest"),
+                ("-journal", None),
+            ),
+        )
+        current = storage_repository._WritableTargetSnapshot(
+            main=main_state,
+            main_sha256="main-digest",
+            sidecars=(
+                ("-wal", current_wal),
+                ("-shm", None),
+                ("-journal", None),
+            ),
+            durable_sidecar_sha256s=(
+                ("-wal", "same-wal-digest"),
+                ("-journal", None),
+            ),
+        )
+
+        with patch.object(
+            storage_repository,
+            "_writable_target_snapshot",
+            return_value=current,
+        ):
+            storage_repository._assert_writable_target_snapshot(
+                path,
+                expected,
+                allow_sqlite_sidecar_churn=True,
+            )
+
+    def test_writable_snapshot_rejects_active_wal_digest_change(self) -> None:
+        path = Path("/tmp/storage_v2.sqlite3")
+        main_state = (
+            1,
+            100,
+            stat.S_IFREG | 0o600,
+            1,
+            4096,
+            10,
+            10,
+        )
+        wal_state = (
+            1,
+            101,
+            stat.S_IFREG | 0o600,
+            1,
+            64,
+            10,
+            10,
+        )
+        expected = storage_repository._WritableTargetSnapshot(
+            main=main_state,
+            main_sha256="main-digest",
+            sidecars=(
+                ("-wal", wal_state),
+                ("-shm", None),
+                ("-journal", None),
+            ),
+            durable_sidecar_sha256s=(
+                ("-wal", "expected-wal-digest"),
+                ("-journal", None),
+            ),
+        )
+        current = storage_repository._WritableTargetSnapshot(
+            main=main_state,
+            main_sha256="main-digest",
+            sidecars=(
+                ("-wal", wal_state),
+                ("-shm", None),
+                ("-journal", None),
+            ),
+            durable_sidecar_sha256s=(
+                ("-wal", "changed-wal-digest"),
+                ("-journal", None),
+            ),
+        )
+
+        with patch.object(
+            storage_repository,
+            "_writable_target_snapshot",
+            return_value=current,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "Writable v2 DB or its sidecars changed during validation",
+            ):
+                storage_repository._assert_writable_target_snapshot(
+                    path,
+                    expected,
+                    allow_sqlite_sidecar_churn=True,
+                )
 
     def test_initial_database_commit_fsyncs_parent_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -1016,7 +1016,6 @@ class StorageV2AnalyticsTests(unittest.TestCase):
                     metadata.st_nlink,
                     metadata.st_size,
                     metadata.st_mtime_ns,
-                    metadata.st_ctime_ns,
                 ),
             )
 
@@ -1049,6 +1048,9 @@ class StorageV2AnalyticsTests(unittest.TestCase):
         self.assertEqual(payload["totals"]["jobs"], 1)
         connect_v2.assert_called_once_with(self.db_path, readonly=True)
         self.assertEqual(durable_snapshot(self.db_path), before_main)
+        # Some Linux filesystems change WAL ctime while SQLite acquires
+        # read-only coordination locks. Bytes, identity, size, and mtime are
+        # the durable evidence that must remain unchanged.
         self.assertEqual(durable_snapshot(wal_path), before_wal)
         # SQLite mode=ro may update SHM read-lock coordination bytes/timestamps.
         self.assertEqual(coordination_identity(shm_path), before_shm_identity)

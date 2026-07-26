@@ -5,6 +5,18 @@
 
 ## 2026-07-27
 
+### Storage v2 운영 보존 반영과 read-only 웹 패널 전환
+- 운영 v1 SQLite를 backup API로 `state/backups/storage-v2-rollout-20260727T012255+0900/jobs.snapshot.sqlite3`에 일관되게 보존했다. Snapshot은 `quick_check=ok`, jobs 132건, deliveries 247건이며 SHA-256은 `c6a8d9611a67f57591be8a0a70bdec0e566bcc94609a016236db0c87a7eb4603`이다. 기존 설정도 같은 rollback evidence 디렉터리에 권한 `0600`으로 복사했고 snapshot/config manifest를 함께 남겼다.
+- 전체 132건 import plan은 applicable 132, blocker 0, missing source 91, needs-review 27이었고 exact plan SHA-256 `25ea41ea8a805b1635115d597956928f3f8b0bbb7183df010c761dec53e982fc`를 고정했다. `expected_count=132`, exact digest, `--allow-write`, `--allow-missing-source` guard로 별도 운영 DB `state/storage-v2.sqlite3`와 별도 root `~/Library/Application Support/lecture_stt/storage-v2/records`에만 적용했다.
+- 적용 결과는 imported 132, skipped 0이며 verifier는 issue 0이었다. 동일 plan replay는 imported 0, skipped 132, recovered 0이고 DB SHA-256도 바뀌지 않았다. Plan/apply/replay/verifier JSON과 metadata-only adapter preflight 결과는 rollback evidence 디렉터리에 보존했다.
+- Machine-local `config/config.yaml`에서는 analytics/library/archive/timetable/title review의 읽기만 활성화하고 status write, confirmation, promotion, materialization을 포함한 모든 쓰기 gate는 계속 `false`로 유지했다. `com.geonha.lecture-stt-webpanel`만 재시작했으며 STT와 downstream PID는 그대로 유지했다. Live HTTP에서 library 132건, unified review 92건, archive 0건과 각 source availability를 확인했고 현재 probe 동안 webpanel error log에 새 오류가 추가되지 않았다. 전후 PID, endpoint status/capability와 log size/mtime/SHA-256은 rollback evidence의 `runtime-validation.json`에 함께 기록했다.
+- Legacy v1 DB/root와 iCloud 원본에는 migration, rename, move, delete를 하지 않았다. STT/worker cutover, canonical title 자동 승격, 웹 materialization/upload도 수행하지 않았다. 남은 open review 92건은 사람이 확인할 queue이며 자동 처리 대상이 아니다.
+
+### GitHub Actions 교차 플랫폼 저장소 검증 보강
+- 첫 공개 커밋 뒤 Ubuntu CI에서 SQLite가 read-only/writable reopen 중 quiescent `-wal`/`-journal`과 coordination-only `-shm`을 재생성하는 동작을 writable target 변조로 오인하는 것을 확인했다. 메인 DB inode·metadata·SHA-256과 sidecar regular-file/single-link 검증은 그대로 유지하고 durable WAL/journal SHA-256도 snapshot에 추가했다. Absent/0-byte identity churn, content·identity·size·mtime이 같은 active WAL/journal의 ctime-only churn, WAL identity churn에 수반되는 SHM 재생성만 reopen 경계에서 허용한다. SHM 단독 identity churn과 durable sidecar content/mtime 변경은 계속 fail-closed한다.
+- 별도 dependency를 설치하지 않는 macOS smoke에서 테스트 본문이 PyYAML을 import하던 문제도 제거했다. Dependency-free fake YAML module이 sanitizer의 nested payload와 exact serialized config를 함께 검증하며 인증·secret allowlist와 runtime isolation 검증은 바꾸지 않았다.
+- 격리 Linux Python 3.12에서 Storage v2 283개, dependency-free Python 3.12에서 Hermes smoke 54개, 로컬 전체 Python 563개가 통과했다. `compileall`, `git diff --check`, 운영 read-only verifier의 recordings 132/artifacts 540/issue 0과 운영 DB snapshot 복사본의 writable reopen 2회 canary도 통과했다.
+
 ### Storage v2 운영 반영 preflight
 - Git 공개와 운영용 Storage v2 환경 구축을 시작하기 전 `origin/main`, 누적 dirty worktree, 운영 설정과 importer root 분리 계약을 다시 대조했다.
 - `config/config.example.yaml`의 기존 `${LECTURE_RECORDINGS_ROOT}/storage-v2` 예시는 importer가 의도대로 거부하는 legacy root 내부 target이어서, 원본과 물리적으로 분리된 `~/Library/Application Support/lecture_stt/storage-v2/records`로 바로잡았다. 운영 v1 DB/root와 iCloud 원본은 이 preflight에서 변경하지 않았다.
