@@ -100,13 +100,28 @@ class _FakeNotifier:
     def notify_error(self, payload: dict) -> None:
         pass
 
+    def notify_review(self, payload: dict) -> None:
+        pass
+
 
 class _RecordingNotifier(_FakeNotifier):
     def __init__(self) -> None:
         self.errors: list[dict] = []
+        self.reviews: list[dict] = []
+        self.successes: list[dict] = []
+        self.transcript_generated: list[dict] = []
 
     def notify_error(self, payload: dict) -> None:
         self.errors.append(dict(payload))
+
+    def notify_success(self, payload: dict) -> None:
+        self.successes.append(dict(payload))
+
+    def notify_review(self, payload: dict) -> None:
+        self.reviews.append(dict(payload))
+
+    def notify_transcript_generated(self, payload: dict) -> None:
+        self.transcript_generated.append(dict(payload))
 
 
 class _FakeWorker:
@@ -267,8 +282,102 @@ class SttPipelineBehaviorTests(unittest.TestCase):
         self.assertIn(scorecard["health"], {"good", "warn", "bad"})
         self.assertIsInstance(scorecard["quality_score"], int)
         self.assertEqual(scorecard["artifacts"]["transcript_json_path"], str(transcript_json_path))
+        self.assertEqual(scorecard["profile"]["key"], "legacy")
+        self.assertEqual(len(scorecard["profile"]["config_sha256"]), 64)
         self.assertNotIn("segments", scorecard)
         self.assertNotIn("테스트", scorecard_text)
+
+    def test_active_profile_is_applied_and_snapshotted(self) -> None:
+        self.pipeline.conn.close()
+        self.config["profiles"] = {
+            "active": "general",
+            "definitions": {
+                "general": {
+                    "version": "2026-07-23.1",
+                    "transcribe": {
+                        "initial_prompt": "",
+                        "beam_size": 2,
+                    },
+                    "postprocess": {
+                        "corrections": {},
+                    },
+                    "quality": {
+                        "warn_threshold": 0.6,
+                        "bad_threshold": 0.8,
+                    },
+                }
+            },
+        }
+        self.pipeline = stt_main.STTPipeline(config=self.config, logger=self.logger)
+
+        self.assertEqual(self.pipeline.params.initial_prompt, "")
+        self.assertEqual(self.pipeline.params.beam_size, 2)
+        self.assertEqual(self.pipeline.active_profile.corrections, {})
+
+        source_path = self.watch_dir / "profiled.m4a"
+        source_path.write_bytes(b"profiled-audio")
+        self.pipeline.process_job(source_path)
+
+        payload = json.loads(
+            (self.transcript_dir / "profiled.json").read_text(encoding="utf-8")
+        )
+        scorecard = json.loads(
+            (self.transcript_dir / "profiled.quality.json").read_text(encoding="utf-8")
+        )
+        snapshot = payload["metadata"]["profile"]
+        self.assertEqual(snapshot["key"], "general")
+        self.assertEqual(snapshot["version"], "2026-07-23.1")
+        self.assertEqual(len(snapshot["config_sha256"]), 64)
+        self.assertEqual(scorecard["profile"], snapshot)
+
+    def test_process_job_flags_sparse_transcript_when_audio_duration_is_long(self) -> None:
+        source_path = self.watch_dir / "sparse-long.m4a"
+        source_path.write_bytes(b"fake-audio")
+        notifier = _RecordingNotifier()
+        self.pipeline.notifier = notifier  # type: ignore[assignment]
+
+        with mock.patch.object(stt_main.STTWorker, "_wav_duration_sec", return_value=2755.051, create=True):
+            self.pipeline.process_job(source_path)
+
+        scorecard_path = self.transcript_dir / "sparse-long.quality.json"
+        scorecard = json.loads(scorecard_path.read_text(encoding="utf-8"))
+        self.assertEqual(scorecard["health"], "bad")
+        self.assertLess(scorecard["quality_score"], 45)
+        self.assertLess(scorecard["metrics"]["chars_per_audio_min"], 15)
+        self.assertLess(scorecard["metrics"]["coverage_ratio"], 0.35)
+        self.assertIn("전사량", scorecard["summary"])
+
+        rows = self.pipeline.conn.execute("SELECT status, current_step, error_message FROM jobs").fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], stt_main.STATUS_NEEDS_REVIEW)
+        self.assertEqual(rows[0]["current_step"], "품질 검토 필요")
+        self.assertIn("전사량", rows[0]["error_message"])
+        self.assertEqual(notifier.successes, [])
+        self.assertEqual(notifier.errors, [])
+        self.assertEqual(len(notifier.reviews), 1)
+        self.assertEqual(notifier.reviews[0]["review_step"], "품질 검사")
+        self.assertIn("전사량", notifier.reviews[0]["review_message"])
+
+    def test_bad_quality_marks_need_review_and_uses_review_notification(self) -> None:
+        source_path = self.watch_dir / "sparse-review.m4a"
+        source_path.write_bytes(b"fake-audio")
+        notifier = _RecordingNotifier()
+        self.pipeline.notifier = notifier  # type: ignore[assignment]
+
+        with mock.patch.object(stt_main.STTWorker, "_wav_duration_sec", return_value=2755.051, create=True):
+            self.pipeline.process_job(source_path)
+
+        rows = self.pipeline.conn.execute(
+            "SELECT status, current_step, error_message FROM jobs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertIsNotNone(rows)
+        self.assertEqual(rows["status"], stt_main.STATUS_NEEDS_REVIEW)
+        self.assertEqual(rows["current_step"], "품질 검토 필요")
+        self.assertIn("전사량", rows["error_message"])
+        self.assertEqual(len(notifier.reviews), 1)
+        self.assertEqual(len(notifier.successes), 0)
+        self.assertEqual(len(notifier.errors), 0)
+        self.assertEqual(len(notifier.transcript_generated), 0)
 
     def test_validate_output_requires_quality_scorecard_sidecar(self) -> None:
         txt_path = self.transcript_dir / "missing-sidecar.txt"
@@ -332,12 +441,95 @@ class SttPipelineBehaviorTests(unittest.TestCase):
         duplicate_payload = json.loads(duplicate_json_path.read_text(encoding="utf-8"))
         self.assertTrue(duplicate_payload["metadata"]["deduped"])
         self.assertIn("quality", duplicate_payload["metadata"])
+        self.assertEqual(
+            duplicate_payload["metadata"]["profile"]["config_sha256"],
+            self.pipeline.active_profile.config_sha256,
+        )
 
         scorecard_text = duplicate_scorecard_path.read_text(encoding="utf-8")
         scorecard = json.loads(scorecard_text)
         self.assertEqual(scorecard["canonical_base"], "dedupe-copy")
         self.assertNotIn("segments", scorecard)
         self.assertNotIn("테스트", scorecard_text)
+
+    def test_deduped_pre_profile_output_is_not_attributed_to_active_profile(self) -> None:
+        original_path = self.watch_dir / "legacy-original.m4a"
+        original_path.write_bytes(b"legacy-same-audio")
+        self.pipeline.process_job(original_path)
+
+        original_json_path = self.transcript_dir / "legacy-original.json"
+        original_payload = json.loads(original_json_path.read_text(encoding="utf-8"))
+        original_payload["metadata"].pop("profile", None)
+        original_json_path.write_text(
+            json.dumps(original_payload, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        duplicate_path = self.watch_dir / "legacy-copy.m4a"
+        duplicate_path.write_bytes(b"legacy-same-audio")
+        self.pipeline.process_job(duplicate_path)
+
+        duplicate_payload = json.loads(
+            (self.transcript_dir / "legacy-copy.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            duplicate_payload["metadata"]["profile"],
+            {
+                "key": "legacy-unknown",
+                "version": "unknown",
+                "config_sha256": "unknown",
+            },
+        )
+
+    def test_deduped_bad_historical_quality_remains_needs_review(self) -> None:
+        original_path = self.watch_dir / "bad-history-original.m4a"
+        original_path.write_bytes(b"bad-history-audio")
+        self.pipeline.process_job(original_path)
+
+        original_row = self.pipeline.conn.execute(
+            "SELECT id FROM jobs WHERE canonical_base = 'bad-history-original'"
+        ).fetchone()
+        original_json_path = self.transcript_dir / "bad-history-original.json"
+        original_payload = json.loads(original_json_path.read_text(encoding="utf-8"))
+        original_payload["metadata"]["quality"]["health"] = "bad"
+        original_payload["metadata"]["quality"]["summary"] = "과거 품질 검토 대상"
+        original_json_path.write_text(
+            json.dumps(original_payload, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        self.pipeline.conn.execute(
+            "UPDATE jobs SET status = ?, current_step = ?, error_message = ? WHERE id = ?",
+            (
+                stt_main.STATUS_NEEDS_REVIEW,
+                "품질 검토 필요",
+                "과거 품질 검토 대상",
+                int(original_row["id"]),
+            ),
+        )
+        self.pipeline.conn.commit()
+
+        notifier = _RecordingNotifier()
+        self.pipeline.notifier = notifier  # type: ignore[assignment]
+        duplicate_path = self.watch_dir / "bad-history-copy.m4a"
+        duplicate_path.write_bytes(b"bad-history-audio")
+        with mock.patch.object(
+            self.pipeline.worker,
+            "transcribe_file",
+            wraps=self.pipeline.worker.transcribe_file,
+        ) as transcribe_file:
+            self.pipeline.process_job(duplicate_path)
+
+        self.assertEqual(transcribe_file.call_count, 0)
+        row = self.pipeline.conn.execute(
+            "SELECT status, current_step, error_message FROM jobs "
+            "WHERE canonical_base = 'bad-history-copy'"
+        ).fetchone()
+        self.assertEqual(row["status"], stt_main.STATUS_NEEDS_REVIEW)
+        self.assertEqual(row["current_step"], "품질 검토 필요")
+        self.assertIn("과거 품질", row["error_message"])
+        self.assertEqual(len(notifier.reviews), 1)
+        self.assertEqual(notifier.successes, [])
+        self.assertEqual(notifier.transcript_generated, [])
 
     def test_process_job_skips_missing_source_when_competing_job_exists(self) -> None:
         source_path = self.watch_dir / "race.m4a"
@@ -505,6 +697,161 @@ class SttPipelineBehaviorTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(done["status"], stt_main.STATUS_DONE)
         self.assertEqual(done["current_step"], "전체 완료")
+
+    def test_startup_recovery_preserves_bad_quality_as_needs_review(self) -> None:
+        canonical_audio = self.audio_dir / "review-recovery.m4a"
+        canonical_audio.write_bytes(b"claimed-audio")
+        txt_path = self.transcript_dir / "review-recovery.txt"
+        json_path = self.transcript_dir / "review-recovery.json"
+        metadata = self._quality_metadata("review-recovery", txt_path, json_path)
+        metadata["quality"]["health"] = "bad"
+        metadata["quality"]["quality_score"] = 21
+        metadata["quality"]["summary"] = "오디오 길이 대비 전사량이 매우 적음"
+        txt_path.write_text("검토가 필요한 전사", encoding="utf-8")
+        json_path.write_text(
+            json.dumps(
+                {
+                    "segments": [
+                        {"id": 0, "start": 0.0, "end": 2.0, "text": "검토가 필요한 전사"}
+                    ],
+                    "metadata": metadata,
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        stt_main.write_quality_scorecard(json_path, metadata)
+        self.pipeline.conn.execute(
+            "INSERT INTO jobs (status, created_at, updated_at, started_at, orig_inbox_path, orig_name, canonical_base, "
+            "canonical_audio_path, transcript_txt_path, transcript_json_path, current_step, progress_pct) "
+            "VALUES (?, datetime('now'), datetime('now'), datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                stt_main.STATUS_PROCESSING,
+                str(self.watch_dir / "review-recovery.m4a"),
+                "review-recovery.m4a",
+                "review-recovery",
+                str(canonical_audio),
+                str(txt_path),
+                str(json_path),
+                "산출물 저장/검증",
+                94,
+            ),
+        )
+        self.pipeline.conn.commit()
+
+        counts = stt_main.db.recover_processing_jobs(self.pipeline.conn)
+
+        recovered = self.pipeline.conn.execute(
+            "SELECT status, current_step, progress_pct, error_message FROM jobs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual(counts["needs_review"], 1)
+        self.assertEqual(recovered["status"], stt_main.STATUS_NEEDS_REVIEW)
+        self.assertEqual(recovered["current_step"], "품질 검토 필요")
+        self.assertEqual(recovered["progress_pct"], 100)
+        self.assertIn("전사량", recovered["error_message"])
+
+    def test_startup_recovery_rebuilds_missing_quality_scorecard_before_done(self) -> None:
+        canonical_audio = self.audio_dir / "missing-recovery-sidecar.m4a"
+        canonical_audio.write_bytes(b"claimed-audio")
+        txt_path = self.transcript_dir / "missing-recovery-sidecar.txt"
+        json_path = self.transcript_dir / "missing-recovery-sidecar.json"
+        metadata = self._quality_metadata("missing-recovery-sidecar", txt_path, json_path)
+        txt_path.write_text("scorecard missing", encoding="utf-8")
+        json_path.write_text(
+            json.dumps({"segments": [{"text": "검증"}], "metadata": metadata}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        self.pipeline.conn.execute(
+            "INSERT INTO jobs (status, created_at, updated_at, started_at, orig_inbox_path, orig_name, canonical_base, "
+            "canonical_audio_path, transcript_txt_path, transcript_json_path, current_step, progress_pct) "
+            "VALUES (?, datetime('now'), datetime('now'), datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                stt_main.STATUS_PROCESSING,
+                str(self.watch_dir / "missing-recovery-sidecar.m4a"),
+                "missing-recovery-sidecar.m4a",
+                "missing-recovery-sidecar",
+                str(canonical_audio),
+                str(txt_path),
+                str(json_path),
+                "산출물 저장/검증",
+                94,
+            ),
+        )
+        self.pipeline.conn.commit()
+
+        counts = stt_main.db.recover_processing_jobs(self.pipeline.conn)
+
+        recovered = self.pipeline.conn.execute(
+            "SELECT status, current_step, progress_pct, error_message FROM jobs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        scorecard_path = self.transcript_dir / "missing-recovery-sidecar.quality.json"
+        scorecard = json.loads(scorecard_path.read_text(encoding="utf-8"))
+        self.assertEqual(counts["done"], 1)
+        self.assertEqual(counts["needs_review"], 0)
+        self.assertEqual(recovered["status"], stt_main.STATUS_DONE)
+        self.assertIsNone(recovered["error_message"])
+        self.assertEqual(scorecard["canonical_base"], "missing-recovery-sidecar")
+        self.assertNotIn("segments", scorecard)
+        self.assertTrue(txt_path.exists())
+        self.assertTrue(json_path.exists())
+
+    def test_startup_recovery_rejects_malformed_quality_scorecard(self) -> None:
+        canonical_audio = self.audio_dir / "malformed-recovery-sidecar.m4a"
+        canonical_audio.write_bytes(b"claimed-audio")
+        txt_path = self.transcript_dir / "malformed-recovery-sidecar.txt"
+        json_path = self.transcript_dir / "malformed-recovery-sidecar.json"
+        scorecard_path = self.transcript_dir / "malformed-recovery-sidecar.quality.json"
+        metadata = self._quality_metadata("malformed-recovery-sidecar", txt_path, json_path)
+        txt_path.write_text("scorecard malformed", encoding="utf-8")
+        json_path.write_text(
+            json.dumps({"segments": [{"text": "검증"}], "metadata": metadata}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        scorecard_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "kind": "lecture_stt_quality_scorecard",
+                    "canonical_base": "wrong-stem",
+                    "segments": [{"text": "raw transcript must not be here"}],
+                    "artifacts": {"transcript_json_path": str(json_path)},
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        self.pipeline.conn.execute(
+            "INSERT INTO jobs (status, created_at, updated_at, started_at, orig_inbox_path, orig_name, canonical_base, "
+            "canonical_audio_path, transcript_txt_path, transcript_json_path, current_step, progress_pct) "
+            "VALUES (?, datetime('now'), datetime('now'), datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                stt_main.STATUS_PROCESSING,
+                str(self.watch_dir / "malformed-recovery-sidecar.m4a"),
+                "malformed-recovery-sidecar.m4a",
+                "malformed-recovery-sidecar",
+                str(canonical_audio),
+                str(txt_path),
+                str(json_path),
+                "산출물 저장/검증",
+                94,
+            ),
+        )
+        self.pipeline.conn.commit()
+
+        counts = stt_main.db.recover_processing_jobs(self.pipeline.conn)
+
+        recovered = self.pipeline.conn.execute(
+            "SELECT status, current_step, progress_pct, error_message FROM jobs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual(counts["done"], 0)
+        self.assertEqual(counts["needs_review"], 1)
+        self.assertEqual(recovered["status"], stt_main.STATUS_NEEDS_REVIEW)
+        self.assertEqual(recovered["current_step"], "품질 산출물 검증 필요")
+        self.assertEqual(recovered["progress_pct"], 100)
+        self.assertIn("검증 실패", recovered["error_message"])
+        self.assertTrue(txt_path.exists())
+        self.assertTrue(json_path.exists())
+        self.assertTrue(scorecard_path.exists())
 
     def test_transcription_retries_transient_failures_before_success(self) -> None:
         source_path = self.watch_dir / "retry-success.m4a"

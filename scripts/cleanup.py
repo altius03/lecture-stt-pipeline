@@ -5,6 +5,7 @@ import argparse
 from datetime import datetime
 from pathlib import Path
 import shutil
+import sqlite3
 import sys
 
 import yaml
@@ -33,6 +34,7 @@ def _ensure_config_defaults(config: dict) -> dict:
     defaults = {
         "paths": {
             "tmp_dir": str(REPO_ROOT / "tmp"),
+            "db_path": str(REPO_ROOT / "state" / "jobs.sqlite3"),
         },
         "cleanup": {
             "retain_days": 7,
@@ -68,7 +70,12 @@ def _delete_path(path: Path, dry_run: bool) -> bool:
     return False
 
 
-def _cleanup_audio(audio_dir: Path, cutoff_ts: float, dry_run: bool) -> tuple[int, int]:
+def _cleanup_audio(
+    audio_dir: Path,
+    cutoff_ts: float,
+    dry_run: bool,
+    protected_stems: set[str] | None = None,
+) -> tuple[int, int]:
     # 컷오프 이전의 오디오 파일만 제거한다.
     if not audio_dir.exists():
         print(f"audio folder missing: {audio_dir}")
@@ -79,9 +86,13 @@ def _cleanup_audio(audio_dir: Path, cutoff_ts: float, dry_run: bool) -> tuple[in
 
     deleted = 0
     kept = 0
+    protected = protected_stems or set()
     for item in audio_dir.iterdir():
         _assert_under_base(item, audio_dir)
         if not item.is_file():
+            continue
+        if item.stem in protected:
+            kept += 1
             continue
         if item.stat().st_mtime < cutoff_ts:
             if _delete_path(item, dry_run):
@@ -107,7 +118,13 @@ def _transcript_artifact_stem(path: Path) -> str:
     return path.stem
 
 
-def _cleanup_transcripts(transcript_dir: Path, cutoff_ts: float, dry_run: bool, min_keep: int) -> tuple[int, int]:
+def _cleanup_transcripts(
+    transcript_dir: Path,
+    cutoff_ts: float,
+    dry_run: bool,
+    min_keep: int,
+    protected_stems: set[str] | None = None,
+) -> tuple[int, int]:
     # 유지할 최소 전사 세트 수를 제외하고 오래된 트랜스크립트 세트(txt/json/quality)를 정리한다.
     if not transcript_dir.exists():
         return 0, 0
@@ -134,7 +151,12 @@ def _cleanup_transcripts(transcript_dir: Path, cutoff_ts: float, dry_run: bool, 
 
     deleted = 0
     kept = len(keep_paths)
+    protected = protected_stems or set()
     for group in groups:
+        group_stem = _transcript_artifact_stem(group[0])
+        if group_stem in protected:
+            kept += sum(1 for item in group if item not in keep_paths)
+            continue
         group_mtime = max(item.stat().st_mtime for item in group)
         for item in group:
             if item in keep_paths:
@@ -146,6 +168,27 @@ def _cleanup_transcripts(transcript_dir: Path, cutoff_ts: float, dry_run: bool, 
             kept += 1
 
     return deleted, kept
+
+
+def _needs_review_stems(db_path: Path) -> set[str]:
+    """Return immutable cleanup exclusions for unresolved review jobs."""
+    if not db_path.exists():
+        return set()
+    try:
+        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=3.0) as conn:
+            rows = conn.execute(
+                "SELECT canonical_base FROM jobs "
+                "WHERE status = 'NEEDS_REVIEW' AND canonical_base IS NOT NULL"
+            ).fetchall()
+    except sqlite3.Error as exc:
+        raise RuntimeError(
+            f"Refusing cleanup because NEEDS_REVIEW exclusions could not be loaded: {db_path}"
+        ) from exc
+    return {
+        str(row[0]).strip()
+        for row in rows
+        if row and isinstance(row[0], str) and str(row[0]).strip()
+    }
 
 
 def _cleanup_tmp(tmp_dir: Path, dry_run: bool) -> int:
@@ -209,19 +252,28 @@ def main() -> None:
     audio_dir = resolve_config_path(str(paths_cfg["stable_audio_folder"]), base_dir=REPO_ROOT)
     transcript_dir = resolve_config_path(str(paths_cfg["transcript_folder"]), base_dir=REPO_ROOT)
     tmp_dir = resolve_config_path(str(paths_cfg["tmp_dir"]), base_dir=REPO_ROOT)
+    db_path = resolve_config_path(str(paths_cfg["db_path"]), base_dir=REPO_ROOT)
     retain_days = int(cfg["cleanup"]["retain_days"])
     min_transcripts = int(cfg.get("cleanup", {}).get("retain_min_transcripts", 5))
+    protected_stems = _needs_review_stems(db_path)
 
     cutoff_ts = datetime.now().timestamp() - (retain_days * 24 * 3600)
 
     print(f"dry_run={dry_run}")
-    removed_audio, kept_audio = _cleanup_audio(audio_dir, cutoff_ts, dry_run)
+    print(f"protected review sets={len(protected_stems)}")
+    removed_audio, kept_audio = _cleanup_audio(
+        audio_dir,
+        cutoff_ts,
+        dry_run,
+        protected_stems=protected_stems,
+    )
     removed_tmp = _cleanup_tmp(tmp_dir, dry_run)
     removed_transcript, kept_transcript = _cleanup_transcripts(
         transcript_dir,
         cutoff_ts,
         dry_run,
         min_keep=min_transcripts,
+        protected_stems=protected_stems,
     )
 
     print(

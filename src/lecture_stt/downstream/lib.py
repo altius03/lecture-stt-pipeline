@@ -18,7 +18,7 @@ from lecture_stt.shared import db, utils
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_OBSIDIAN_NOTE_DIR = "강의록"
+DEFAULT_OBSIDIAN_NOTE_DIR = "06_lecture_notes/01_summarize"
 CORRECTION_STATUS_INCOMPLETE = "INCOMPLETE"
 CORRECTION_STATUS_DELIVERED = "DELIVERED"
 CORRECTION_STATUS_CONFLICT = "CONFLICT"

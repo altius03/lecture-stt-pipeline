@@ -14,6 +14,33 @@ paths:
   tmp_dir: ~/Library/Caches/lecture_stt/tmp
   db_path: state/jobs.sqlite3
 
+# Storage v2 remains separate from the live legacy jobs DB. The archive review
+# API is opt-in, and every mutation still needs an explicit request guard.
+storage_v2:
+  db_path: state/storage-v2.sqlite3
+  # Preserve-first imports reject a target nested under the legacy iCloud root.
+  records_root: "~/Library/Application Support/lecture_stt/storage-v2/records"
+  analytics:
+    enabled: false
+  library:
+    enabled: false
+  archive_review:
+    enabled: false
+    status_writes_enabled: false
+    promotions_enabled: false
+  timetable:
+    # CSV/JSON import and classification generation remain CLI-only. These
+    # flags expose imported metadata/reviews and explicit review writes only.
+    enabled: false
+    status_writes_enabled: false
+    confirmations_enabled: false
+  title_review:
+    # Title proposals are generated separately; the web panel only exposes the
+    # review queue plus explicit reject/confirmation guards.
+    enabled: false
+    status_writes_enabled: false
+    confirmations_enabled: false
+
 engine:
   engine: faster-whisper
 
@@ -28,6 +55,46 @@ transcribe:
   word_timestamps: false
   condition_on_previous_text: true
   keep_model_loaded: false
+
+# 활성 프로필은 전사 실행 시점에 snapshot(key/version/hash)으로 기록된다.
+# 일반 녹음을 기본값으로 두고, 강의/회의/메모는 필요할 때 active만 바꾼다.
+profiles:
+  active: general
+  definitions:
+    general:
+      version: "2026-07-23.1"
+      transcribe:
+        initial_prompt: ""
+      postprocess:
+        corrections: {}
+      quality:
+        warn_threshold: 0.55
+        bad_threshold: 0.70
+    lecture:
+      version: "2026-07-23.1"
+      transcribe:
+        initial_prompt: "한국어 대학 수업 녹음입니다."
+      quality:
+        warn_threshold: 0.55
+        bad_threshold: 0.70
+    meeting:
+      version: "2026-07-23.1"
+      transcribe:
+        initial_prompt: "한국어 회의 및 대화 녹음입니다."
+      postprocess:
+        corrections: {}
+      quality:
+        warn_threshold: 0.55
+        bad_threshold: 0.70
+    memo:
+      version: "2026-07-23.1"
+      transcribe:
+        initial_prompt: "한국어 개인 음성 메모입니다."
+      postprocess:
+        corrections: {}
+      quality:
+        warn_threshold: 0.55
+        bad_threshold: 0.70
 
 ffmpeg:
   binary_path: ffmpeg
@@ -52,6 +119,7 @@ notification:
   enabled: true
   send_start: true
   send_success: true
+  send_review: true
   send_failure: true
   dual_send_providers: []
 
@@ -74,29 +142,29 @@ downstream:
       gh_course_dir: "01_logic_circuits"
       obsidian_course_dir: "01_logic_circuits"
       display_name: "논리회로"
-      obsidian_note_dir: "강의록"
+      obsidian_note_dir: "06_lecture_notes/01_summarize"
     DStr:
       gh_course_dir: "02_data_structures"
       obsidian_course_dir: "02_data_structures"
       display_name: "자료구조"
-      obsidian_note_dir: "강의록"
+      obsidian_note_dir: "06_lecture_notes/01_summarize"
     DS:
       gh_course_dir: "03_data_science"
       obsidian_course_dir: "03_data_science"
       display_name: "데이터사이언스"
-      obsidian_note_dir: "강의록"
+      obsidian_note_dir: "06_lecture_notes/01_summarize"
     LA:
       gh_course_dir: "04_linear_algebra"
       obsidian_course_dir: "04_linear_algebra"
       display_name: "선형대수학"
-      obsidian_note_dir: "강의록"
+      obsidian_note_dir: "06_lecture_notes/01_summarize"
     OOP:
       gh_course_dir: "05_object_oriented_programming"
       obsidian_course_dir: "05_object_oriented_programming"
       display_name: "객체지향언어"
-      obsidian_note_dir: "강의록"
+      obsidian_note_dir: "06_lecture_notes/01_summarize"
     Unix:
       gh_course_dir: "06_unix_fundamentals"
       obsidian_course_dir: "06_unix_fundamentals"
       display_name: "유닉스 기초"
-      obsidian_note_dir: "강의록"
+      obsidian_note_dir: "06_lecture_notes/01_summarize"

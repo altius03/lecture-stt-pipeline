@@ -12,6 +12,7 @@ from typing import Any
 import yaml
 
 from lecture_stt.downstream.lib import (
+    DEFAULT_OBSIDIAN_NOTE_DIR,
     DownstreamConfig,
     DownstreamDistributor,
     SubjectRoute,
@@ -191,7 +192,7 @@ def load_worker_config(config_path: str = "config/config.yaml") -> DownstreamCon
             gh_course_dir=str(payload["gh_course_dir"]),
             obsidian_course_dir=str(payload["obsidian_course_dir"]),
             display_name=str(payload.get("display_name", abbr)),
-            obsidian_note_dir=str(payload.get("obsidian_note_dir", "강의록")),
+            obsidian_note_dir=str(payload.get("obsidian_note_dir", DEFAULT_OBSIDIAN_NOTE_DIR)),
         )
 
     return DownstreamConfig(

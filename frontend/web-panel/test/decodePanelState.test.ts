@@ -17,6 +17,7 @@ function createStatePayload() {
     counts: {
       PENDING: 2,
       PROCESSING: 1,
+      NEEDS_REVIEW: 1,
       DONE: 10,
       ERROR: 0,
       UNREGISTERED: 3,
@@ -125,6 +126,7 @@ describe("decodePanelState", () => {
     expect(state.actions.endpoints.logs).toBe("/api/custom-logs")
     expect(state.notification.selection).toBe("telegram")
     expect(state.summary.current_job?.eta_sec).toBe(120)
+    expect(state.counts.NEEDS_REVIEW).toBe(1)
     expect(state.jobs_v2[0]?.status).toBe("PROCESSING")
   })
 
@@ -163,5 +165,14 @@ describe("decodePanelState", () => {
     expect(state.notification.selected_label).toBe("미지원 백엔드")
     expect(state.notification.options[0]?.available).toBe(false)
     expect(state.notification.options[3]?.available).toBe(true)
+  })
+
+  it("defaults NEEDS_REVIEW count to zero for older schema_version 2 payloads", () => {
+    const payload = createStatePayload()
+    delete (payload.counts as { NEEDS_REVIEW?: number }).NEEDS_REVIEW
+
+    const state = decodePanelState(payload)
+
+    expect(state.counts.NEEDS_REVIEW).toBe(0)
   })
 })

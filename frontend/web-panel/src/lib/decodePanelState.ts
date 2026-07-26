@@ -52,6 +52,17 @@ function readNumber(record: Record<string, unknown>, key: string, label: string)
   return value
 }
 
+function readOptionalNumber(record: Record<string, unknown>, key: string, label: string): number | null {
+  const value = record[key]
+  if (value === undefined) {
+    return null
+  }
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new Error(`${label}.${key} 값이 숫자가 아닙니다.`)
+  }
+  return value
+}
+
 function readBoolean(record: Record<string, unknown>, key: string, label: string): boolean {
   const value = record[key]
   if (typeof value !== "boolean") {
@@ -97,6 +108,7 @@ function decodeCounts(input: unknown): CountSummary {
   return {
     PENDING: readNumber(record, "PENDING", "counts"),
     PROCESSING: readNumber(record, "PROCESSING", "counts"),
+    NEEDS_REVIEW: readOptionalNumber(record, "NEEDS_REVIEW", "counts") ?? 0,
     DONE: readNumber(record, "DONE", "counts"),
     ERROR: readNumber(record, "ERROR", "counts"),
     UNREGISTERED: readNumber(record, "UNREGISTERED", "counts"),

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import signal
 import sqlite3
@@ -14,10 +15,64 @@ from typing import Any
 
 from lecture_stt.shared import db
 from lecture_stt.shared.paths import env_file, package_env, resolve_config_path, runtime_env, venv_python
+from lecture_stt.storage_v2.analytics import (
+    disabled_transcription_analytics,
+    read_transcription_analytics,
+)
+from lecture_stt.storage_v2.archive_review import (
+    ArchiveReviewWriteDisabledError,
+    apply_archive_review_promotion,
+    list_archive_review_cases,
+    plan_archive_review_promotion,
+    read_archive_review_case,
+    update_archive_review_status,
+)
+from lecture_stt.storage_v2.library import (
+    RecordingLibraryDisabledError,
+    disabled_recording_library_list,
+    list_recordings,
+    read_recording_detail,
+)
+from lecture_stt.storage_v2.title_suggestions import (
+    TitleSuggestionWriteDisabledError,
+    apply_title_suggestion_confirmation,
+    list_title_suggestions,
+    plan_title_suggestion_confirmation,
+    read_title_suggestion,
+    reject_title_suggestion,
+)
+from lecture_stt.storage_v2.timetable import (
+    TimetableWriteDisabledError,
+    apply_classification_confirmation,
+    list_classification_proposals,
+    list_timetable_entries,
+    plan_classification_confirmation,
+    read_classification_proposal,
+    update_classification_status,
+)
+from lecture_stt.storage_v2.unified_review import read_unified_review_feed
 import yaml
 
 
 NOTIFICATION_SELECTIONS = ("telegram", "discord", "both", "disabled")
+
+
+def _prometheus_escape_label(value: str) -> str:
+    return (
+        value.replace("\\", "\\\\")
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace('"', '\\"')
+    )
+
+
+def _prometheus_labels(labels: dict[str, str]) -> str:
+    if not labels:
+        return ""
+    payload = ",".join(
+        f'{key}="{_prometheus_escape_label(value)}"' for key, value in labels.items()
+    )
+    return f"{{{payload}}}"
 
 
 class ControlState:
@@ -133,6 +188,7 @@ class ControlState:
             "enabled": True,
             "send_start": True,
             "send_success": True,
+            "send_review": True,
             "send_failure": True,
             "dual_send_providers": [],
         }
@@ -325,6 +381,845 @@ class ControlState:
         if not isinstance(configured, str) or not configured.strip():
             return Path()
         return resolve_config_path(configured, base_dir=self.repo_root, env=self._runtime_env())
+
+    def _transcription_analytics_settings(self) -> dict[str, Any]:
+        storage_config = self.config_data.get("storage_v2")
+        if not isinstance(storage_config, dict):
+            storage_config = {}
+        analytics_config = storage_config.get("analytics")
+        if not isinstance(analytics_config, dict):
+            analytics_config = {}
+        enabled = analytics_config.get("enabled") is True
+        if not enabled:
+            return {"enabled": False}
+
+        configured_records_root = storage_config.get("records_root")
+        if (
+            not isinstance(configured_records_root, str)
+            or not configured_records_root.strip()
+        ):
+            raise RuntimeError(
+                "storage_v2.records_root must be configured when transcription analytics is enabled"
+            )
+        configured_db_path = storage_config.get(
+            "db_path",
+            "state/storage-v2.sqlite3",
+        )
+        return {
+            "enabled": True,
+            "db_path": resolve_config_path(
+                str(configured_db_path),
+                base_dir=self.repo_root,
+                env=self._runtime_env(),
+            ),
+            "records_root": resolve_config_path(
+                configured_records_root,
+                base_dir=self.repo_root,
+                env=self._runtime_env(),
+            ),
+        }
+
+    def transcription_analytics(
+        self,
+        *,
+        period: str = "week",
+    ) -> dict[str, Any]:
+        settings = self._transcription_analytics_settings()
+        if not settings["enabled"]:
+            return disabled_transcription_analytics(period)
+        return read_transcription_analytics(
+            settings["db_path"],
+            settings["records_root"],
+            period=period,
+        )
+
+    def transcription_analytics_prometheus(self, *, period: str = "week") -> str:
+        payload = self.transcription_analytics(period=period)
+        period_label = str(payload.get("period", period))
+        available_label = (
+            "true"
+            if payload.get("available") is True
+            else "false"
+        )
+        lines: list[str] = []
+        emitted_families: set[str] = set()
+
+        def push_metric(
+            name: str,
+            doc: str,
+            value: float | int | None,
+            labels: dict[str, str],
+            metric_type: str = "gauge",
+        ) -> None:
+            if value is None:
+                return
+            safe_value = float(value)
+            if not math.isfinite(safe_value):
+                return
+            if name not in emitted_families:
+                lines.append(f"# HELP {name} {doc}")
+                lines.append(f"# TYPE {name} {metric_type}")
+                emitted_families.add(name)
+            rendered_value = (
+                str(int(safe_value))
+                if safe_value.is_integer()
+                else format(safe_value, ".15g")
+            )
+            lines.append(f"{name}{_prometheus_labels(labels)} {rendered_value}")
+
+        base_labels = {
+            "period": period_label,
+            "available": available_label,
+        }
+
+        coverage = payload.get("coverage", {})
+        totals = payload.get("totals", {})
+        status_distribution = payload.get("status_distribution", [])
+        quality_distribution = payload.get("quality_distribution", [])
+        classification_distribution = payload.get("classification_distribution", [])
+        freshness = payload.get("freshness", {})
+        window = payload.get("window", {})
+
+        for row in status_distribution:
+            status = str(row.get("status", "unknown"))
+            count = row.get("count", 0)
+            push_metric(
+                "lecture_stt_transcriptions_jobs_in_window",
+                "분석 윈도우의 상태별 전사 작업 수",
+                int(count),
+                {**base_labels, "status": status},
+            )
+
+        for row in quality_distribution:
+            band = str(row.get("band", "unscored"))
+            count = row.get("count", 0)
+            push_metric(
+                "lecture_stt_transcriptions_quality_band_jobs",
+                "분석 윈도우의 품질 점수 구간별 전사 작업 수",
+                int(count),
+                {**base_labels, "band": band},
+            )
+
+        for row in classification_distribution:
+            context_type = row.get("context_type")
+            source = row.get("source")
+            count = row.get("count", 0)
+            push_metric(
+                "lecture_stt_transcriptions_classification_jobs",
+                "분석 윈도우의 분류별 전사 작업 수",
+                int(count),
+                {
+                    **base_labels,
+                    "context_type": (
+                        "미분류"
+                        if context_type is None
+                        else str(context_type)
+                    ),
+                    "source": "미분류" if source is None else str(source),
+                },
+            )
+
+        push_metric(
+            "lecture_stt_transcriptions_average_quality_score",
+            "전사 품질 점수 평균",
+            None
+            if totals.get("average_quality_score") is None
+            else float(totals["average_quality_score"]),
+            base_labels,
+        )
+        push_metric(
+            "lecture_stt_transcriptions_audio_duration_seconds",
+            "전사 오디오 시간 총합(초)",
+            None if totals.get("audio_duration_sec") is None else float(totals["audio_duration_sec"]),
+            base_labels,
+        )
+        push_metric(
+            "lecture_stt_transcriptions_processing_seconds",
+            "전사 처리 시간 총합(초)",
+            None
+            if totals.get("total_processing_sec") is None
+            else float(totals["total_processing_sec"]),
+            base_labels,
+        )
+
+        push_metric(
+            "lecture_stt_transcriptions_jobs_in_window_overall",
+            "분석 윈도우의 전체 전사 작업 수",
+            int(totals.get("jobs", 0)),
+            base_labels,
+            metric_type="gauge",
+        )
+
+        push_metric(
+            "lecture_stt_transcriptions_quality_missing_jobs",
+            "분석 윈도우의 품질 점수 누락 작업 수",
+            int(coverage.get("quality_missing", 0)),
+            base_labels,
+        )
+        push_metric(
+            "lecture_stt_transcriptions_quality_invalid_jobs",
+            "분석 윈도우의 품질 점수 무효 작업 수",
+            int(coverage.get("quality_invalid", 0)),
+            base_labels,
+        )
+        push_metric(
+            "lecture_stt_transcriptions_quality_scored_jobs",
+            "분석 윈도우의 품질 점수 보유 작업 수",
+            int(coverage.get("quality_scored", 0)),
+            base_labels,
+        )
+
+        generated_at = freshness.get("generated_at")
+        latest_event_at = freshness.get("latest_event_at")
+        if isinstance(generated_at, str):
+            try:
+                generated_unix = datetime.fromisoformat(generated_at).timestamp()
+                push_metric(
+                    "lecture_stt_transcriptions_generated_epoch_seconds",
+                    "분석 데이터 생성 시각(UNIX epoch)",
+                    float(generated_unix),
+                    base_labels,
+                    metric_type="gauge",
+                )
+            except ValueError:
+                pass
+        if isinstance(latest_event_at, str):
+            try:
+                latest_event_unix = datetime.fromisoformat(latest_event_at).timestamp()
+                push_metric(
+                    "lecture_stt_transcriptions_latest_event_epoch_seconds",
+                    "최신 이벤트 시각(UNIX epoch)",
+                    float(latest_event_unix),
+                    base_labels,
+                    metric_type="gauge",
+                )
+            except ValueError:
+                pass
+
+        start_at = window.get("start_at")
+        end_at = window.get("end_at")
+        if isinstance(start_at, str):
+            try:
+                start_unix = datetime.fromisoformat(start_at).timestamp()
+                push_metric(
+                    "lecture_stt_transcriptions_window_start_epoch_seconds",
+                    "분석 윈도우 시작 시각(UNIX epoch)",
+                    float(start_unix),
+                    base_labels,
+                    metric_type="gauge",
+                )
+            except ValueError:
+                pass
+        if isinstance(end_at, str):
+            try:
+                end_unix = datetime.fromisoformat(end_at).timestamp()
+                push_metric(
+                    "lecture_stt_transcriptions_window_end_epoch_seconds",
+                    "분석 윈도우 종료 시각(UNIX epoch)",
+                    float(end_unix),
+                    base_labels,
+                    metric_type="gauge",
+                )
+            except ValueError:
+                pass
+
+        return "\n".join(lines) + "\n"
+
+    def _recording_library_settings(self) -> dict[str, Any]:
+        storage_config = self.config_data.get("storage_v2")
+        if not isinstance(storage_config, dict):
+            storage_config = {}
+        library_config = storage_config.get("library")
+        if not isinstance(library_config, dict):
+            library_config = {}
+        configured_db_path = storage_config.get(
+            "db_path",
+            "state/storage-v2.sqlite3",
+        )
+        return {
+            "enabled": library_config.get("enabled") is True,
+            "db_path": resolve_config_path(
+                str(configured_db_path),
+                base_dir=self.repo_root,
+                env=self._runtime_env(),
+            ),
+        }
+
+    def recording_library_list(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        settings = self._recording_library_settings()
+        if not settings["enabled"]:
+            return disabled_recording_library_list(
+                limit=limit,
+                offset=offset,
+            )
+        return list_recordings(
+            settings["db_path"],
+            limit=limit,
+            offset=offset,
+        )
+
+    def recording_library_detail(
+        self,
+        storage_key: str,
+    ) -> dict[str, Any]:
+        settings = self._recording_library_settings()
+        if not settings["enabled"]:
+            raise RecordingLibraryDisabledError(
+                "Recording library API is disabled"
+            )
+        return read_recording_detail(
+            settings["db_path"],
+            storage_key,
+        )
+
+    def unified_review_feed(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        archive_settings = self._archive_review_settings()
+        timetable_settings = self._timetable_settings()
+        title_settings = self._title_review_settings()
+        recording_settings = self._recording_library_settings()
+        return read_unified_review_feed(
+            archive_settings["db_path"],
+            archive_enabled=bool(archive_settings["enabled"]),
+            timetable_enabled=bool(timetable_settings["enabled"]),
+            title_enabled=bool(title_settings["enabled"]),
+            recording_enabled=bool(recording_settings["enabled"]),
+            limit=limit,
+            offset=offset,
+        )
+
+    def _title_review_settings(self) -> dict[str, Any]:
+        storage_config = self.config_data.get("storage_v2")
+        if not isinstance(storage_config, dict):
+            storage_config = {}
+        title_config = storage_config.get("title_review")
+        if not isinstance(title_config, dict):
+            title_config = {}
+        configured_db_path = storage_config.get(
+            "db_path",
+            "state/storage-v2.sqlite3",
+        )
+        configured_records_root = storage_config.get("records_root")
+        enabled = title_config.get("enabled") is True
+        return {
+            "enabled": enabled,
+            "confirmations_enabled": (
+                title_config.get("confirmations_enabled") is True
+            ),
+            "status_writes_enabled": (
+                title_config.get("status_writes_enabled") is True
+            ),
+            "db_path": (
+                resolve_config_path(
+                    str(configured_db_path),
+                    base_dir=self.repo_root,
+                    env=self._runtime_env(),
+                )
+                if enabled
+                else None
+            ),
+            "records_root_value": configured_records_root,
+        }
+
+    @staticmethod
+    def _disabled_title_review_list(
+        *,
+        status: str | None,
+        limit: int,
+        offset: int,
+    ) -> dict[str, Any]:
+        return {
+            "schema_version": "storage-v2/title-suggestion-list@1",
+            "available": False,
+            "disabled_reason": "title_review_disabled",
+            "counts": {
+                "suggested": 0,
+                "confirmed": 0,
+                "rejected": 0,
+            },
+            "total": 0,
+            "proposals": [],
+            "capabilities": {
+                "confirmations_enabled": False,
+                "status_writes_enabled": False,
+            },
+        }
+
+    def _require_title_review_records_root(
+        self,
+        settings: dict[str, Any],
+    ) -> Path:
+        records_root_value = settings.get("records_root_value")
+        if records_root_value is None:
+            raise ValueError("Title review requires storage_v2.records_root")
+        if not isinstance(records_root_value, str):
+            records_root_value = str(records_root_value)
+        return resolve_config_path(
+            records_root_value,
+            base_dir=self.repo_root,
+            env=self._runtime_env(),
+        )
+
+    def title_review_list(
+        self,
+        *,
+        status: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        settings = self._title_review_settings()
+        if not settings["enabled"]:
+            return self._disabled_title_review_list(
+                status=status,
+                limit=limit,
+                offset=offset,
+            )
+        payload = list_title_suggestions(
+            settings["db_path"],
+            status=status,
+            limit=limit,
+            offset=offset,
+        )
+        if not payload.get("available", False):
+            payload["disabled_reason"] = "storage_v2_db_unavailable"
+            payload["capabilities"] = {
+                "confirmations_enabled": False,
+                "status_writes_enabled": False,
+            }
+            return payload
+        payload["capabilities"] = {
+            "confirmations_enabled": settings["confirmations_enabled"],
+            "status_writes_enabled": settings["status_writes_enabled"],
+        }
+        return payload
+
+    def title_review_detail(
+        self,
+        proposal_id: int,
+    ) -> dict[str, Any]:
+        settings = self._title_review_settings()
+        if not settings["enabled"]:
+            raise TitleSuggestionWriteDisabledError(
+                "Title review API is disabled"
+            )
+        payload = read_title_suggestion(
+            settings["db_path"],
+            proposal_id,
+        )
+        payload["capabilities"] = {
+            "confirmations_enabled": settings["confirmations_enabled"],
+            "status_writes_enabled": settings["status_writes_enabled"],
+        }
+        return payload
+
+    def title_review_status_update(
+        self,
+        proposal_id: int,
+        *,
+        status: str,
+        allow_write: bool = False,
+    ) -> dict[str, Any]:
+        settings = self._title_review_settings()
+        if not settings["enabled"]:
+            raise TitleSuggestionWriteDisabledError(
+                "Title review API is disabled"
+            )
+        normalized_status = str(status or "").strip().lower()
+        if normalized_status != "rejected":
+            raise ValueError("status must be rejected")
+        return reject_title_suggestion(
+            settings["db_path"],
+            proposal_id,
+            status_writes_enabled=bool(
+                settings["status_writes_enabled"]
+            ),
+            allow_write=allow_write,
+        )
+
+    def title_review_confirmation_plan(
+        self,
+        proposal_id: int,
+    ) -> dict[str, Any]:
+        settings = self._title_review_settings()
+        if not settings["enabled"]:
+            raise TitleSuggestionWriteDisabledError(
+                "Title review API is disabled"
+            )
+        return plan_title_suggestion_confirmation(
+            settings["db_path"],
+            self._require_title_review_records_root(settings),
+            proposal_id,
+        )
+
+    def title_review_confirmation_apply(
+        self,
+        proposal_id: int,
+        *,
+        expected_count: int,
+        expected_plan_sha256: str,
+        allow_write: bool = False,
+    ) -> dict[str, Any]:
+        settings = self._title_review_settings()
+        if not settings["enabled"]:
+            raise TitleSuggestionWriteDisabledError(
+                "Title review API is disabled"
+            )
+        return apply_title_suggestion_confirmation(
+            settings["db_path"],
+            self._require_title_review_records_root(settings),
+            proposal_id,
+            expected_count=expected_count,
+            expected_plan_sha256=expected_plan_sha256,
+            confirmations_enabled=bool(
+                settings["confirmations_enabled"]
+            ),
+            allow_write=allow_write,
+        )
+
+    def _archive_review_settings(self) -> dict[str, Any]:
+        storage_config = self.config_data.get("storage_v2")
+        if not isinstance(storage_config, dict):
+            storage_config = {}
+        review_config = storage_config.get("archive_review")
+        if not isinstance(review_config, dict):
+            review_config = {}
+        configured_db_path = storage_config.get(
+            "db_path",
+            "state/storage-v2.sqlite3",
+        )
+        return {
+            # Only a YAML boolean true enables these gates. Strings such as
+            # "true" or "false" remain fail-closed.
+            "enabled": review_config.get("enabled") is True,
+            "status_writes_enabled": (
+                review_config.get("status_writes_enabled") is True
+            ),
+            "promotions_enabled": (
+                review_config.get("promotions_enabled") is True
+            ),
+            "db_path": resolve_config_path(
+                str(configured_db_path),
+                base_dir=self.repo_root,
+                env=self._runtime_env(),
+            ),
+        }
+
+    @staticmethod
+    def _disabled_archive_review_list(
+        *,
+        review_status: str | None,
+        limit: int,
+        offset: int,
+    ) -> dict[str, Any]:
+        return {
+            "schema_version": "storage-v2/archive-review-list@1",
+            "available": False,
+            "disabled_reason": "archive_review_disabled",
+            "filters": {
+                "review_status": review_status,
+                "limit": limit,
+                "offset": offset,
+            },
+            "counts": {
+                "open": 0,
+                "triaged": 0,
+                "resolved": 0,
+                "dismissed": 0,
+            },
+            "total": 0,
+            "cases": [],
+            "capabilities": {
+                "status_writes_enabled": False,
+                "promotions_enabled": False,
+            },
+        }
+
+    def archive_review_list(
+        self,
+        *,
+        review_status: str | None = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        settings = self._archive_review_settings()
+        if not settings["enabled"]:
+            return self._disabled_archive_review_list(
+                review_status=review_status,
+                limit=limit,
+                offset=offset,
+            )
+        payload = list_archive_review_cases(
+            settings["db_path"],
+            review_status=review_status,
+            limit=limit,
+            offset=offset,
+        )
+        payload["capabilities"] = {
+            "status_writes_enabled": settings["status_writes_enabled"],
+            "promotions_enabled": settings["promotions_enabled"],
+        }
+        return payload
+
+    def archive_review_detail(self, case_key: str) -> dict[str, Any]:
+        settings = self._archive_review_settings()
+        if not settings["enabled"]:
+            raise ArchiveReviewWriteDisabledError(
+                "Archive evidence review API is disabled"
+            )
+        payload = read_archive_review_case(settings["db_path"], case_key)
+        payload["capabilities"] = {
+            "status_writes_enabled": settings["status_writes_enabled"],
+            "promotions_enabled": settings["promotions_enabled"],
+        }
+        return payload
+
+    def archive_review_update_status(
+        self,
+        case_key: str,
+        review_status: str,
+        *,
+        allow_write: bool = False,
+    ) -> dict[str, Any]:
+        settings = self._archive_review_settings()
+        if not settings["enabled"]:
+            raise ArchiveReviewWriteDisabledError(
+                "Archive evidence review API is disabled"
+            )
+        return update_archive_review_status(
+            settings["db_path"],
+            case_key,
+            review_status,
+            allow_write=bool(
+                settings["status_writes_enabled"] and allow_write
+            ),
+        )
+
+    def archive_review_plan_promotion(
+        self,
+        case_key: str,
+        *,
+        target_storage_key: str,
+        selected_revisions: dict[str, int],
+    ) -> dict[str, Any]:
+        settings = self._archive_review_settings()
+        if not settings["enabled"]:
+            raise ArchiveReviewWriteDisabledError(
+                "Archive evidence review API is disabled"
+            )
+        return plan_archive_review_promotion(
+            settings["db_path"],
+            case_key,
+            target_storage_key=target_storage_key,
+            selected_revisions=selected_revisions,
+        )
+
+    def archive_review_apply_promotion(
+        self,
+        case_key: str,
+        *,
+        target_storage_key: str,
+        selected_revisions: dict[str, int],
+        expected_count: int,
+        expected_plan_sha256: str,
+        allow_write: bool = False,
+    ) -> dict[str, Any]:
+        settings = self._archive_review_settings()
+        if not settings["enabled"]:
+            raise ArchiveReviewWriteDisabledError(
+                "Archive evidence review API is disabled"
+            )
+        return apply_archive_review_promotion(
+            settings["db_path"],
+            case_key,
+            target_storage_key=target_storage_key,
+            selected_revisions=selected_revisions,
+            expected_count=expected_count,
+            expected_plan_sha256=expected_plan_sha256,
+            promotions_enabled=bool(settings["promotions_enabled"]),
+            allow_write=allow_write,
+        )
+
+    def _timetable_settings(self) -> dict[str, Any]:
+        storage_config = self.config_data.get("storage_v2")
+        if not isinstance(storage_config, dict):
+            storage_config = {}
+        timetable_config = storage_config.get("timetable")
+        if not isinstance(timetable_config, dict):
+            timetable_config = {}
+        configured_db_path = storage_config.get(
+            "db_path",
+            "state/storage-v2.sqlite3",
+        )
+        return {
+            "enabled": timetable_config.get("enabled") is True,
+            "confirmations_enabled": (
+                timetable_config.get("confirmations_enabled") is True
+            ),
+            "status_writes_enabled": (
+                timetable_config.get("status_writes_enabled") is True
+            ),
+            "db_path": resolve_config_path(
+                str(configured_db_path),
+                base_dir=self.repo_root,
+                env=self._runtime_env(),
+            ),
+        }
+
+    def timetable_list(
+        self,
+        *,
+        semester: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        settings = self._timetable_settings()
+        if not settings["enabled"]:
+            return {
+                "schema_version": "storage-v2/timetable-list@1",
+                "available": False,
+                "disabled_reason": "timetable_api_disabled",
+                "semester": semester,
+                "total": 0,
+                "entries": [],
+                "capabilities": {
+                    "confirmations_enabled": False,
+                    "status_writes_enabled": False,
+                },
+            }
+        payload = list_timetable_entries(
+            settings["db_path"],
+            semester=semester,
+            limit=limit,
+            offset=offset,
+        )
+        payload["capabilities"] = {
+            "confirmations_enabled": settings["confirmations_enabled"],
+            "status_writes_enabled": settings["status_writes_enabled"],
+        }
+        return payload
+
+    def timetable_classification_list(
+        self,
+        *,
+        status: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        settings = self._timetable_settings()
+        if not settings["enabled"]:
+            return {
+                "schema_version": "storage-v2/classification-proposal-list@1",
+                "available": False,
+                "disabled_reason": "timetable_api_disabled",
+                "counts": {
+                    "suggested": 0,
+                    "confirmed": 0,
+                    "rejected": 0,
+                },
+                "total": 0,
+                "proposals": [],
+                "capabilities": {
+                    "confirmations_enabled": False,
+                    "status_writes_enabled": False,
+                },
+            }
+        payload = list_classification_proposals(
+            settings["db_path"],
+            status=status,
+            limit=limit,
+            offset=offset,
+        )
+        payload["capabilities"] = {
+            "confirmations_enabled": settings["confirmations_enabled"],
+            "status_writes_enabled": settings["status_writes_enabled"],
+        }
+        return payload
+
+    def timetable_classification_detail(
+        self,
+        proposal_id: int,
+    ) -> dict[str, Any]:
+        settings = self._timetable_settings()
+        if not settings["enabled"]:
+            raise TimetableWriteDisabledError(
+                "Timetable review API is disabled"
+            )
+        payload = read_classification_proposal(
+            settings["db_path"],
+            proposal_id,
+        )
+        payload["capabilities"] = {
+            "confirmations_enabled": settings["confirmations_enabled"],
+            "status_writes_enabled": settings["status_writes_enabled"],
+        }
+        return payload
+
+    def timetable_classification_status_update(
+        self,
+        proposal_id: int,
+        *,
+        status: str,
+        allow_write: bool = False,
+    ) -> dict[str, Any]:
+        settings = self._timetable_settings()
+        if not settings["enabled"]:
+            raise TimetableWriteDisabledError(
+                "Timetable review API is disabled"
+            )
+        return update_classification_status(
+            settings["db_path"],
+            proposal_id,
+            status=status,
+            status_writes_enabled=bool(
+                settings["status_writes_enabled"]
+            ),
+            allow_write=allow_write,
+        )
+
+    def timetable_confirmation_plan(
+        self,
+        proposal_id: int,
+    ) -> dict[str, Any]:
+        settings = self._timetable_settings()
+        if not settings["enabled"]:
+            raise TimetableWriteDisabledError(
+                "Timetable review API is disabled"
+            )
+        return plan_classification_confirmation(
+            settings["db_path"],
+            proposal_id,
+        )
+
+    def timetable_confirmation_apply(
+        self,
+        proposal_id: int,
+        *,
+        expected_count: int,
+        expected_plan_sha256: str,
+        allow_write: bool = False,
+    ) -> dict[str, Any]:
+        settings = self._timetable_settings()
+        if not settings["enabled"]:
+            raise TimetableWriteDisabledError(
+                "Timetable review API is disabled"
+            )
+        return apply_classification_confirmation(
+            settings["db_path"],
+            proposal_id,
+            expected_count=expected_count,
+            expected_plan_sha256=expected_plan_sha256,
+            confirmations_enabled=bool(settings["confirmations_enabled"]),
+            allow_write=allow_write,
+        )
 
     def _worker_cmd(self, *extra: str) -> list[str]:
         cmd = [str(self.python_bin), "-m", self.worker_module]
@@ -556,7 +1451,14 @@ class ControlState:
             threading.Thread(target=callback, daemon=True).start()
 
     def _db_counts(self) -> dict[str, int]:
-        counts = {"PENDING": 0, "PROCESSING": 0, "DONE": 0, "ERROR": 0, "UNREGISTERED": 0}
+        counts = {
+            "PENDING": 0,
+            "PROCESSING": 0,
+            "NEEDS_REVIEW": 0,
+            "DONE": 0,
+            "ERROR": 0,
+            "UNREGISTERED": 0,
+        }
         try:
             with sqlite3.connect(self.db_path, timeout=3.0) as conn:
                 conn.execute("PRAGMA busy_timeout = 3000")
@@ -711,7 +1613,7 @@ class ControlState:
                 pass
 
     def clear_history(self) -> None:
-        """완료/오류 이력과 로그를 수동 초기화한다. 사용자가 버튼을 눌렀을 때만 실행."""
+        """완료/오류 이력과 로그만 정리하고 확인 필요 작업은 보존한다."""
         try:
             with sqlite3.connect(self.db_path, timeout=3.0) as conn:
                 conn.execute("PRAGMA busy_timeout = 3000")
@@ -727,7 +1629,7 @@ class ControlState:
         except Exception:
             pass
 
-        self.notice = "이력 및 로그가 초기화되었습니다."
+        self.notice = "완료/오류 이력과 로그를 정리했습니다. 확인 필요 항목은 보존됩니다."
         self._set_poll_boost()
 
     def _folder_counts(self) -> dict[str, str]:

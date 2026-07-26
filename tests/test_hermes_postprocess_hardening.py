@@ -49,6 +49,27 @@ def _write_raw_pair(lecture_root: Path, stem: str, body: str = RAW_SENTINEL) -> 
     (transcript_dir / f"{stem}.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
 
+def _write_quality_scorecard(lecture_root: Path, stem: str, *, health: str, malformed: bool = False) -> None:
+    transcript_dir = lecture_root / "02_transcripts"
+    transcript_dir.mkdir(parents=True, exist_ok=True)
+    scorecard_path = transcript_dir / f"{stem}.quality.json"
+    if malformed:
+        scorecard_path.write_text("{not-json", encoding="utf-8")
+        return
+    scorecard_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "lecture_stt_quality_scorecard",
+                "canonical_base": stem,
+                "health": health,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+
 def _write_correction_pair(lecture_root: Path, stem: str) -> None:
     correction_dir = lecture_root / "03_correction"
     correction_dir.mkdir(parents=True, exist_ok=True)
@@ -348,6 +369,23 @@ class HermesPostprocessOperatorHardeningTests(unittest.TestCase):
             self.assertTrue(active_claim.exists())
             self.assertFalse(stale_claim.exists())
 
+    def test_operator_select_candidate_skips_bad_quality_and_selects_next_stem(self) -> None:
+        from scripts.hermes_postprocess.operator import OperatorConfig, select_candidate
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            lecture_root = _make_operator_fixture(root)
+            _write_raw_pair(lecture_root, "260504DS_1")
+            _write_quality_scorecard(lecture_root, "260504DS_1", health="bad")
+            _write_raw_pair(lecture_root, "260504DS_2")
+            config = OperatorConfig(repo_root=root, lecture_root=lecture_root, hermes_bin=Path("/bin/false"), stable_for_sec=0)
+
+            candidate = select_candidate(config, now=FIXED_NOW)
+
+        self.assertIsNotNone(candidate)
+        assert candidate is not None
+        self.assertEqual(candidate.stem, "260504DS_2")
+
     def test_operator_acquires_claim_atomically_without_overwriting_existing_claim(self) -> None:
         from scripts.hermes_postprocess.operator import OperatorConfig, acquire_claim, select_candidate
 
@@ -368,6 +406,62 @@ class HermesPostprocessOperatorHardeningTests(unittest.TestCase):
         self.assertIn("260504DS_2", claim_text)
         self.assertIn('"status": "claimed"', claim_text)
         self.assertNotIn(RAW_SENTINEL, claim_text)
+
+    def test_operator_run_once_skips_malformed_quality_and_runs_next_candidate(self) -> None:
+        from scripts.hermes_postprocess.operator import ChildRunResult, OperatorConfig, run_once
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            lecture_root = _make_operator_fixture(root)
+            _write_raw_pair(lecture_root, "260504DS_1")
+            _write_quality_scorecard(lecture_root, "260504DS_1", health="warn", malformed=True)
+            _write_raw_pair(lecture_root, "260504DS_2")
+            config = OperatorConfig(repo_root=root, lecture_root=lecture_root, hermes_bin=Path("/bin/false"), stable_for_sec=0)
+            seen_stems: list[str] = []
+
+            def child_runner(candidate: object, _candidate_path: Path, _config: object) -> ChildRunResult:
+                seen_stems.append(candidate.stem)  # type: ignore[attr-defined]
+                return ChildRunResult(exit_code=1, log_path=root / "child.log")
+
+            outcome = run_once(config, child_runner=child_runner, now=FIXED_NOW)
+            skipped_claim_exists = (root / "state" / "hermes_postprocess" / "claims" / "260504DS_1.json").exists()
+            selected_claim_exists = (root / "state" / "hermes_postprocess" / "claims" / "260504DS_2.json").exists()
+
+        self.assertEqual(seen_stems, ["260504DS_2"])
+        self.assertEqual(outcome["kind"], "failed")
+        self.assertEqual(outcome["stem"], "260504DS_2")
+        self.assertFalse(skipped_claim_exists)
+        self.assertTrue(selected_claim_exists)
+
+    def test_run_once_resets_stale_staging_before_child_attempt(self) -> None:
+        from scripts.hermes_postprocess.operator import ChildRunResult, OperatorConfig, run_once, select_candidate
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            lecture_root = _make_operator_fixture(root)
+            _write_raw_pair(lecture_root, "260504DS_2")
+            config = OperatorConfig(repo_root=root, lecture_root=lecture_root, hermes_bin=Path("/bin/false"), stable_for_sec=0)
+            stale_candidate = select_candidate(config, now=FIXED_NOW)
+            assert stale_candidate is not None
+            _write_valid_staging(stale_candidate, lecture_root)
+            staging = Path(stale_candidate.staging_dir)
+            stale_marker = staging / "stale-only.txt"
+            stale_marker.write_text(RAW_SENTINEL, encoding="utf-8")
+
+            def child_runner(*_args: object, **_kwargs: object) -> ChildRunResult:
+                return ChildRunResult(exit_code=0, log_path=root / "child.log")
+
+            outcome = run_once(config, child_runner=child_runner, now=FIXED_NOW)
+            claim_text_after = Path(stale_candidate.claim_path).read_text(encoding="utf-8")
+            promote_text = (staging / "promote.json").read_text(encoding="utf-8")
+
+        self.assertEqual(outcome["kind"], "failed")
+        self.assertFalse(stale_marker.exists())
+        self.assertFalse(Path(stale_candidate.correction_txt_path).exists())
+        self.assertIn("postprocess_verification_failed", claim_text_after)
+        self.assertIn("unsafe_staging_artifact", promote_text)
+        self.assertIn('"reason": "missing"', promote_text)
+        self.assertNotIn(RAW_SENTINEL, json.dumps(outcome, ensure_ascii=False) + claim_text_after + promote_text)
 
     def test_operator_concurrent_claim_attempts_allow_exactly_one_winner(self) -> None:
         from scripts.hermes_postprocess.operator import OperatorConfig, acquire_claim, select_candidate
@@ -400,6 +494,7 @@ class HermesPostprocessOperatorHardeningTests(unittest.TestCase):
             root = Path(tmp)
             lecture_root = _make_operator_fixture(root)
             _write_raw_pair(lecture_root, "260504DS_2")
+            (root / ".env").write_text("REPO_SECRET=do-not-read\n", encoding="utf-8")
             config = OperatorConfig(repo_root=root, lecture_root=lecture_root, hermes_bin=Path("/opt/hermes/bin/hermes"), stable_for_sec=0)
             candidate = select_candidate(config, now=FIXED_NOW)
             self.assertIsNotNone(candidate)
@@ -432,12 +527,22 @@ class HermesPostprocessOperatorHardeningTests(unittest.TestCase):
             self.assertEqual(cmd[1], "-f")
             sandbox_profile = Path(cmd[2])
             self.assertEqual(cmd[3], str(config.hermes_bin))
+            self.assertIn("-t", cmd)
+            self.assertEqual(cmd[cmd.index("-t") + 1], "file,no_mcp")
+            self.assertNotIn("terminal,file", cmd)
             profile_text = sandbox_profile.read_text(encoding="utf-8")
             self.assertIn("(deny file-write*)", profile_text)
             self.assertIn("(allow file-write*", profile_text)
             self.assertNotIn("(allow default)", profile_text)
             self.assertIn(str(Path(candidate.staging_dir)), profile_text)
+            self.assertIn('(allow file-write* (literal "/dev/null"))', profile_text)
+            self.assertIn('/private/var/select', profile_text)
             self.assertNotIn(f'(allow file-read* (subpath "{config.cron_log_dir}"))', profile_text)
+            self.assertNotIn(f'(allow file-read* (literal "{root / ".env"}"))', profile_text)
+            self.assertIn(f'(deny file-read* (literal "{root / ".env"}"))', profile_text)
+            runtime_home = Path(candidate.staging_dir) / ".hermes-runtime"
+            self.assertNotIn(f'(allow file-read* (literal "{runtime_home / ".env"}"))', profile_text)
+            self.assertIn(f'(deny file-read* (literal "{runtime_home / ".env"}"))', profile_text)
             self.assertNotIn(f'(allow file-write* (subpath "{config.cron_log_dir}"))', profile_text)
             self.assertNotIn(f'(allow file-read* (subpath "{lecture_root / "02_transcripts"}"))', profile_text)
             self.assertNotIn(f'(allow file-read* (subpath "{lecture_root / "03_correction"}"))', profile_text)
@@ -452,6 +557,114 @@ class HermesPostprocessOperatorHardeningTests(unittest.TestCase):
             self.assertIs(captured["stdout"], subprocess.DEVNULL)
             self.assertIs(captured["stderr"], subprocess.DEVNULL)
             self.assertIs(captured["text"], True)
+
+    def test_run_child_hermes_uses_isolated_hermes_home_inside_staging(self) -> None:
+        from scripts.hermes_postprocess.operator import OperatorConfig, run_child_hermes, select_candidate, write_candidate_and_manifest
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            lecture_root = _make_operator_fixture(root)
+            _write_raw_pair(lecture_root, "260504DS_2")
+            real_hermes_home = root / "real-hermes-home"
+            real_hermes_home.mkdir()
+            (real_hermes_home / "config.yaml").write_text("model: test-model\n", encoding="utf-8")
+            (real_hermes_home / "auth.json").write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "active_provider": "openai-codex",
+                        "updated_at": "2026-05-21T12:00:00Z",
+                        "providers": {
+                            "openai-codex": {
+                                "tokens": {
+                                    "access_token": "codex-access-token",
+                                    "refresh_token": "codex-refresh-token",
+                                },
+                                "auth_mode": "chatgpt",
+                            },
+                            "copilot": {
+                                "tokens": {
+                                    "access_token": "other-provider-token",
+                                }
+                            },
+                        },
+                        "credential_pool": {
+                            "openai-codex": [
+                                {
+                                    "label": "primary",
+                                    "access_token": "pool-access-token",
+                                    "refresh_token": "pool-refresh-token",
+                                }
+                            ],
+                            "copilot": [
+                                {
+                                    "label": "other",
+                                    "access_token": "other-pool-token",
+                                }
+                            ],
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            (real_hermes_home / ".env").write_text("TEST_PROVIDER_KEY=secret\n", encoding="utf-8")
+            (real_hermes_home / "models_dev_cache.json").write_text("{}\n", encoding="utf-8")
+            config = OperatorConfig(repo_root=root, lecture_root=lecture_root, hermes_bin=Path("/opt/hermes/bin/hermes"), stable_for_sec=0)
+            candidate = select_candidate(config, now=FIXED_NOW)
+            self.assertIsNotNone(candidate)
+            assert candidate is not None
+            candidate_path, _manifest_path = write_candidate_and_manifest(candidate)
+            captured: dict[str, object] = {}
+
+            class FakeCompletedProcess:
+                returncode = 0
+
+            def fake_run(cmd: list[str], **kwargs: object) -> FakeCompletedProcess:
+                env = kwargs.get("env")
+                assert isinstance(env, dict)
+                runtime_home = Path(env["HERMES_HOME"])
+                self.assertEqual(runtime_home, Path(candidate.staging_dir) / ".hermes-runtime")
+                self.assertTrue((runtime_home / "config.yaml").is_file())
+                self.assertTrue((runtime_home / "auth.json").is_file())
+                self.assertFalse((runtime_home / ".env").exists())
+                self.assertTrue((runtime_home / "logs").is_dir())
+                self.assertTrue((runtime_home / "sessions").is_dir())
+                self.assertTrue((runtime_home / "cache").is_dir())
+                import yaml
+
+                copied_config = yaml.safe_load((runtime_home / "config.yaml").read_text(encoding="utf-8"))
+                copied_auth = json.loads((runtime_home / "auth.json").read_text(encoding="utf-8"))
+                self.assertEqual(copied_config["model"], "test-model")
+                self.assertEqual(copied_config["mcp_servers"], {})
+                self.assertEqual(copied_config["security"]["tirith_enabled"], False)
+                self.assertEqual(copied_auth["active_provider"], "openai-codex")
+                self.assertEqual(sorted(copied_auth["providers"]), ["openai-codex"])
+                self.assertEqual(sorted(copied_auth["credential_pool"]), ["openai-codex"])
+                self.assertNotIn("copilot", json.dumps(copied_auth, ensure_ascii=False))
+                self.assertNotIn("TEST_PROVIDER_KEY", json.dumps(copied_auth, ensure_ascii=False))
+                self.assertNotIn("UNRELATED_SECRET", env)
+                self.assertEqual(env["PATH"], os.environ["PATH"])
+                captured["cmd"] = cmd
+                captured["env"] = env
+                captured["runtime_home"] = runtime_home
+                return FakeCompletedProcess()
+
+            with (
+                patch.dict(os.environ, {"HERMES_HOME": str(real_hermes_home), "UNRELATED_SECRET": "do-not-forward"}, clear=False),
+                patch("scripts.hermes_postprocess.operator.shutil.which", return_value="/usr/bin/sandbox-exec"),
+                patch("scripts.hermes_postprocess.operator.subprocess.run", side_effect=fake_run),
+            ):
+                result = run_child_hermes(candidate, candidate_path, config)
+
+            cmd = captured["cmd"]
+            assert isinstance(cmd, list)
+            sandbox_profile = Path(cmd[2]).read_text(encoding="utf-8")
+            runtime_home = captured["runtime_home"]
+            assert isinstance(runtime_home, Path)
+            self.assertEqual(result.exit_code, 0)
+            self.assertIn(str(runtime_home), sandbox_profile)
+            self.assertFalse(runtime_home.exists())
 
     def test_run_child_hermes_suppresses_child_stdout_and_stderr_from_log(self) -> None:
         from scripts.hermes_postprocess.operator import OperatorConfig, run_child_hermes, select_candidate, write_candidate_and_manifest
@@ -1424,6 +1637,7 @@ class HermesPostprocessOperatorHardeningTests(unittest.TestCase):
             root = Path(tmp)
             lecture_root = _make_operator_fixture(root)
             _write_raw_pair(lecture_root, "260504DS_2")
+            (root / ".env").write_text("REPO_SECRET=do-not-read\n", encoding="utf-8")
             config = OperatorConfig(repo_root=root, lecture_root=lecture_root, hermes_bin=Path("/opt/hermes/bin/hermes"), stable_for_sec=0)
             candidate = select_candidate(config, now=FIXED_NOW)
             assert candidate is not None
@@ -1435,6 +1649,11 @@ class HermesPostprocessOperatorHardeningTests(unittest.TestCase):
         self.assertIn(str(Path(candidate.raw_txt_path)), profile_text)
         self.assertIn(str(Path(candidate.raw_json_path)), profile_text)
         self.assertIn(str(Path(candidate.operator_docs_dir)), profile_text)
+        runtime_home = Path(candidate.staging_dir) / ".hermes-runtime"
+        self.assertNotIn(f'(allow file-read* (literal "{root / ".env"}"))', profile_text)
+        self.assertIn(f'(deny file-read* (literal "{root / ".env"}"))', profile_text)
+        self.assertNotIn(f'(allow file-read* (literal "{runtime_home / ".env"}"))', profile_text)
+        self.assertIn(f'(deny file-read* (literal "{runtime_home / ".env"}"))', profile_text)
         self.assertNotIn(f'(allow file-read* (subpath "{Path(candidate.raw_txt_path).parent}"))', profile_text)
         self.assertNotIn(f'(allow file-read* (subpath "{Path(candidate.correction_txt_path).parent}"))', profile_text)
         self.assertNotIn(f'(allow file-read* (subpath "{Path(candidate.summary_md_path).parent}"))', profile_text)

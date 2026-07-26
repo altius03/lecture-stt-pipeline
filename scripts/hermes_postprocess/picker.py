@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 
@@ -44,6 +45,25 @@ def _candidate_stems(lecture_root: Path, *, stable_for_sec: int) -> list[str]:
             continue
         stems.append(txt_path.stem)
     return sorted(set(stems))
+
+
+def _should_skip_for_bad_quality(transcript_dir: Path, stem: str) -> bool:
+    scorecard_path = transcript_dir / f"{stem}.quality.json"
+    if not scorecard_path.exists():
+        return False
+    try:
+        payload = json.loads(scorecard_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return True
+    if not isinstance(payload, dict):
+        return True
+    health = payload.get("health")
+    if not isinstance(health, str):
+        return True
+    normalized_health = health.strip().lower()
+    if normalized_health not in {"good", "warn", "bad"}:
+        return True
+    return normalized_health == "bad"
 
 
 def build_action_plan(paths: CandidatePaths) -> tuple[dict[str, dict[str, object]], tuple[str, ...]]:
@@ -117,7 +137,10 @@ def find_candidate(
 ) -> Candidate | None:
     lecture_root_path = Path(lecture_root).expanduser()
     repo_root_path = Path(repo_root).expanduser()
+    transcript_dir = lecture_root_path / TRANSCRIPT_DIR
     for stem in _candidate_stems(lecture_root_path, stable_for_sec=stable_for_sec):
+        if _should_skip_for_bad_quality(transcript_dir, stem):
+            continue
         paths = resolve_candidate_paths(stem, lecture_root=lecture_root_path, repo_root=repo_root_path)
         if skip_claimed and paths.claim_path.exists():
             continue

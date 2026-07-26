@@ -112,6 +112,41 @@ class NotifierTests(unittest.TestCase):
             self.assertTrue((state_dir / "notified" / "telegram_error_99").exists())
             self.assertTrue((state_dir / "notified" / "discord_error_99").exists())
 
+    def test_dual_provider_review_uses_distinct_markers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_dir = Path(tmpdir)
+            with (
+                mock.patch("lecture_stt.stt.notifier.requests.get", return_value=_FakeResponse()),
+                mock.patch("lecture_stt.stt.notifier.requests.post", return_value=_FakeResponse()) as post_mock,
+            ):
+                notifier = build_notifier(
+                    config={
+                        "notification": {
+                            "provider": "telegram",
+                            "dual_send_providers": ["discord"],
+                        }
+                    },
+                    env={
+                        "TELEGRAM_BOT_TOKEN": "bot-token",
+                        "TELEGRAM_CHAT_ID": "123456",
+                        "DISCORD_WEBHOOK_URL": "https://discord.example/webhook",
+                    },
+                    state_dir=state_dir,
+                )
+
+                payload = {
+                    "job_id": 77,
+                    "orig_name": "review.wav",
+                    "review_step": "품질 검사",
+                    "review_message": "전사량이 비정상적으로 적습니다.",
+                }
+                notifier.notify_review(payload)
+                notifier.notify_review(payload)
+
+            self.assertEqual(post_mock.call_count, 2)
+            self.assertTrue((state_dir / "notified" / "telegram_review_77").exists())
+            self.assertTrue((state_dir / "notified" / "discord_review_77").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

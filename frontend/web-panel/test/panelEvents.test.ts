@@ -48,6 +48,7 @@ function createPanelState(): PanelState {
     counts: {
       PENDING: 1,
       PROCESSING: 0,
+      NEEDS_REVIEW: 0,
       DONE: 0,
       ERROR: 0,
       UNREGISTERED: 0,

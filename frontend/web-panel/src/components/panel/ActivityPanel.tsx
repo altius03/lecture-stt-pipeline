@@ -31,10 +31,32 @@ function statusClassName(status: string): string {
   if (status === "ERROR") {
     return "status-pill status-negative"
   }
+  if (status === "NEEDS_REVIEW") {
+    return "status-pill status-active"
+  }
   if (status === "PROCESSING") {
     return "status-pill status-active"
   }
   return "status-pill status-neutral"
+}
+
+function statusLabel(status: string): string {
+  if (status === "PENDING") {
+    return "대기"
+  }
+  if (status === "PROCESSING") {
+    return "처리중"
+  }
+  if (status === "DONE") {
+    return "완료"
+  }
+  if (status === "ERROR") {
+    return "오류"
+  }
+  if (status === "NEEDS_REVIEW") {
+    return "확인 필요"
+  }
+  return status
 }
 
 function entryLevelClassName(entry: ParsedLogEntry): string {
@@ -101,7 +123,8 @@ function entryMetaLabel(entry: ParsedLogEntry): string {
 
 function pickDefaultJobId(jobs: PanelJob[]): number | null {
   const processingJob = jobs.find((job) => job.status === "PROCESSING")
-  return processingJob?.id ?? jobs[0]?.id ?? null
+  const reviewJob = jobs.find((job) => job.status === "NEEDS_REVIEW")
+  return processingJob?.id ?? reviewJob?.id ?? jobs[0]?.id ?? null
 }
 
 function formatUpdatedAt(value: string): string {
@@ -226,7 +249,7 @@ export function ActivityPanel({
                     }}
                   >
                     <td className="mono-cell">{job.id}</td>
-                    <td className="status-cell"><span className={statusClassName(job.status)}>{job.status}</span></td>
+                    <td className="status-cell"><span className={statusClassName(job.status)}>{statusLabel(job.status)}</span></td>
                     <td className="file-cell" title={job.file_name}>{job.file_name}</td>
                     <td className="muted-cell" title={job.updated_at}>{formatUpdatedAt(job.updated_at)}</td>
                     <td className="mono-cell progress-cell">{job.progress_pct}%</td>
@@ -339,7 +362,7 @@ export function ActivityPanel({
       <ActionBar
         compact
         actions={[
-          { action: "clear_history", label: "이력 초기화", tone: "secondary" },
+          { action: "clear_history", label: "완료·오류 이력 정리", tone: "secondary" },
           { action: "exit", label: "패널 종료", tone: "danger" },
         ]}
         pendingAction={pendingAction}

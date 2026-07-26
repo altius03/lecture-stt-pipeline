@@ -10,7 +10,7 @@ import re
 import shutil
 import time
 import traceback
-from typing import Any, Dict
+from typing import Any, Callable, Dict, cast
 
 from dotenv import load_dotenv
 import yaml
@@ -19,6 +19,7 @@ from lecture_stt.shared import db, utils
 from lecture_stt.shared.db import (
     STATUS_DONE,
     STATUS_ERROR,
+    STATUS_NEEDS_REVIEW,
     STATUS_PENDING,
     STATUS_PROCESSING,
 )
@@ -34,6 +35,11 @@ from lecture_stt.shared.paths import (
 )
 from lecture_stt.stt.notifier import SUPPORTED_PROVIDERS, build_notifier
 from lecture_stt.stt.postprocess import postprocess
+from lecture_stt.stt.profiles import (
+    legacy_unknown_snapshot,
+    merge_transcribe_config,
+    resolve_profile,
+)
 from lecture_stt.stt.quality_gate import (
     evaluate as quality_evaluate,
     validate_quality_scorecard,
@@ -41,6 +47,17 @@ from lecture_stt.stt.quality_gate import (
 )
 from lecture_stt.stt.transcribe import EngineParams, STTWorker
 from lecture_stt.stt.watcher import PollingWatcher
+
+
+def _audio_duration_from_tmp_wav(tmp_wav: Path) -> float | None:
+    """Return decoded WAV duration when available, without failing transcript output."""
+    duration_reader = cast("Callable[[Path], float | None] | None", getattr(STTWorker, "_wav_duration_sec", None))
+    if not callable(duration_reader):
+        return None
+    try:
+        return duration_reader(tmp_wav)
+    except Exception:
+        return None
 
 try:
     import fcntl
@@ -297,7 +314,7 @@ def validate_config(config_path: str, config: dict) -> dict:
                 f"Config error: notification.provider must be one of {sorted(SUPPORTED_PROVIDERS)}"
             )
 
-        for key in ["enabled", "send_start", "send_success", "send_failure"]:
+        for key in ["enabled", "send_start", "send_success", "send_review", "send_failure"]:
             if key in notification:
                 notification[key] = parse_bool(f"notification.{key}", notification[key])
 
@@ -322,6 +339,9 @@ def validate_config(config_path: str, config: dict) -> dict:
         notification["provider"] = provider
         notification["dual_send_providers"] = normalized_dual
 
+    # 모든 definition을 시작 시 검증한다. profiles가 없으면 기존 동작을
+    # 유지하는 추적용 legacy profile로 해석한다.
+    resolve_profile(config)
     return config
 
 
@@ -366,12 +386,14 @@ def _ensure_config_defaults(config: dict) -> dict:
             "enabled": True,
             "send_start": True,
             "send_success": True,
+            "send_review": True,
             "send_failure": True,
             "dual_send_providers": [],
         },
     }
 
-    merged = defaults.copy()
+    # STT 기본값을 채우되 profiles/downstream 같은 독립 섹션은 보존한다.
+    merged = dict(config)
     for section, values in defaults.items():
         merged[section] = {**values, **(config.get(section, {}) or {})}
 
@@ -472,7 +494,8 @@ class STTPipeline:
         self.stale_processing_hours = int(app_cfg["stale_processing_hours"])
         self.transcribe_max_retries = max(0, int(app_cfg.get("transcribe_max_retries", 2)))
 
-        trans = self.config["transcribe"]
+        self.active_profile = resolve_profile(self.config)
+        trans = merge_transcribe_config(self.config["transcribe"], self.active_profile)
         self.params = EngineParams(
             model_size=trans["model_size"],
             device=trans["device"],
@@ -560,7 +583,7 @@ class STTPipeline:
         try:
             return db.get_status_counts(self.conn)
         except Exception:
-            return {"PENDING": 0, "PROCESSING": 0, "DONE": 0, "ERROR": 0}
+            return {"PENDING": 0, "PROCESSING": 0, "DONE": 0, "NEEDS_REVIEW": 0, "ERROR": 0}
 
     def _update_progress(
         self,
@@ -626,9 +649,10 @@ class STTPipeline:
         if any(counts.values()):
             self._log(
                 logging.INFO,
-                "Recovered PROCESSING jobs: done=%s pending=%s error=%s",
+                "Recovered PROCESSING jobs: done=%s needs_review=%s pending=%s error=%s",
                 {"job_id": "-", "canonical_base": "-"},
                 counts["done"],
+                counts["needs_review"],
                 counts["pending"],
                 counts["error"],
             )
@@ -816,6 +840,7 @@ class STTPipeline:
             "word_timestamps": self.params.word_timestamps,
             "condition_on_previous_text": self.params.condition_on_previous_text,
             "keep_model_loaded": self.params.keep_model_loaded,
+            "profile": self.active_profile.snapshot(),
             "timings": {
                 "preprocess_sec": round(float(preprocess_sec), 6),
                 "transcribe_sec": round(float(transcribe_sec), 6),
@@ -903,6 +928,24 @@ class STTPipeline:
                 source_sha256=duplicate["sha256"],
             )
             prior_metadata = prior_payload.get("metadata")
+            prior_profile = (
+                prior_metadata.get("profile")
+                if isinstance(prior_metadata, dict)
+                else None
+            )
+            if (
+                isinstance(prior_profile, dict)
+                and all(
+                    isinstance(prior_profile.get(key), str) and prior_profile.get(key)
+                    for key in ("key", "version", "config_sha256")
+                )
+            ):
+                metadata["profile"] = {
+                    key: str(prior_profile[key])
+                    for key in ("key", "version", "config_sha256")
+                }
+            else:
+                metadata["profile"] = legacy_unknown_snapshot()
             prior_quality = (
                 prior_metadata.get("quality")
                 if isinstance(prior_metadata, dict)
@@ -916,6 +959,23 @@ class STTPipeline:
             self._write_output(txt_path, json_path, segments, text, metadata)
             self._validate_output_files(txt_path, json_path)
             self._update_progress(job_id, "전사문 생성(TXT/JSON)")
+            replay_health = str(metadata["quality"].get("health", "")).strip().lower()
+            if replay_health == "bad":
+                self._handle_bad_quality(
+                    job_id=job_id,
+                    source_path=source_path,
+                    canonical_audio=canonical_audio_path,
+                    canonical_base=canonical_base,
+                    txt_path=txt_path,
+                    json_path=json_path,
+                    metadata=metadata,
+                    quality_report=metadata["quality"],
+                    ended_at=ended_at,
+                    preprocess_sec=0.0,
+                    transcribe_sec=0.0,
+                    total_sec=0.0,
+                )
+                return True
 
             db.update_job(
                 self.conn,
@@ -1088,6 +1148,63 @@ class STTPipeline:
             })
         self._log(logging.ERROR, "failed", job_ctx)
 
+    def _handle_bad_quality(
+        self,
+        *,
+        job_id: int,
+        source_path: Path,
+        canonical_audio: Path,
+        canonical_base: str,
+        txt_path: Path,
+        json_path: Path,
+        metadata: dict[str, Any],
+        quality_report: Any,
+        ended_at: str,
+        preprocess_sec: float,
+        transcribe_sec: float,
+        total_sec: float,
+    ) -> None:
+        """Persist a completed-but-unusable transcript as an actionable quality failure.
+
+        The transcript and scorecard stay on disk for inspection/remediation, but the job
+        must not be announced as a normal success or silently enter downstream work.
+        """
+        if isinstance(quality_report, dict):
+            raw_summary = quality_report.get("summary", "품질 위험")
+        else:
+            raw_summary = getattr(quality_report, "summary", "품질 위험")
+        safe_summary = _redact_sensitive_text(str(raw_summary))
+        db.update_job(
+            self.conn,
+            job_id,
+            status=STATUS_NEEDS_REVIEW,
+            ended_at=ended_at,
+            preprocess_sec=preprocess_sec,
+            transcribe_sec=transcribe_sec,
+            total_sec=total_sec,
+            engine_params=json.dumps(metadata, ensure_ascii=False),
+            error_message=safe_summary,
+            error_trace=None,
+            current_step="품질 검토 필요",
+            progress_pct=100,
+            eta_sec=0,
+        )
+        queue = self._queue_status()
+        self.notifier.notify_review({
+            "job_id": job_id,
+            "orig_name": source_path.name,
+            "canonical_base": canonical_base,
+            "orig_inbox_path": str(source_path),
+            "canonical_audio_path": str(canonical_audio),
+            "transcript_txt_path": str(txt_path),
+            "transcript_json_path": str(json_path),
+            "review_message": safe_summary,
+            "review_step": "품질 검사",
+            "pending_count": queue.get("PENDING", 0),
+            "processing_count": queue.get("PROCESSING", 0),
+        })
+        self._log(logging.WARNING, "bad quality transcript preserved for remediation: %s", {"job_id": str(job_id), "canonical_base": canonical_base}, safe_summary)
+
     # 하나의 파일에 대해 이동, 중복 처리, 전사, 저장, 알림까지 수행한다.
     def process_job(self, source_path: Path) -> None:
         paths = self._job_paths(source_path)
@@ -1155,6 +1272,7 @@ class STTPipeline:
                     "word_timestamps": self.params.word_timestamps,
                     "condition_on_previous_text": self.params.condition_on_previous_text,
                     "keep_model_loaded": self.params.keep_model_loaded,
+                    "profile": self.active_profile.snapshot(),
                 },
                 current_step="로컬 staging",
                 progress_pct=15,
@@ -1196,7 +1314,7 @@ class STTPipeline:
             self._log(logging.INFO, "moved to stable folder", job_ctx)
             self._update_progress(job_id, "파일 이동", 30)
 
-            duplicate = db.find_done_job_by_sha(self.conn, sha256)
+            duplicate = db.find_replayable_job_by_sha(self.conn, sha256)
             if duplicate and duplicate["id"] != job_id:
                 # 이미 변환 완료된 동일 파일이 있으면 결과를 재사용해 중복 작업 시간을 줄인다.
                 fail_step = "중복 결과 재사용"
@@ -1274,11 +1392,22 @@ class STTPipeline:
             # ── v2: 후처리 + 품질 게이트 ──
             fail_step = "후처리"
             self._update_progress(job_id, "후처리(반복/노이즈 제거)", 78, 12)
-            segments, transcript_text = postprocess(segments, transcript_text)
+            segments, transcript_text = postprocess(
+                segments,
+                transcript_text,
+                corrections=self.active_profile.corrections,
+            )
 
             fail_step = "품질 검사"
             self._update_progress(job_id, "품질 검사", 88, 6)
-            quality_report = quality_evaluate(segments, transcript_text)
+            audio_duration_sec = _audio_duration_from_tmp_wav(tmp_wav)
+            quality_report = quality_evaluate(
+                segments,
+                transcript_text,
+                warn_threshold=self.active_profile.warn_threshold,
+                bad_threshold=self.active_profile.bad_threshold,
+                audio_duration_sec=audio_duration_sec,
+            )
             self._log(
                 logging.WARNING if quality_report.health != "good" else logging.INFO,
                 f"quality: {quality_report.summary}",
@@ -1307,6 +1436,22 @@ class STTPipeline:
             self._update_progress(job_id, "전사문 생성(TXT/JSON)", 94, 3)
             self._write_output(txt_path, json_path, segments, transcript_text, metadata)
             self._validate_output_files(txt_path, json_path)
+            if quality_report.health == "bad":
+                self._handle_bad_quality(
+                    job_id=job_id,
+                    source_path=source_path,
+                    canonical_audio=canonical_audio_final,
+                    canonical_base=canonical_base,
+                    txt_path=txt_path,
+                    json_path=json_path,
+                    metadata=metadata,
+                    quality_report=quality_report,
+                    ended_at=ended_at,
+                    preprocess_sec=preprocess_sec,
+                    transcribe_sec=transcribe_sec,
+                    total_sec=total_sec,
+                )
+                return
             self.notifier.notify_transcript_generated({
                 "job_id": job_id,
                 "orig_name": source_path.name,
@@ -1465,11 +1610,22 @@ class STTPipeline:
 
             fail_step = "후처리"
             self._update_progress(job_id, "후처리(반복/노이즈 제거)", 78, 12)
-            segments, transcript_text = postprocess(segments, transcript_text)
+            segments, transcript_text = postprocess(
+                segments,
+                transcript_text,
+                corrections=self.active_profile.corrections,
+            )
 
             fail_step = "품질 검사"
             self._update_progress(job_id, "품질 검사", 88, 6)
-            quality_report = quality_evaluate(segments, transcript_text)
+            audio_duration_sec = _audio_duration_from_tmp_wav(tmp_wav)
+            quality_report = quality_evaluate(
+                segments,
+                transcript_text,
+                warn_threshold=self.active_profile.warn_threshold,
+                bad_threshold=self.active_profile.bad_threshold,
+                audio_duration_sec=audio_duration_sec,
+            )
             self._log(
                 logging.WARNING if quality_report.health != "good" else logging.INFO,
                 f"quality: {quality_report.summary}",
@@ -1499,6 +1655,22 @@ class STTPipeline:
             self._update_progress(job_id, "전사문 생성(TXT/JSON)", 94, 3)
             self._write_output(txt_path, json_path, segments, transcript_text, metadata)
             self._validate_output_files(txt_path, json_path)
+            if quality_report.health == "bad":
+                self._handle_bad_quality(
+                    job_id=job_id,
+                    source_path=source_path,
+                    canonical_audio=canonical_audio,
+                    canonical_base=canonical_base,
+                    txt_path=txt_path,
+                    json_path=json_path,
+                    metadata=metadata,
+                    quality_report=quality_report,
+                    ended_at=ended_at,
+                    preprocess_sec=preprocess_sec,
+                    transcribe_sec=transcribe_sec,
+                    total_sec=total_sec,
+                )
+                return
             self.notifier.notify_transcript_generated({
                 "job_id": job_id,
                 "orig_name": source_path.name,

@@ -8,8 +8,8 @@
 `.env`/환경에서 확인한 path 변수:
 
 - `LECTURE_RECORDINGS_ROOT=/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings`
-- `GH_CURRENT_SEMESTER_ROOT=/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/GH_archive/01_TUK/01_current_semester`
-- `OBSIDIAN_SEMESTER_ROOT=/Users/geonha/Library/Mobile Documents/iCloud~md~obsidian/Documents/99_obsidian/StudyVaults/2-1`
+- `GH_CURRENT_SEMESTER_ROOT=/Users/geonha/GH_archive/01_TUK/01_current_semester`
+- `OBSIDIAN_SEMESTER_ROOT=/Users/geonha/GH_archive/01_TUK/01_current_semester`
 
 secret류 환경변수는 값 출력하지 않음.
 

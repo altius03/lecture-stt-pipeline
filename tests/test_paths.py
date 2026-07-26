@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import tempfile
 import unittest
 from unittest import mock
 
@@ -49,6 +50,33 @@ class RuntimePathDefaultsTests(unittest.TestCase):
             config["downstream"]["log_jsonl_path"],
             "~/Library/Logs/lecture_stt/downstream.jsonl",
         )
+
+    def test_config_example_keeps_storage_v2_records_outside_legacy_root(self) -> None:
+        example_path = paths.repo_root() / "config" / "config.example.yaml"
+        config = yaml.safe_load(example_path.read_text(encoding="utf-8"))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            home = root / "home"
+            legacy_root = root / "legacy-recordings"
+            with mock.patch.dict(
+                "os.environ",
+                {
+                    "HOME": str(home),
+                    "LECTURE_RECORDINGS_ROOT": str(legacy_root),
+                },
+            ):
+                records_root = paths.resolve_config_path(
+                    config["storage_v2"]["records_root"]
+                )
+
+        self.assertEqual(
+            records_root,
+            home / "Library" / "Application Support" / "lecture_stt"
+            / "storage-v2" / "records",
+        )
+        self.assertFalse(records_root.is_relative_to(legacy_root))
+        self.assertFalse(legacy_root.is_relative_to(records_root))
 
 
 if __name__ == "__main__":

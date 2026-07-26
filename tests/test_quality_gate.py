@@ -53,3 +53,36 @@ class QualityGateTests(unittest.TestCase):
         self.assertEqual(report.health, "good")
         self.assertGreaterEqual(report.quality_score, 75)
         self.assertIn("정상", report.summary)
+
+    def test_long_audio_with_sparse_early_segments_is_flagged_as_bad(self) -> None:
+        segments = [
+            {"start": idx * 18.0, "end": idx * 18.0 + 4.0, "text": "짧은 전사"}
+            for idx in range(11)
+        ]
+        text = "\n".join(segment["text"] for segment in segments)
+
+        report = evaluate(segments, text, audio_duration_sec=2755.051)
+
+        self.assertEqual(report.health, "bad")
+        self.assertLess(report.quality_score, 45)
+        self.assertLess(report.chars_per_audio_min, 15)
+        self.assertLess(report.coverage_ratio, 0.35)
+        self.assertIn("전사량", report.summary)
+
+    def test_long_audio_with_dense_full_span_transcript_remains_good(self) -> None:
+        segments = [
+            {
+                "start": idx * 12.0,
+                "end": idx * 12.0 + 8.0,
+                "text": "".join(chr(0xAC00 + ((idx * 37 + char_idx * 97) % 11172)) for char_idx in range(45)),
+            }
+            for idx in range(225)
+        ]
+        text = "\n".join(segment["text"] for segment in segments)
+
+        report = evaluate(segments, text, audio_duration_sec=2700.0)
+
+        self.assertEqual(report.health, "good")
+        self.assertGreaterEqual(report.chars_per_audio_min, 120)
+        self.assertGreaterEqual(report.coverage_ratio, 0.95)
+        self.assertGreaterEqual(report.quality_score, 75)

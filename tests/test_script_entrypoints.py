@@ -4,6 +4,7 @@ import importlib.util
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -44,6 +45,7 @@ class ScriptEntrypointTests(unittest.TestCase):
                     f"  stable_audio_folder: {audio_dir}\n"
                     f"  transcript_folder: {transcript_dir}\n"
                     f"  tmp_dir: {tmp_dir}\n"
+                    f"  db_path: {root / 'jobs.sqlite3'}\n"
                 ),
                 encoding="utf-8",
             )
@@ -170,6 +172,72 @@ class ScriptEntrypointTests(unittest.TestCase):
             self.assertTrue((transcript_dir / "real_lecture.json").exists())
             self.assertTrue((transcript_dir / "real_lecture.quality.json").exists())
             self.assertFalse((transcript_dir / "orphan.quality.json").exists())
+
+    def test_cleanup_preserves_unresolved_needs_review_artifacts(self) -> None:
+        module = _load_module("cleanup_script", REPO_ROOT / "scripts" / "cleanup.py")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            audio_dir = root / "audio"
+            transcript_dir = root / "transcripts"
+            audio_dir.mkdir()
+            transcript_dir.mkdir()
+            db_path = root / "jobs.sqlite3"
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    "CREATE TABLE jobs (canonical_base TEXT, status TEXT NOT NULL)"
+                )
+                conn.executemany(
+                    "INSERT INTO jobs (canonical_base, status) VALUES (?, ?)",
+                    [
+                        ("protected", "NEEDS_REVIEW"),
+                        ("expired", "DONE"),
+                    ],
+                )
+
+            now = time.time()
+            for directory, names in (
+                (audio_dir, ["protected.m4a", "expired.m4a"]),
+                (
+                    transcript_dir,
+                    [
+                        "protected.txt",
+                        "protected.json",
+                        "protected.quality.json",
+                        "expired.txt",
+                        "expired.json",
+                        "expired.quality.json",
+                    ],
+                ),
+            ):
+                for name in names:
+                    path = directory / name
+                    path.write_text("{}", encoding="utf-8")
+                    os.utime(path, (now - 600, now - 600))
+
+            protected = module._needs_review_stems(db_path)
+            removed_audio, _ = module._cleanup_audio(
+                audio_dir,
+                cutoff_ts=now,
+                dry_run=False,
+                protected_stems=protected,
+            )
+            removed_transcripts, _ = module._cleanup_transcripts(
+                transcript_dir,
+                cutoff_ts=now,
+                dry_run=False,
+                min_keep=0,
+                protected_stems=protected,
+            )
+
+            self.assertEqual(protected, {"protected"})
+            self.assertEqual(removed_audio, 1)
+            self.assertEqual(removed_transcripts, 3)
+            self.assertTrue((audio_dir / "protected.m4a").exists())
+            self.assertTrue((transcript_dir / "protected.txt").exists())
+            self.assertTrue((transcript_dir / "protected.json").exists())
+            self.assertTrue((transcript_dir / "protected.quality.json").exists())
+            self.assertFalse((audio_dir / "expired.m4a").exists())
+            self.assertFalse((transcript_dir / "expired.txt").exists())
 
     def test_rotate_logs_script_is_dry_run_by_default(self) -> None:
         module = _load_module("rotate_logs_script", REPO_ROOT / "scripts" / "rotate_logs.py")

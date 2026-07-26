@@ -45,14 +45,27 @@ Hermes cron이 `lecture_stt`의 raw transcript 하나를 선택해 Stage 3 corre
 - workdir: `/Users/geonha/DEV/lecture_stt`
 - script: `~/.hermes/scripts/lecture_stt_postprocess_operator.py` thin shim → repo-tracked `scripts/hermes_postprocess/operator.py`
 - mode: `no_agent=true`
+- timeout alignment: active Hermes default profile config has `cron.script_timeout_seconds=1800`; active shim passes `--child-timeout-sec 1500`. Keep the child timeout below the scheduler script timeout so the parent operator can catch child timeouts, validate/quarantine/restore, and exit cleanly instead of leaving orphaned child Hermes processes.
 
-## Hardening canary evidence
+## Hardening/activation evidence
 
-Latest local evidence file:
+Latest closeout report:
+
+- `/Users/geonha/DEV/lecture_stt/state/reports/hermes_postprocess/closeout-20260521T141641Z.md`
+
+Latest local fixture evidence file:
 
 - `/Users/geonha/DEV/lecture_stt/state/reports/hermes_postprocess/hardening-canary-20260521.json`
 
-Scope of that evidence:
+2026-05-21 live closeout scope:
+
+- live stem `260504DS_1` promoted exactly once to `03_correction/*.txt`, `03_correction/*.json`, and `04_summarize/*.md`
+- staged/final size and SHA-256 match verified by metadata-only promote report
+- direct wrapper no-candidate probe produced exit 0 with empty stdout/stderr
+- triggered Hermes cron no-candidate run finished with `last_status=ok`
+- child Hermes uses per-attempt isolated `HERMES_HOME`; staging is reset before every child attempt
+
+Earlier local fixture scope:
 
 - local temporary fixture roots only
 - no iCloud final writes
@@ -76,6 +89,8 @@ Wrapper 동작:
 3. child Hermes CLI를 repo root에서 실행해 docs/prompt를 읽고 staging artifact를 만든다. Child stdout/stderr는 raw body 누출 방지를 위해 cron log에 저장하지 않는다.
 4. deterministic validator와 `--allow-promote` promote가 모두 통과하면 final paths와 pass/fail metadata만 짧게 출력한다.
 5. candidate가 없으면 stdout 없이 0으로 종료한다.
+
+2026-05-25 operational timeout note: Hermes scheduler's default script timeout is 120s unless overridden. The active default-profile gateway must be restarted after changing `cron.script_timeout_seconds`; otherwise an already-running gateway may keep the old cached config and continue timing out the wrapper at 120s. After restart, verify with `hermes cron status`, active shim `py_compile`, and no `cron-lecture-stt-postprocess` orphan under PID 1.
 
 ## Repo-local CLI
 
@@ -106,7 +121,7 @@ python3 scripts/lecture_stt_postprocess_operator.py run-once \
 Operator containment rules:
 
 - The child Hermes process is untrusted generation only. The parent owns validation, promotion, claim writes, and final artifact writes.
-- On macOS, the child command is wrapped with `sandbox-exec` using deny-default plus explicit file-write allowlist for staging/log/temp/Hermes runtime paths. If `sandbox-exec` is unavailable on macOS, the operator fails closed instead of running the child unsandboxed.
+- On macOS, the child command is wrapped with `sandbox-exec` using deny-default plus explicit file-write allowlist for staging/log/temp/Hermes runtime paths. The per-attempt runtime copies only non-secret Hermes runtime files plus, when the active provider requires it, a minimal `auth.json` snapshot containing only the active provider and its credential-pool entries; repo `.env` and child `.env` are not child-readable, while Hermes's own file tool still denies root credential files under `HERMES_HOME`. If `sandbox-exec` is unavailable on macOS, the operator fails closed instead of running the child unsandboxed.
 - Before child execution, the parent snapshots pre-existing regular final artifacts with lstat mode and content hash. After every child outcome (success, nonzero exit, timeout, wrapper exception), the parent quarantines newly-created final artifacts, restores modified/deleted/replaced pre-existing regular final artifacts, and writes metadata-only failure reports.
 - If a final path already contains a non-regular filesystem entry before the child runs (symlink, directory, device, socket, etc.), the operator fails as `preexisting_final_artifact_unsupported_type` without mutating that entry.
 - Quarantined unauthorized final entries live under `state/hermes_postprocess/staging/{stem}/unauthorized-final-artifacts/` and must be reviewed manually before any further action.
@@ -115,7 +130,7 @@ Operator containment rules:
 
 | Platform/runtime | Child execution mode | Expected behavior | Operator action if unavailable |
 | --- | --- | --- | --- |
-| macOS with `sandbox-exec` | Child command is wrapped with `sandbox-exec -f <generated-profile>`. | Child may read repo/prompt/raw inputs, but file writes are denied by default and explicitly allowed only for staging, cron logs, temp, and Hermes runtime paths. Child stdout/stderr go to `subprocess.DEVNULL`. | Continue only after parent-owned validation/promote checks. |
+| macOS with `sandbox-exec` | Child command is wrapped with `sandbox-exec -f <generated-profile>`. | Child may read repo/prompt/raw inputs, but file writes are denied by default and explicitly allowed only for staging, cron logs, temp, and Hermes runtime paths. Secret `.env` files are explicitly denied for child reads; any minimal child `auth.json` snapshot remains provider-readable but stays outside the child file tool because Hermes blocks root credential files under `HERMES_HOME`. Child stdout/stderr go to `subprocess.DEVNULL`. | Continue only after parent-owned validation/promote checks. |
 | macOS without `sandbox-exec` | No child run. | Fail closed before running Hermes child. | Treat `sandbox_exec_missing`/wrapper failure as a platform failure. Do not run unsandboxed as a workaround. |
 | Non-Darwin without `sandbox-exec` | Child runs without macOS sandbox wrapper. | Still uses parent-owned validation, single-link regular-file staging checks, final snapshot/quarantine/restore, and `subprocess.DEVNULL` stdout/stderr suppression. | Only use for local fixture/CI-style verification unless a separate OS sandbox/container policy is approved. |
 | Any platform with unsupported final path entry | No child run. | Symlinks, directories, sockets, devices, or other non-regular final entries fail as `preexisting_final_artifact_unsupported_type`. | Manual cleanup/approval required; operator must not mutate those entries automatically. |

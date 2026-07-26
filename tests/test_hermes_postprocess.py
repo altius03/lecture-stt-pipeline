@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import time
 import sys
 import tempfile
 import unittest
@@ -40,6 +42,27 @@ def _write_raw_pair(lecture_root: Path, stem: str, body: str = RAW_SENTINEL) -> 
         ],
     }
     (transcript_dir / f"{stem}.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+
+def _write_quality_scorecard(lecture_root: Path, stem: str, *, health: str, malformed: bool = False) -> None:
+    transcript_dir = lecture_root / "02_transcripts"
+    transcript_dir.mkdir(parents=True, exist_ok=True)
+    path = transcript_dir / f"{stem}.quality.json"
+    if malformed:
+        path.write_text("{not-json", encoding="utf-8")
+        return
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "lecture_stt_quality_scorecard",
+                "canonical_base": stem,
+                "health": health,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
 
 
 def _write_correction_pair(lecture_root: Path, stem: str) -> None:
@@ -90,6 +113,53 @@ def _write_summary(lecture_root: Path, stem: str) -> None:
 
 
 class HermesPostprocessCandidateTests(unittest.TestCase):
+    def test_skip_candidate_when_raw_pair_is_temporary_or_stale(self) -> None:
+        from scripts.hermes_postprocess.picker import find_candidate
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            lecture_root = _make_operator_fixture(root)
+            _write_raw_pair(lecture_root, "260504DS_1", body=RAW_SENTINEL)
+            _write_raw_pair(lecture_root, "260505DS_2", body=RAW_SENTINEL)
+
+            now = time.time()
+            transcript_dir = lecture_root / "02_transcripts"
+            os.utime(transcript_dir / "260504DS_1.txt", (now - 1200, now - 1200))
+            os.utime(transcript_dir / "260504DS_1.json", (now - 1200, now - 1200))
+            os.utime(transcript_dir / "260505DS_2.txt", (now - 1, now - 1))
+            os.utime(transcript_dir / "260505DS_2.json", (now - 1, now - 1))
+            (transcript_dir / "260506DS_3.txt").write_text("temp", encoding="utf-8")
+            (transcript_dir / "260506DS_3.json.tmp").write_text("{}", encoding="utf-8")
+
+            candidate = find_candidate(
+                lecture_root=lecture_root, repo_root=root, stable_for_sec=60, skip_claimed=True
+            )
+
+        self.assertIsNotNone(candidate)
+        assert candidate is not None
+        self.assertEqual(candidate.stem, "260504DS_1")
+
+    def test_skip_claimed_stems_by_default(self) -> None:
+        from scripts.hermes_postprocess.paths import resolve_candidate_paths
+        from scripts.hermes_postprocess.picker import find_candidate
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            lecture_root = _make_operator_fixture(root)
+            _write_raw_pair(lecture_root, "260504DS_1")
+            _write_raw_pair(lecture_root, "260505DS_2")
+            claimed = resolve_candidate_paths("260504DS_1", lecture_root=lecture_root, repo_root=root)
+            claimed.claim_path.parent.mkdir(parents=True, exist_ok=True)
+            claimed.claim_path.write_text("{}", encoding="utf-8")
+
+            candidate = find_candidate(
+                lecture_root=lecture_root, repo_root=root, stable_for_sec=0, skip_claimed=True
+            )
+
+        self.assertIsNotNone(candidate)
+        assert candidate is not None
+        self.assertEqual(candidate.stem, "260505DS_2")
+
     def test_selects_one_oldest_incomplete_raw_pair_and_skips_complete_outputs(self) -> None:
         from scripts.hermes_postprocess.picker import find_candidate
 
@@ -142,6 +212,55 @@ class HermesPostprocessCandidateTests(unittest.TestCase):
             candidate = find_candidate(lecture_root=lecture_root, repo_root=root, stable_for_sec=0)
 
         self.assertIsNone(candidate)
+
+    def test_skips_bad_quality_candidate_and_selects_next_stem(self) -> None:
+        from scripts.hermes_postprocess.picker import find_candidate
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            lecture_root = _make_operator_fixture(root)
+            _write_raw_pair(lecture_root, "260504DS_2")
+            _write_quality_scorecard(lecture_root, "260504DS_2", health="bad")
+            _write_raw_pair(lecture_root, "260505OOP_1")
+
+            candidate = find_candidate(lecture_root=lecture_root, repo_root=root, stable_for_sec=0)
+
+        self.assertIsNotNone(candidate)
+        assert candidate is not None
+        self.assertEqual(candidate.stem, "260505OOP_1")
+
+    def test_malformed_quality_scorecard_fails_closed_for_that_stem_only(self) -> None:
+        from scripts.hermes_postprocess.picker import find_candidate
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            lecture_root = _make_operator_fixture(root)
+            _write_raw_pair(lecture_root, "260504DS_2")
+            _write_quality_scorecard(lecture_root, "260504DS_2", health="warn", malformed=True)
+            _write_raw_pair(lecture_root, "260505OOP_1")
+
+            candidate = find_candidate(lecture_root=lecture_root, repo_root=root, stable_for_sec=0)
+
+        self.assertIsNotNone(candidate)
+        assert candidate is not None
+        self.assertEqual(candidate.stem, "260505OOP_1")
+
+    def test_quality_scorecard_without_valid_health_fails_closed_for_that_stem(self) -> None:
+        from scripts.hermes_postprocess.picker import find_candidate
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            lecture_root = _make_operator_fixture(root)
+            _write_raw_pair(lecture_root, "260504DS_2")
+            scorecard_path = lecture_root / "02_transcripts" / "260504DS_2.quality.json"
+            scorecard_path.write_text('{"schema_version": 1, "health": 7}', encoding="utf-8")
+            _write_raw_pair(lecture_root, "260505OOP_1")
+
+            candidate = find_candidate(lecture_root=lecture_root, repo_root=root, stable_for_sec=0)
+
+        self.assertIsNotNone(candidate)
+        assert candidate is not None
+        self.assertEqual(candidate.stem, "260505OOP_1")
 
     def test_resolves_contract_paths_and_longest_subject_abbreviation(self) -> None:
         from scripts.hermes_postprocess.paths import resolve_candidate_paths

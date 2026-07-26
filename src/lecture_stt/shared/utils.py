@@ -9,6 +9,7 @@ import re
 import tempfile
 import time
 import traceback
+import unicodedata
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -21,7 +22,6 @@ logger = logging.getLogger(__name__)
 
 
 _WHITESPACE_RE = re.compile(r"\s+")
-_INVALID_CHARS_RE = re.compile(r"[^0-9A-Za-z가-힣_-]")
 _MULTI_UNDERSCORE_RE = re.compile(r"_+")
 
 
@@ -35,14 +35,23 @@ def sanitize_stem(stem: str, max_length: int = 80) -> str:
     if not stem:
         return "audio"
 
-    name = stem.strip()
+    name = unicodedata.normalize("NFC", str(stem)).strip()
     name = _WHITESPACE_RE.sub("_", name)
     # 경로 구분자와 파일명 특수문자를 제거해 안전한 파일명으로 변환한다.
     name = name.replace("/", "_").replace("\\", "_")
     name = name.replace(":", "_").replace("*", "_")
     name = name.replace("?", "_").replace("\"", "_")
     name = name.replace("<", "_").replace(">", "_").replace("|", "_")
-    name = _INVALID_CHARS_RE.sub("_", name)
+    normalized_chars: list[str] = []
+    for char in name:
+        category = unicodedata.category(char)
+        if char in {"_", "-"}:
+            normalized_chars.append(char)
+        elif category[:1] in {"L", "N", "M"}:
+            normalized_chars.append(char)
+        else:
+            normalized_chars.append("_")
+    name = "".join(normalized_chars)
     name = _MULTI_UNDERSCORE_RE.sub("_", name)
     name = name.strip("._-")
 
@@ -141,6 +150,30 @@ def atomic_write(path: Union[str, Path], data: Any, encoding: str = "utf-8") -> 
     os.replace(temp_path, target)
 
 
+def _copy2_with_stream_fallback(src_path: Path, dst_path: Path) -> None:
+    try:
+        shutil.copy2(src_path, dst_path)
+        return
+    except OSError as exc:
+        if exc.errno != 11:
+            raise
+        logger.warning(
+            "copy2 failed with errno=11; falling back to streaming copy: %s -> %s",
+            src_path,
+            dst_path,
+        )
+
+    with src_path.open("rb") as source, dst_path.open("wb") as target:
+        shutil.copyfileobj(source, target, length=1024 * 1024)
+        target.flush()
+        os.fsync(target.fileno())
+
+    try:
+        shutil.copystat(src_path, dst_path)
+    except OSError:
+        logger.debug("Unable to copy file metadata %s -> %s", src_path, dst_path, exc_info=True)
+
+
 # os.replace 실패(크로스 디바이스) 시 복사-동기화-교체 방식으로 보완한다.
 def safe_move_file(src: Union[str, Path], dst: Union[str, Path]) -> None:
     src_path = Path(src)
@@ -160,7 +193,7 @@ def safe_move_file(src: Union[str, Path], dst: Union[str, Path]) -> None:
         tmp_path = dst_path.with_name(f".{dst_path.name}.{uuid.uuid4().hex}.tmp")
         copied = False
         try:
-            shutil.copy2(src_path, tmp_path)
+            _copy2_with_stream_fallback(src_path, tmp_path)
             copied = True
             try:
                 with open(tmp_path, "rb") as handle:

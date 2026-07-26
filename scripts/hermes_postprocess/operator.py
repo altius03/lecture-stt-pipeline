@@ -25,9 +25,15 @@ from .contract import (
     POSTPROCESS_STATE_DIR,
     SCHEMA_VERSION,
     STATE_DIR,
+    TRANSCRIPT_DIR,
 )
 from .finals import all_final_regular, final_type_name, unsupported_final_entries
-from .picker import _candidate_stems, build_action_plan, is_complete  # noqa: PLC2701 - internal scanner reused by operator
+from .picker import (  # noqa: PLC2701 - internal picker helpers reused by operator
+    _candidate_stems,
+    _should_skip_for_bad_quality,
+    build_action_plan,
+    is_complete,
+)
 from .paths import resolve_candidate_paths
 from .schemas import Candidate
 from .staging import PromoteError, preflight_safe_staging_artifacts, promote_candidate, write_staging_manifest
@@ -214,8 +220,11 @@ def _claim_blocks_selection(path: Path, *, now: dt.datetime, stale_after_sec: in
 def select_candidate(config: OperatorConfig, *, now: dt.datetime | None = None) -> Candidate | None:
     now = now or utc_now()
     skip_stems = load_baseline_skip_stems(config)
+    transcript_dir = config.lecture_root / TRANSCRIPT_DIR
     for stem in _candidate_stems(config.lecture_root, stable_for_sec=config.stable_for_sec):
         if stem in skip_stems:
+            continue
+        if _should_skip_for_bad_quality(transcript_dir, stem):
             continue
         paths = resolve_candidate_paths(stem, lecture_root=config.lecture_root, repo_root=config.repo_root)
         if paths.claim_path.exists() and _claim_blocks_selection(paths.claim_path, now=now, stale_after_sec=config.stale_claim_after_sec):
@@ -286,7 +295,11 @@ def write_claim_status(
 
 def write_candidate_and_manifest(candidate: Candidate) -> tuple[Path, Path]:
     staging_dir = Path(candidate.staging_dir)
-    staging_dir.mkdir(parents=True, exist_ok=True)
+    # Each operator attempt owns a fresh staging directory. Leaving artifacts
+    # from a previous failed child run in place can let a later successful child
+    # exit promote stale correction/summary bodies that were not produced by the
+    # current attempt.
+    _reset_directory(staging_dir)
     candidate_path = staging_dir / "candidate.json"
     candidate_path.write_text(_json_dump(candidate.to_dict()), encoding="utf-8")
     manifest_path = write_staging_manifest(candidate)
@@ -345,32 +358,269 @@ def _sandbox_escape(value: Path) -> str:
     return str(value).replace("\\", "\\\\").replace('"', '\\"')
 
 
+_CHILD_HERMES_RUNTIME_DIR = ".hermes-runtime"
+_CHILD_HERMES_RUNTIME_FILES = ("config.yaml", "models_dev_cache.json")
+_CHILD_HERMES_RUNTIME_DIRS = ("logs", "sessions", "cache", "plugins", "skills", "optional-skills", "cron")
+_CHILD_ENV_PASSTHROUGH_VARS = (
+    "COLORTERM",
+    "CURL_CA_BUNDLE",
+    "HOME",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LOGNAME",
+    "NO_PROXY",
+    "PATH",
+    "PYTHONIOENCODING",
+    "PYTHONUTF8",
+    "REQUESTS_CA_BUNDLE",
+    "SHELL",
+    "SSL_CERT_FILE",
+    "TEMP",
+    "TERM",
+    "TERM_PROGRAM",
+    "TMP",
+    "TMPDIR",
+    "USER",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+)
+_CHILD_PROVIDER_ENV_VARS = (
+    "HERMES_CA_BUNDLE",
+    "HERMES_CODEX_BASE_URL",
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+)
+
+
+def _child_hermes_runtime_home(candidate: Candidate) -> Path:
+    return Path(candidate.staging_dir) / _CHILD_HERMES_RUNTIME_DIR
+
+
+def _current_hermes_home() -> Path:
+    return Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes")).expanduser()
+
+
+def _read_json_dict(path: Path) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _reset_directory(path: Path, *, mode: int = 0o700) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif os.path.lexists(path):
+        shutil.rmtree(path)
+    path.mkdir(parents=True, mode=mode, exist_ok=True)
+    os.chmod(path, mode)
+
+
+def _sanitize_child_hermes_config(config_path: Path) -> None:
+    """Keep child Hermes runtime lean and deterministic for file-only staging.
+
+    The child is invoked with explicit file-only toolsets, but Hermes still reads
+    configured MCP servers from config during startup. Stripping MCP servers from
+    the copied, per-attempt config avoids slow/broken MCP startup inside the
+    sandbox. Disabling Tirith in the copied config avoids terminal-security lazy
+    installs in a child that has no terminal tool in its toolset.
+    """
+    try:
+        import yaml
+    except Exception:
+        return
+    try:
+        payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    if not isinstance(payload, dict):
+        return
+    payload["mcp_servers"] = {}
+    security = payload.setdefault("security", {})
+    if isinstance(security, dict):
+        security["tirith_enabled"] = False
+    try:
+        config_path.write_text(yaml.safe_dump(payload, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        os.chmod(config_path, 0o600)
+    except Exception:
+        return
+
+
+def _minimal_child_auth_snapshot(source_home: Path) -> dict[str, Any] | None:
+    """Return only the active provider credential required by child Hermes.
+
+    OAuth providers such as ``openai-codex`` still require an ``auth.json``
+    runtime file. The child has no terminal tool, and Hermes' file tool blocks
+    direct reads of ``HERMES_HOME/auth.json``; minimizing the snapshot avoids
+    exposing unrelated provider credentials to that runtime.
+    """
+    auth_store = _read_json_dict(source_home / "auth.json")
+    if not auth_store:
+        return None
+    active_provider = auth_store.get("active_provider")
+    if not isinstance(active_provider, str) or not active_provider.strip():
+        return None
+    active_provider = active_provider.strip()
+    providers = auth_store.get("providers")
+    provider_state = providers.get(active_provider) if isinstance(providers, dict) else None
+    credential_pool = auth_store.get("credential_pool")
+    pool_entries = credential_pool.get(active_provider) if isinstance(credential_pool, dict) else None
+    if provider_state is None and pool_entries is None:
+        return None
+    snapshot: dict[str, Any] = {
+        "version": auth_store.get("version", 1),
+        "active_provider": active_provider,
+    }
+    updated_at = auth_store.get("updated_at")
+    if isinstance(updated_at, str) and updated_at.strip():
+        snapshot["updated_at"] = updated_at
+    if provider_state is not None:
+        snapshot["providers"] = {active_provider: provider_state}
+    if pool_entries is not None:
+        snapshot["credential_pool"] = {active_provider: pool_entries}
+    return snapshot
+
+
+def _prepare_child_hermes_home(candidate: Candidate) -> Path:
+    runtime_home = _child_hermes_runtime_home(candidate)
+    _reset_directory(runtime_home)
+    source_home = _current_hermes_home()
+    for dirname in _CHILD_HERMES_RUNTIME_DIRS:
+        directory = runtime_home / dirname
+        directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+        os.chmod(directory, 0o700)
+    for filename in _CHILD_HERMES_RUNTIME_FILES:
+        source = source_home / filename
+        if source.is_file():
+            target = runtime_home / filename
+            shutil.copy2(source, target)
+            os.chmod(target, 0o600)
+            if filename == "config.yaml":
+                _sanitize_child_hermes_config(target)
+    auth_snapshot = _minimal_child_auth_snapshot(source_home)
+    if auth_snapshot is not None:
+        auth_path = runtime_home / "auth.json"
+        auth_path.write_text(_json_dump(auth_snapshot), encoding="utf-8")
+        os.chmod(auth_path, 0o600)
+    return runtime_home
+
+
+def _cleanup_child_hermes_home(path: Path) -> None:
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def _ancestor_literals(path: Path) -> list[Path]:
+    expanded = Path(path).expanduser()
+    if not expanded.is_absolute():
+        return []
+    ancestors = [expanded, *expanded.parents]
+    return list(reversed(ancestors))
+
+
+def _dedupe_paths(paths: list[Path]) -> list[Path]:
+    seen: set[str] = set()
+    result: list[Path] = []
+    for path in paths:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(path)
+    return result
+
+
+def _hermes_runtime_read_subpaths(config: OperatorConfig) -> list[Path]:
+    hermes_bin = Path(config.hermes_bin).expanduser()
+    paths = [hermes_bin.parent]
+    try:
+        resolved_bin = hermes_bin.resolve(strict=False)
+    except OSError:
+        resolved_bin = hermes_bin
+    paths.append(resolved_bin.parent)
+    for ancestor in resolved_bin.parents:
+        if (ancestor / "hermes_cli").exists():
+            paths.append(ancestor)
+            break
+    python_bin = resolved_bin.parent / "python3"
+    try:
+        resolved_python = python_bin.resolve(strict=False)
+    except OSError:
+        resolved_python = python_bin
+    paths.append(resolved_python.parent)
+    paths.append(Path.home() / ".hermes" / "hermes-agent")
+    paths.append(Path.home() / ".local" / "share" / "uv")
+    return _dedupe_paths(paths)
+
+
+def _build_child_env(*, child_hermes_home: Path, config: OperatorConfig) -> dict[str, str]:
+    env: dict[str, str] = {}
+    for key in (*_CHILD_ENV_PASSTHROUGH_VARS, *_CHILD_PROVIDER_ENV_VARS):
+        value = os.environ.get(key)
+        if value:
+            env[key] = value
+    env["HERMES_HOME"] = str(child_hermes_home)
+    env["LECTURE_RECORDINGS_ROOT"] = str(config.lecture_root)
+    return env
+
+
 def _child_sandbox_profile(candidate: Candidate, config: OperatorConfig) -> str:
     staging_dir = Path(candidate.staging_dir)
+    child_hermes_home = _child_hermes_runtime_home(candidate)
     writable_subpaths = [
         staging_dir,
+        child_hermes_home,
     ]
     for tmp_dir in (os.environ.get("TMPDIR"), "/tmp", "/private/tmp", "/var/tmp", "/private/var/tmp"):
         if tmp_dir:
             writable_subpaths.append(Path(tmp_dir))
     read_allowed_subpaths = [
         staging_dir,
+        child_hermes_home,
         Path(candidate.operator_docs_dir),
         Path(candidate.prompt_dir),
-        Path(config.hermes_bin).parent,
         Path("/bin"),
         Path("/usr"),
         Path("/System"),
         Path("/Library"),
         Path("/opt"),
+        Path("/etc"),
+        Path("/private/etc"),
         Path("/private/var/db"),
+        Path("/private/var/select"),
+        *_hermes_runtime_read_subpaths(config),
     ]
     read_allowed_literals = [
         Path(candidate.raw_txt_path),
         Path(candidate.raw_json_path),
         staging_dir / "candidate.json",
         staging_dir / "manifest.json",
+        Path("/"),
+        Path("/Users"),
+        Path.home(),
+        Path("/etc"),
+        Path("/private"),
+        Path("/private/etc"),
+        Path("/var"),
+        Path("/private/var"),
+        Path("/tmp"),
+        Path("/private/tmp"),
+        config.repo_root / ".git",
+        config.repo_root / "AGENTS.md",
+        config.repo_root / "CLAUDE.md",
+        config.repo_root / "HERMES.md",
+        config.repo_root / ".cursorrules",
+        Path("/dev/null"),
+        Path("/dev/urandom"),
     ]
+    for path in [config.repo_root, staging_dir, child_hermes_home, Path(config.hermes_bin).expanduser(), Path(config.hermes_bin).expanduser().resolve(strict=False)]:
+        read_allowed_literals.extend(_ancestor_literals(path))
+    for path in read_allowed_subpaths:
+        read_allowed_literals.extend(_ancestor_literals(path))
     if candidate.actions.get("summary", {}).get("input_source") == "final_correction":
         read_allowed_literals.append(Path(candidate.correction_txt_path))
     read_only_subpaths = [
@@ -385,6 +635,20 @@ def _child_sandbox_profile(candidate: Candidate, config: OperatorConfig) -> str:
         staging_dir / "validation-summary.json",
         staging_dir / "promote.json",
     ]
+    denied_read_literals = [
+        child_hermes_home / ".env",
+        config.repo_root / ".env",
+    ]
+    writable_literals = [
+        Path("/dev/null"),
+    ]
+    read_allowed_subpaths = _dedupe_paths(read_allowed_subpaths)
+    read_allowed_literals = _dedupe_paths(read_allowed_literals)
+    writable_subpaths = _dedupe_paths(writable_subpaths)
+    writable_literals = _dedupe_paths(writable_literals)
+    read_only_subpaths = _dedupe_paths(read_only_subpaths)
+    read_only_literals = _dedupe_paths(read_only_literals)
+    denied_read_literals = _dedupe_paths(denied_read_literals)
     lines = [
         "(version 1)",
         "; Child LLM may write only staged artifacts and runtime logs/temp files.",
@@ -400,8 +664,12 @@ def _child_sandbox_profile(candidate: Candidate, config: OperatorConfig) -> str:
         lines.append(f'(allow file-read* (subpath "{_sandbox_escape(path)}"))')
     for path in read_allowed_literals:
         lines.append(f'(allow file-read* (literal "{_sandbox_escape(path)}"))')
+    for path in denied_read_literals:
+        lines.append(f'(deny file-read* (literal "{_sandbox_escape(path)}"))')
     for path in writable_subpaths:
         lines.append(f'(allow file-write* (subpath "{_sandbox_escape(path)}"))')
+    for path in writable_literals:
+        lines.append(f'(allow file-write* (literal "{_sandbox_escape(path)}"))')
     for path in read_only_subpaths:
         lines.append(f'(deny file-write* (subpath "{_sandbox_escape(path)}"))')
     for path in read_only_literals:
@@ -436,30 +704,34 @@ def run_child_hermes(candidate: Candidate, candidate_path: Path, config: Operato
         "chat",
         "-Q",
         "-t",
-        "terminal,file",
+        "file,no_mcp",
         "--source",
         config.source,
         "-q",
         prompt,
     ]
+    child_hermes_home = _prepare_child_hermes_home(candidate)
     cmd = _wrap_child_command_with_sandbox(cmd, candidate=candidate, config=config, run_id=run_id)
     log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(log_fd, "w", encoding="utf-8") as log:
-        os.chmod(log_path, 0o600)
-        log.write(f"# lecture_stt postprocess child run\n# stem={candidate.stem}\n# started_at={_format_ts(utc_now())}\n")
-        log.write("# child stdout/stderr suppressed by metadata-only policy\n")
-        log.flush()
-        proc = subprocess.run(
-            cmd,
-            cwd=config.repo_root,
-            text=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=config.child_timeout_sec,
-            env={**os.environ, "LECTURE_RECORDINGS_ROOT": str(config.lecture_root)},
-            check=False,
-        )
-        log.write(f"\n# exit_code={proc.returncode}\n# finished_at={_format_ts(utc_now())}\n")
+    try:
+        with os.fdopen(log_fd, "w", encoding="utf-8") as log:
+            os.chmod(log_path, 0o600)
+            log.write(f"# lecture_stt postprocess child run\n# stem={candidate.stem}\n# started_at={_format_ts(utc_now())}\n")
+            log.write("# child stdout/stderr suppressed by metadata-only policy\n")
+            log.flush()
+            proc = subprocess.run(
+                cmd,
+                cwd=config.repo_root,
+                text=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=config.child_timeout_sec,
+                env=_build_child_env(child_hermes_home=child_hermes_home, config=config),
+                check=False,
+            )
+            log.write(f"\n# exit_code={proc.returncode}\n# finished_at={_format_ts(utc_now())}\n")
+    finally:
+        _cleanup_child_hermes_home(child_hermes_home)
     return ChildRunResult(exit_code=proc.returncode, log_path=log_path)
 
 

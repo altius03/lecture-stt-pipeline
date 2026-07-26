@@ -3,6 +3,8 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 
 import {
   FALLBACK_PANEL_ENDPOINTS,
+  PANEL_EVENTS_ENDPOINT,
+  PANEL_STATE_EVENTS_ENDPOINT,
   fetchPanelState,
   postNotificationSelection,
   postPanelAction,
@@ -11,12 +13,17 @@ import { subscribePanelEvents } from "../lib/panelEvents"
 import type { NotificationSelection, PanelAction, PanelState } from "../types"
 
 const PANEL_STATE_QUERY_KEY = ["panel", "state"] as const
+const STATE_STREAM_FALLBACK_DELAY_MS = 1500
+
+interface UsePanelStateOptions {
+  logsEnabled?: boolean
+}
 
 function toErrorMessage(error: unknown, fallback: string): string {
   return error instanceof Error ? error.message : fallback
 }
 
-export function usePanelState() {
+export function usePanelState({ logsEnabled = false }: UsePanelStateOptions = {}) {
   const queryClient = useQueryClient()
   const pollTimerRef = useRef<number | null>(null)
   const [pendingAction, setPendingAction] = useState<PanelAction | null>(null)
@@ -25,6 +32,8 @@ export function usePanelState() {
   const [logResetKey, setLogResetKey] = useState(0)
   const [realtimeConnected, setRealtimeConnected] = useState(false)
   const [streamError, setStreamError] = useState<string | null>(null)
+  const [stateOnlyUnavailable, setStateOnlyUnavailable] = useState(false)
+  const streamEndpoint = logsEnabled || stateOnlyUnavailable ? PANEL_EVENTS_ENDPOINT : PANEL_STATE_EVENTS_ENDPOINT
 
   const stateQuery = useQuery({
     queryKey: PANEL_STATE_QUERY_KEY,
@@ -37,29 +46,60 @@ export function usePanelState() {
   const hasInitialState = stateQuery.data != null
 
   useEffect(() => {
+    setRealtimeConnected(false)
+  }, [streamEndpoint])
+
+  useEffect(() => {
     if (!hasInitialState) {
       return
     }
 
-    return subscribePanelEvents({
-      onEvent: (event) => {
-        if (event.type !== "state") {
-          return
-        }
-        setStreamError(null)
-        queryClient.setQueryData(PANEL_STATE_QUERY_KEY, event.state)
-      },
-      onConnectionChange: (connected) => {
-        if (connected) {
+    const shouldFallbackToCombined = !logsEnabled && streamEndpoint === PANEL_STATE_EVENTS_ENDPOINT
+    let fallbackTimer: number | null = null
+
+    const unsubscribe = subscribePanelEvents(
+      {
+        onEvent: (event) => {
+          if (event.type !== "state") {
+            return
+          }
           setStreamError(null)
-        }
-        setRealtimeConnected(connected)
+          queryClient.setQueryData(PANEL_STATE_QUERY_KEY, event.state)
+        },
+        onConnectionChange: (connected) => {
+          if (connected) {
+            setStreamError(null)
+            if (fallbackTimer !== null) {
+              window.clearTimeout(fallbackTimer)
+              fallbackTimer = null
+            }
+          }
+          setRealtimeConnected(connected)
+        },
+        onFatalError: (message) => {
+          if (shouldFallbackToCombined) {
+            setStateOnlyUnavailable(true)
+            return
+          }
+          setStreamError(message)
+        },
       },
-      onFatalError: (message) => {
-        setStreamError(message)
-      },
-    })
-  }, [hasInitialState, queryClient])
+      streamEndpoint,
+    )
+
+    if (shouldFallbackToCombined) {
+      fallbackTimer = window.setTimeout(() => {
+        setStateOnlyUnavailable(true)
+      }, STATE_STREAM_FALLBACK_DELAY_MS)
+    }
+
+    return () => {
+      unsubscribe()
+      if (fallbackTimer !== null) {
+        window.clearTimeout(fallbackTimer)
+      }
+    }
+  }, [hasInitialState, logsEnabled, queryClient, streamEndpoint])
 
   useEffect(() => {
     if (!stateQuery.data || realtimeConnected) {
@@ -133,6 +173,7 @@ export function usePanelState() {
     pendingNotificationApplyNow,
     logResetKey,
     realtimeConnected,
+    streamEndpoint,
     runAction: async (action: PanelAction) => {
       await actionMutation.mutateAsync(action)
     },

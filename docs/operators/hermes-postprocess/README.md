@@ -79,6 +79,16 @@ Hermes cron은 script-only job `lecture_stt_postprocess_operator`로 등록되�
 - mode: `no_agent=true`; script stdout이 비어 있으면 delivery도 조용하다.
 - backlog guard: activation-time backlog는 `state/hermes_postprocess/cron-baseline.json`의 `skip_stems`로 건너뛰고, cron은 baseline 이후 새 후보만 처리한다.
 
+## 2026-05-21 hardening/closeout addendum
+
+후속 hardening closeout에서 live stem `260504DS_1`의 final artifact 3개가 staged artifact와 SHA-256 일치 상태로 검증되었고, child Hermes 실행은 per-attempt isolated `HERMES_HOME` + macOS sandbox profile로 강화되었다. Staging directory는 매 attempt 전에 reset되어 이전 실패/timeout의 stale artifact를 재사용하지 않는다.
+
+Scheduler는 기존 `lecture_stt_postprocess_operator` job을 resume한 상태이며, direct wrapper no-candidate probe와 triggered cron no-candidate run 모두 정상/quiet로 확인했다. Metadata-only closeout report는 `state/reports/hermes_postprocess/closeout-20260521T141641Z.md`에 있다.
+
+## 2026-05-25 timeout addendum
+
+Hermes scheduler가 wrapper script를 120초 기본 timeout으로 종료하면서 child Hermes가 PID 1 orphan으로 남는 문제가 확인되었다. Active default profile은 `cron.script_timeout_seconds=1800`으로 조정했고, active shim은 `--child-timeout-sec 1500`을 전달한다. 이 간격을 유지해야 child timeout을 parent operator가 먼저 처리하고 validation/quarantine/restore 후 깨끗하게 종료할 수 있다. Config 변경 후에는 default Hermes gateway restart가 필요하다.
+
 ## Documents
 
 - `operator-runbook.md`: Hermes cron agent 행동 규칙

@@ -20,6 +20,7 @@ from lecture_stt.downstream.lib import (  # noqa: E402
     CORRECTION_STATUS_DELIVERED,
     CORRECTION_STATUS_ERROR,
     CORRECTION_STATUS_INCOMPLETE,
+    DEFAULT_OBSIDIAN_NOTE_DIR,
     SUMMARY_STATUS_BLOCKED,
     SUMMARY_STATUS_CONFLICT,
     SUMMARY_STATUS_DELIVERED,
@@ -82,6 +83,12 @@ class DownstreamDistributorTests(unittest.TestCase):
 
     def _route(self, abbr: str):
         return self.config.subjects[abbr]
+
+    def test_default_subject_routes_use_integrated_lecture_notes_summary_dir(self) -> None:
+        self.assertEqual(DEFAULT_OBSIDIAN_NOTE_DIR, "06_lecture_notes/01_summarize")
+        for route in default_subject_routes().values():
+            self.assertEqual(route.obsidian_note_dir, "06_lecture_notes/01_summarize")
+            self.assertNotIn("강의록", str(route.obsidian_summary_dir(Path("/vault"))))
 
     def test_correction_pair_is_delivered_as_a_unit(self) -> None:
         stem = "260316LC_1"

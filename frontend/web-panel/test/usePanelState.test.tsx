@@ -7,6 +7,8 @@ import { usePanelState } from "../src/hooks/usePanelState"
 import { subscribePanelEvents } from "../src/lib/panelEvents"
 import {
   FALLBACK_PANEL_ENDPOINTS,
+  PANEL_EVENTS_ENDPOINT,
+  PANEL_STATE_EVENTS_ENDPOINT,
   fetchPanelState,
   postNotificationSelection,
   postPanelAction,
@@ -29,6 +31,8 @@ vi.mock("../src/lib/panelApi", () => ({
   fetchPanelState: vi.fn(),
   postNotificationSelection: vi.fn(),
   postPanelAction: vi.fn(),
+  PANEL_EVENTS_ENDPOINT: "/api/events",
+  PANEL_STATE_EVENTS_ENDPOINT: "/api/events?streams=state",
 }))
 
 vi.mock("../src/lib/panelEvents", () => ({
@@ -55,6 +59,7 @@ function createPanelState(): PanelState {
     counts: {
       PENDING: 1,
       PROCESSING: 1,
+      NEEDS_REVIEW: 0,
       DONE: 3,
       ERROR: 0,
       UNREGISTERED: 0,
@@ -152,6 +157,116 @@ describe("usePanelState", () => {
     postPanelActionMock.mockReset()
     subscribePanelEventsMock.mockReset()
     subscribePanelEventsMock.mockReturnValue(() => {})
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it("uses /api/events?streams=state when logs are disabled", async () => {
+    fetchPanelStateMock.mockResolvedValue(createPanelState())
+
+    const { result } = renderHook(() => usePanelState(), {
+      wrapper: createWrapper(),
+    })
+
+    await waitFor(() => {
+      expect(result.current.streamEndpoint).toBe(PANEL_STATE_EVENTS_ENDPOINT)
+    })
+    await waitFor(() => {
+      expect(subscribePanelEventsMock).toHaveBeenCalledWith(
+        expect.objectContaining({ onConnectionChange: expect.any(Function) }),
+        PANEL_STATE_EVENTS_ENDPOINT,
+      )
+    })
+  })
+
+  it("uses /api/events when logs are enabled", async () => {
+    fetchPanelStateMock.mockResolvedValue(createPanelState())
+
+    const { result } = renderHook(() => usePanelState({ logsEnabled: true }), {
+      wrapper: createWrapper(),
+    })
+
+    await waitFor(() => {
+      expect(result.current.streamEndpoint).toBe(PANEL_EVENTS_ENDPOINT)
+    })
+    await waitFor(() => {
+      expect(subscribePanelEventsMock).toHaveBeenCalledWith(
+        expect.objectContaining({ onConnectionChange: expect.any(Function) }),
+        PANEL_EVENTS_ENDPOINT,
+      )
+    })
+  })
+
+  it("switches directly from state-only to combined SSE when logs are enabled", async () => {
+    fetchPanelStateMock.mockResolvedValue(createPanelState())
+    const unsubscribeStateOnly = vi.fn()
+    subscribePanelEventsMock.mockReturnValueOnce(unsubscribeStateOnly).mockReturnValue(() => {})
+
+    const { rerender } = renderHook(
+      ({ logsEnabled }: { logsEnabled: boolean }) => usePanelState({ logsEnabled }),
+      {
+        initialProps: { logsEnabled: false },
+        wrapper: createWrapper(),
+      },
+    )
+
+    await waitFor(() => {
+      expect(subscribePanelEventsMock).toHaveBeenCalledWith(
+        expect.objectContaining({ onConnectionChange: expect.any(Function) }),
+        PANEL_STATE_EVENTS_ENDPOINT,
+      )
+    })
+
+    rerender({ logsEnabled: true })
+
+    await waitFor(() => {
+      expect(subscribePanelEventsMock).toHaveBeenCalledWith(
+        expect.objectContaining({ onConnectionChange: expect.any(Function) }),
+        PANEL_EVENTS_ENDPOINT,
+      )
+    })
+
+    expect(subscribePanelEventsMock.mock.calls.map(([, endpoint]) => endpoint)).toEqual([
+      PANEL_STATE_EVENTS_ENDPOINT,
+      PANEL_EVENTS_ENDPOINT,
+    ])
+    expect(unsubscribeStateOnly).toHaveBeenCalledTimes(1)
+  })
+
+  it("falls back from state-only stream to combined stream after timeout", async () => {
+    fetchPanelStateMock.mockResolvedValue(createPanelState())
+    const setTimeoutSpy = vi.spyOn(window, "setTimeout")
+
+    try {
+      const { result } = renderHook(() => usePanelState(), {
+        wrapper: createWrapper(),
+      })
+
+      await waitFor(() => {
+        expect(result.current.streamEndpoint).toBe(PANEL_STATE_EVENTS_ENDPOINT)
+      })
+      await waitFor(() => {
+        expect(result.current.state?.runtime_state.status).toBe("running")
+      })
+
+      const fallbackTimeout = setTimeoutSpy.mock.calls.find(([, delay]) => delay === 1500)?.[0]
+      expect(fallbackTimeout).toBeTypeOf("function")
+      act(() => {
+        ;(fallbackTimeout as () => void)()
+      })
+
+      await waitFor(() => {
+        expect(result.current.streamEndpoint).toBe(PANEL_EVENTS_ENDPOINT)
+      })
+      expect(subscribePanelEventsMock).toHaveBeenCalledWith(
+        expect.objectContaining({ onConnectionChange: expect.any(Function) }),
+        PANEL_EVENTS_ENDPOINT,
+      )
+    } finally {
+      setTimeoutSpy.mockRestore()
+    }
   })
 
   it("uses runtime-provided action endpoints and refetches state after an action", async () => {

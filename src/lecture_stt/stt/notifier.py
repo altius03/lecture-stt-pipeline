@@ -24,12 +24,14 @@ class BaseNotifier:
         enabled: bool = True,
         send_start: bool = True,
         send_success: bool = True,
+        send_review: bool = True,
         send_failure: bool = True,
     ):
         self.provider_name = provider_name
         self._enabled = enabled
         self.send_start = send_start
         self.send_success = send_success
+        self.send_review = send_review
         self.send_failure = send_failure
         root = Path(state_dir) if state_dir else default_state_dir()
         self.state_dir = root
@@ -155,6 +157,27 @@ class BaseNotifier:
     def notify_error(self, payload: Dict[str, Any]) -> None:
         self.notify_failure(payload)
 
+    def notify_review(self, payload: Dict[str, Any]) -> None:
+        if not self.is_enabled() or not self.send_review:
+            return
+
+        job_id = str(payload.get("job_id", "-"))
+        file_name = self._truncate(payload.get("orig_name", "-"), 240)
+        review_step = self._truncate(payload.get("review_step", "검토 필요"), 80)
+        review_message = self._truncate(payload.get("review_message", "-"), 700)
+
+        self._send_once(
+            "review",
+            job_id,
+            [
+                f"⚠️ [{file_name}] 전사 결과 검토 필요",
+                f"작업 #{job_id}",
+                f"검토 단계: {review_step}",
+                f"사유: {review_message}",
+                self._queue_suffix(payload),
+            ],
+        )
+
     def notify_failure(self, payload: Dict[str, Any]) -> None:
         if not self.is_enabled() or not self.send_failure:
             return
@@ -197,6 +220,7 @@ class DiscordNotifier(BaseNotifier):
         enabled: bool = True,
         send_start: bool = True,
         send_success: bool = True,
+        send_review: bool = True,
         send_failure: bool = True,
     ):
         self.webhook_url = webhook_url
@@ -206,6 +230,7 @@ class DiscordNotifier(BaseNotifier):
             enabled=enabled and bool(webhook_url),
             send_start=send_start,
             send_success=send_success,
+            send_review=send_review,
             send_failure=send_failure,
         )
         if self.is_enabled():
@@ -258,6 +283,7 @@ class TelegramNotifier(BaseNotifier):
         message_thread_id: str | None = None,
         send_start: bool = True,
         send_success: bool = True,
+        send_review: bool = True,
         send_failure: bool = True,
     ):
         self.bot_token = bot_token
@@ -269,6 +295,7 @@ class TelegramNotifier(BaseNotifier):
             enabled=enabled and bool(bot_token) and bool(chat_id),
             send_start=send_start,
             send_success=send_success,
+            send_review=send_review,
             send_failure=send_failure,
         )
         if self.is_enabled():
@@ -358,6 +385,10 @@ class MultiNotifier:
         for notifier in self.notifiers:
             notifier.notify_error(payload)
 
+    def notify_review(self, payload: Dict[str, Any]) -> None:
+        for notifier in self.notifiers:
+            notifier.notify_review(payload)
+
     def notify_failure(self, payload: Dict[str, Any]) -> None:
         for notifier in self.notifiers:
             notifier.notify_failure(payload)
@@ -438,6 +469,7 @@ def _build_provider(
     enabled = _bool_value(notification_cfg.get("enabled"), True)
     send_start = _bool_value(notification_cfg.get("send_start"), True)
     send_success = _bool_value(notification_cfg.get("send_success"), True)
+    send_review = _bool_value(notification_cfg.get("send_review"), True)
     send_failure = _bool_value(notification_cfg.get("send_failure"), True)
 
     if provider_name == "telegram":
@@ -449,6 +481,7 @@ def _build_provider(
             enabled=enabled,
             send_start=send_start,
             send_success=send_success,
+            send_review=send_review,
             send_failure=send_failure,
         )
     if provider_name == "discord":
@@ -458,6 +491,7 @@ def _build_provider(
             enabled=enabled,
             send_start=send_start,
             send_success=send_success,
+            send_review=send_review,
             send_failure=send_failure,
         )
     return NoopNotifier()

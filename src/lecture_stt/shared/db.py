@@ -13,6 +13,7 @@ from lecture_stt.shared import utils
 STATUS_PENDING = "PENDING"
 STATUS_PROCESSING = "PROCESSING"
 STATUS_DONE = "DONE"
+STATUS_NEEDS_REVIEW = "NEEDS_REVIEW"
 STATUS_ERROR = "ERROR"
 
 DELIVERY_COLUMN_DEFS = {
@@ -290,12 +291,17 @@ def set_status(conn: sqlite3.Connection, job_id: int, status: str, **extra: Any)
     update_job(conn, job_id, status=status, **extra)
 
 
-# 동일 sha256 완료 작업을 최신순으로 찾아 중복 전송/재처리에 활용한다.
-def find_done_job_by_sha(conn: sqlite3.Connection, sha256: str) -> Optional[sqlite3.Row]:
+# 동일 sha256의 재사용 가능한 완료 산출물을 최신순으로 찾아 중복 전송/재처리에 활용한다.
+def find_replayable_job_by_sha(conn: sqlite3.Connection, sha256: str) -> Optional[sqlite3.Row]:
     return conn.execute(
-        "SELECT * FROM jobs WHERE sha256 = ? AND status = ? ORDER BY created_at DESC LIMIT 1",
-        (sha256, STATUS_DONE),
+        "SELECT * FROM jobs WHERE sha256 = ? AND status IN (?, ?) ORDER BY created_at DESC LIMIT 1",
+        (sha256, STATUS_DONE, STATUS_NEEDS_REVIEW),
     ).fetchone()
+
+
+def find_done_job_by_sha(conn: sqlite3.Connection, sha256: str) -> Optional[sqlite3.Row]:
+    """Backward-compatible alias for callers that still use the old name."""
+    return find_replayable_job_by_sha(conn, sha256)
 
 
 # 현재 처리 중인 작업 목록을 조회한다.
@@ -304,7 +310,7 @@ def list_processing_jobs(conn: sqlite3.Connection):
 
 
 def get_status_counts(conn: sqlite3.Connection) -> dict[str, int]:
-    counts = {"PENDING": 0, "PROCESSING": 0, "DONE": 0, "ERROR": 0}
+    counts = {"PENDING": 0, "PROCESSING": 0, "DONE": 0, "NEEDS_REVIEW": 0, "ERROR": 0}
     rows = conn.execute("SELECT status, count(*) AS cnt FROM jobs GROUP BY status").fetchall()
     for row in rows:
         status = str(row["status"])
@@ -365,11 +371,67 @@ def _retry_step_from_engine_params(engine_params: str | None) -> str | None:
     return f"전사 재시도 대기 {failures}/{max_retries}"
 
 
+def _validate_recovered_quality_scorecard(
+    json_path: str,
+    metadata: Dict[str, Any],
+) -> str | None:
+    quality = metadata.get("quality")
+    if not isinstance(quality, dict):
+        return None
+    try:
+        from lecture_stt.stt.quality_gate import (
+            validate_quality_scorecard,
+            write_quality_scorecard,
+        )
+
+        validate_quality_scorecard(json_path, metadata)
+    except FileNotFoundError:
+        # Transcript JSON is written before its metadata-only scorecard. A crash
+        # in that narrow window is safe to repair deterministically from the
+        # persisted metadata; rebuilding also keeps the Hermes picker from
+        # mistaking this result for a pre-scorecard legacy transcript.
+        try:
+            write_quality_scorecard(json_path, metadata)
+            validate_quality_scorecard(json_path, metadata)
+        except (OSError, TypeError, ValueError) as exc:
+            return f"복구된 전사 결과의 quality scorecard 재생성 실패: {exc}"
+    except ValueError as exc:
+        return f"복구된 전사 결과의 quality scorecard 검증 실패: {exc}"
+    except OSError as exc:
+        return f"복구된 전사 결과의 quality scorecard 접근 실패: {exc}"
+    return None
+
+
+def _completed_transcript_quality(json_path: str | None) -> tuple[str | None, str | None, str | None]:
+    """Read the persisted quality verdict used during interrupted-job recovery."""
+    if not json_path:
+        return None, None, None
+    try:
+        with Path(json_path).open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None, None, None
+    if not isinstance(payload, dict):
+        return None, None, None
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, dict):
+        return None, None, None
+    scorecard_error = _validate_recovered_quality_scorecard(json_path, metadata)
+    quality = metadata.get("quality")
+    if not isinstance(quality, dict):
+        return None, None, scorecard_error
+    health = quality.get("health")
+    summary = quality.get("summary")
+    normalized_health = health.strip().lower() if isinstance(health, str) else None
+    normalized_summary = summary.strip() if isinstance(summary, str) and summary.strip() else None
+    return normalized_health, normalized_summary, scorecard_error
+
+
 def recover_processing_jobs(conn: sqlite3.Connection, stale_processing_hours: int = 6) -> Dict[str, int]:
     # 시작 시 끊긴 PROCESSING 작업을 정상 종료/재시도/오류로 복구한다.
     now = datetime.now().astimezone()
     stale_seconds = stale_processing_hours * 3600
-    counts = {"done": 0, "pending": 0, "error": 0}
+    counts = {"done": 0, "needs_review": 0, "pending": 0, "error": 0}
 
     rows = list_processing_jobs(conn)
     for row in rows:
@@ -384,6 +446,35 @@ def recover_processing_jobs(conn: sqlite3.Connection, stale_processing_hours: in
         # 오래된 상태인지는 메타 데이터로만 기록해 추적한다.
         transcript_ready = _has_complete_transcripts(txt, json_path)
         if transcript_ready:
+            quality_health, quality_summary, scorecard_error = _completed_transcript_quality(json_path)
+            if scorecard_error:
+                set_status(
+                    conn,
+                    job_id,
+                    STATUS_NEEDS_REVIEW,
+                    ended_at=utils.now_iso(),
+                    error_message=scorecard_error,
+                    error_trace=None,
+                    current_step="품질 산출물 검증 필요",
+                    progress_pct=100,
+                    eta_sec=0,
+                )
+                counts["needs_review"] += 1
+                continue
+            if quality_health == "bad":
+                set_status(
+                    conn,
+                    job_id,
+                    STATUS_NEEDS_REVIEW,
+                    ended_at=utils.now_iso(),
+                    error_message=quality_summary or "복구된 전사 결과의 품질 검토가 필요합니다.",
+                    error_trace=None,
+                    current_step="품질 검토 필요",
+                    progress_pct=100,
+                    eta_sec=0,
+                )
+                counts["needs_review"] += 1
+                continue
             set_status(
                 conn,
                 job_id,
