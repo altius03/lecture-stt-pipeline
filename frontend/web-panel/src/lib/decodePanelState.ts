@@ -20,7 +20,7 @@ import type {
 } from "../types"
 
 const RUNTIME_STATUSES = ["running", "paused", "stopped"] as const satisfies readonly RuntimeStatus[]
-const RUNTIME_SOURCES = ["web", "external", "none"] as const satisfies readonly RuntimeSource[]
+const RUNTIME_SOURCES = ["web", "controller", "external", "none"] as const satisfies readonly RuntimeSource[]
 const PAUSE_ACTIONS = ["pause", "resume"] as const
 const NOTIFICATION_SELECTIONS = ["telegram", "discord", "both", "disabled"] as const satisfies readonly NotificationSelection[]
 

@@ -3,6 +3,573 @@
 이 파일은 저장소에 반영된 변경을 날짜순으로 누적 기록한다.
 최신 항목을 위에 추가한다.
 
+## 2026-07-28
+
+### Controller runtime web decoder closeout
+- 실브라우저 검증에서 backend가 controller 소유권을
+  `runtime_state.source=controller`로 보내지만 React decoder가
+  `web|external|none`만 허용해 초기 패널이 fail-closed 화면으로 멈추는
+  통합 오류를 발견했다. `RuntimeSource`와 closed decoder literal에
+  `controller`를 추가하고 초기 fetch와 SSE state event 회귀를 보강했다.
+- Frontend 전체 Vitest 244개와 TypeScript/Vite production build가
+  통과했다. 실제 console-owned backend를 대상으로 홈과 검토 큐를 다시
+  열어 SSE 연결, archive 125 / recording 92 / total 217 ledger를 확인했다.
+  1200px desktop과 390px mobile 모두 horizontal overflow 0,
+  console error/warning 0, upload input 0이었고 모바일에서 6개 운영 화면
+  navigation이 모두 노출됐다.
+
+### Guarded terminal transcription error recovery
+- `src/lecture_stt/stt/terminal_error_recovery.py`와
+  `--plan-terminal-error-recovery` /
+  `--terminal-error-recovery-manifest` CLI를 추가했다. 정확히 한 건의
+  `ERROR + 실패: 전사 실행` 행만 read-only closed manifest로 계획하며
+  `expected_count=1`, exact plan SHA-256, 명시적 enable/allow-write,
+  active controller kill switch와 기존 worker lock 없이는 적용할 수 없다.
+- Apply는 `99_errors`의 direct-child single-link 원본을 fd/stat/content
+  evidence로 다시 확인하고 원본을 보존한 채 `01_audio`에 no-overwrite
+  copy한다. Short write를 끝까지 소비하고 file/root fsync 뒤
+  `BEGIN IMMEDIATE`에서 DB 행·오류/engine metadata digest·source/target을
+  다시 확인해 `PENDING / 전사 재시도 대기 1/N`으로 전이한다. Copy 뒤
+  crash는 동일 manifest가 forward-complete하고, 완료된 exact replay는
+  `skipped`로 구분한다. Source/target/row/config drift는 fail-closed다.
+- 초기 focused 회귀 10개와 VAD signature compatibility 회귀 2개가
+  통과했다. Test-automator가 manifest duplicate/tamper, config/transcript/
+  status drift를 보강해 terminal recovery focused는 14개가 됐고,
+  TemporaryDirectory plan/apply/replay/tamper/root-drift 5개 시나리오도
+  모두 통과했다.
+- 운영 적용 직전 `state/backups/terminal-error-recovery-20260728T131220+0900`
+  에 jobs DB와 config를 0700/0600으로 보존했다. 각각 SHA-256
+  `fdde53374d49507cf8640b3f10560023045a11088d81e83526a2f470d6085d91`,
+  `2b23a281c220e9a4a576584664b0385659cf307d8e0e53298ca88b8c4c1b8af7`
+  이며 DB `quick_check=ok`였다.
+- 검증 중 병행된 운영 흐름이 controller를 kill-switch 우선 stop하고
+  job 201의 exact plan
+  `9ef4d2d962d61eaaabe2fed3fb119f28f73badb67e8950a3aeace9a343d42a52`
+  을 적용한 뒤 console controller를 재기동했다. 적용 backup/plan은
+  `state/backups/terminal-error-recovery-20260728T131413+0900`에 남아 있고
+  plan file SHA-256은
+  `bd91e96cc5623b28c7d9aed3b014d29e91db92a94035bb431396e6daf4a9e298`
+  이다. Controller ownership report는 retry 1건 `completed`,
+  `ok=true`, `polling_match=true`로 닫혔다.
+- Job 201은 `DONE`, 품질 93점으로 완료되어 운영 합계가 DONE 132,
+  ERROR/PENDING/PROCESSING 0이 됐다. `99_errors/260519OOP_1.m4a` 원본은
+  그대로 남고 `01_audio` copy와 transcript TXT/JSON이 생성됐다. 성공
+  metadata가 기존 `terminal_error_recovery` audit subtree를 fresh metadata로
+  덮는 사후 gap을 발견해, known `@1` audit object를 DONE과 NEEDS_REVIEW
+  결과에 exact deep-copy하는 회귀를 추가했다. 이미 끝난 job 201은
+  수동 DB 재작성하지 않고 pre-apply DB와 exact plan file을 감사 증거로
+  보존한다.
+- 이어진 reviewer에서 terminal recovery apply가 시작된 뒤 active
+  controller kill switch drift를 다시 확인하지 않는 Medium gap을 잡았다.
+  `apply_terminal_error_recovery_plan()`이 copy 직전과 `BEGIN IMMEDIATE`
+  직전에 모두 active marker를 재확인하도록 닫았고, copy 이후 marker가
+  사라지면 DB 전이 없이 fail-closed하는 회귀를 추가했다.
+
+### Operational archive evidence preservation rollout
+- 운영 ownerless archive 125건을 현재 source와 명시적으로 허용한 과거
+  Obsidian root에서 다시 read-only plan했다. Exact plan SHA-256은
+  `8156d5326faff62965b4a1e58f4c0515508269eaf72f34be9e5073722094d519`,
+  applicable 125, review-required 124, blocker 0이었다.
+- 적용 전 운영 Storage v2 DB와 config를
+  `state/backups/archive-evidence-rollout-20260728T124901+0900`에 각각
+  0600으로 보존했다. DB backup SHA-256은
+  `b9d7c1a3c91457164e53c5f7ff96d4f6e43d9b553576e4cafa5340da97d8a5de`,
+  config backup SHA-256은
+  `2b23a281c220e9a4a576584664b0385659cf307d8e0e53298ca88b8c4c1b8af7`이고
+  SQLite `quick_check=ok`를 확인했다.
+- `expected_count=125`, exact plan SHA-256, `--allow-write`로 기존 records
+  root와 분리된
+  `~/Library/Application Support/lecture_stt/storage-v2/archive-evidence`에
+  copy-only 적용했다. 결과는 imported 125, capture 125, revision 363,
+  observation 476이며 verifier issue 0이었다. 기존 Storage v2 library도
+  recordings 132, artifacts 540, issue 0을 유지했고 exact replay는
+  imported 0, skipped 125였다.
+- 원본 iCloud/GH/Obsidian 파일의 rename/move/delete, canonical promotion,
+  review status 변경은 수행하지 않았다. Unified review feed는 기존
+  recording 92건과 새 archive 125건을 합쳐 217건을 표시하며 모두 사람
+  검토 대상으로 남는다.
+
+### Console controller process and binary identity closeout
+- console runtime PID fence를 단일 숫자에서
+  `lecture-stt/controller-pid@2` JSON으로 올렸다. PID와 함께 Darwin
+  `proc_pidinfo(PROC_PIDTBSDINFO)`의 kernel birth `(tv_sec,tv_usec)`를 0600
+  no-follow 파일에 canonical JSON으로 기록하고 fsync하며,
+  snapshot/start/stop/TERM/KILL 모든 경로가 birth identity,
+  exact executable/argv, `pbi_pgid == pid`를 함께 재검증한다. PID가
+  재사용됐거나 동일 command가 non-leader process로 수동 실행됐으면 stale
+  evidence로만 정리하고 해당 process에는 signal을 보내지 않는다.
+- SHA-256 검증과 exec 사이의 path replacement를 닫기 위해 console binary는
+  expected digest 이름의 version directory 아래에만 허용하고, binary뿐
+  아니라 그 version directory와 `versions` store도 owner-only read/execute
+  `0500` 및 Darwin user-immutable(`uchg`)로 봉인한다. writable ancestor가
+  남아 있어도 store rename을 kernel이 거부하며, open fd의
+  inode/link/owner/mode/flag와 SHA-256을 재검증한 뒤에만 실행한다.
+- 새 subsecond PID birth mismatch, non-leader adoption, strict PID schema,
+  writable version store, Darwin immutable flag 회귀를 추가했다. 기존 운영
+  controller는 kill-switch 우선 stop 후 새 계약으로 재기동했다.
+  launchd/TCC 설정과 iCloud 원본, Storage v2 DB, Git index/remote는
+  변경하지 않았다.
+- 운영 store와 binary에 실제 `0500+uchg`를 적용한 뒤 새 PID JSON으로
+  console controller를 재기동했다. 약 102초의 전체 11-scan 주기가
+  `ok=true`, `polling_match=true`, plan/execution 0으로 끝났고 jobs DB는
+  DONE 131, ERROR 1, PENDING/PROCESSING 0으로 유지됐다. 최종 검증은
+  console focused 43개, Storage v2 301개, 전체 Python 757개, Go 전체
+  race test/vet, Python compileall, YAML parse, plist lint와
+  `git diff --check`를 통과했다. 이어 웹 패널만 종료해 controller가
+  PPID 1에서 계속 실행되는 것을 확인하고, 패널 재기동 뒤 PID birth
+  identity로 동일 process를 정상 복구 조회했다. 최종 @2 runtime에서는
+  PID file의 `(tv_sec,tv_usec)`와 live kernel tuple 및 PGID를 exact match로
+  확인했고, 패널을 다시 재기동해 같은 PID를 새 계약으로 채택했다. 최종
+  독립 reviewer에서 이 console-controller cutover 범위의 High/Medium
+  잔존 항목은 없었다.
+
+## 2026-07-27
+
+### Go controller operational cutover with Darwin console ownership
+- 사용자 승인 후 legacy `com.geonha.lecture-stt` Python polling worker를
+  내리고 Go controller를 실행 정본으로 전환했다. 운영 binary는 공식
+  Go 1.26.5 temporary toolchain으로 빌드한
+  `522b938e4364b11102962933005becfe70b323f5947f12062c96255a29ca7ff9`이며
+  user-owned version store의 0500 single-link file로 보존했다.
+  기존 controller plist/config은 rollback directory에 보존했고 legacy
+  plist도 삭제하거나 덮어쓰지 않았다.
+- launchd 아래의 Go 직접 scan, Go→Python `stat-scan`, Bash→Python direct
+  probe가 모두 iCloud Documents metadata open에서 block/reject되는 것을
+  실제 stack sample과 bounded timeout으로 확인했다. 실행/claim은 항상
+  0건이었다. 반면 사용자 콘솔에서 실제 iCloud inbox + 임시 DB/root
+  `--once` canary는 `ok=true`, `polling_match=true`로 통과했다. 이를 숨기지
+  않도록 ownership report를 `@2`로 올리고 observation/plan-verification
+  mode를 명시했다.
+- 웹 제어판에 opt-in `controller_runtime: console`을 추가했다. 시작 전
+  exact configured binary SHA-256, 0500 owner/mode/link/inode, 0700 state/PID
+  parent, no-follow 0600 PID/log를 검증한다. PID file은 recovery state 밖에
+  durable하게 기록하고 controller는 새 process group으로 실행한다. 중지는
+  kill-switch를 먼저 fsync한 뒤 PID executable/PGID를 재검증해 TERM,
+  bounded wait, 필요 시 KILL로 회수한다. 기본 runtime과 example owner는
+  각각 `launchd`와 `python`으로 유지되어 자동 승격되지 않는다.
+- 운영 inbox가 빈 상태에서 console-owned 전체 11-scan cycle은 약 102초 후
+  `ok=true`, `polling_match=true`, plan/execution 0으로 통과했다. 실제 웹
+  stop은 marker 0600 생성, process-group 종료, PID file 제거까지 완료했고
+  restart 후 동일 cycle을 다시 관찰했다. 당시 jobs DB는 DONE 131, ERROR 1,
+  PENDING/PROCESSING 0으로 전후 동일했다.
+- macOS 개인정보 보호 승인을 새 LaunchAgent에 자동 부여하거나 TCC DB를
+  변경하지 않았다. 따라서 현재 panel/controller는 권한을 가진 사용자
+  console session에 의존하며 재부팅 자동복구는 보장하지 않는다. 운영
+  iCloud 원본 rename/move/upload, Storage v2 migration, canonical title
+  자동 승격, Git stage/commit/push는 수행하지 않았다.
+
+### Controller target-Darwin acceptance closeout
+- 시스템 Go 설치나 저장소-local toolchain을 만들지 않고 공식
+  `go1.26.5.darwin-arm64` archive를 system temporary directory에만
+  내려받아 SHA-256을 검증한 뒤, `GOROOT`/`GOPATH`/`GOCACHE`/`GOMODCACHE`와
+  build output을 모두 임시 경로로 격리했다. `go test -race ./... -count=1
+  -v`와 `go vet ./...`가 통과했고 command-level SIGTERM 회귀는
+  parent/child/grandchild를 함께 회수했다. Real-Python lockstep soak도 race
+  detector 아래 1회 통과했다.
+- Opt-in target-Darwin acceptance를 TemporaryDirectory root에서 다시
+  실행해 20회 연속, run당 5건씩 총 100 stable observation을 모두 verified로
+  닫았다. Python/Go mismatch, safe-plan rejection, unsafe side effect는
+  0건이었고 테스트는 156.23초에 통과했다. 이어 실제 빌드한 Go binary를
+  `controller_evidence` wrapper로 20회 실행한 immutable attempt journal도
+  completed 20, failed 0, incomplete 0, consecutive success 20,
+  consecutive verified 100, `ready=true`로 readiness verifier를 통과했다.
+- 최종 회귀는 immutable runtime targeted 43개, controller/retry focused
+  119개, Storage v2 301개, 전체 Python 724개를 통과했다. Python
+  `compileall`, CI YAML parse, 전체 plist lint, tracked/new source whitespace
+  check도 통과했다. UI 변경은 없어 frontend/browser 검증은 재실행하지
+  않았다.
+- 이는 격리된 shadow/readiness 증거의 완료이며 controller ownership
+  승격이나 운영 설치 승인이 아니다. Go binary에는 실행/claim 경로가 없고
+  Python polling이 계속 유일한 실행 정본이다. 운영 DB/root,
+  LaunchAgents/launchd/worker, iCloud 원본에는 migration·copy·install·
+  cutover·restart를 하지 않았고 Git stage/commit/push도 수행하지 않았다.
+
+### Controller evidence-aware candidate와 temporary offline activation
+- Candidate plist가 Go shadow binary를 직접 실행해 immutable attempt journal을
+  우회하던 경계를 제거했다. 후보는 이제 exact `PYTHONPATH`와
+  `python -m lecture_stt.stt.controller_evidence run`만 사용하며
+  `PYTHONDONTWRITEBYTECODE=1`, bundle 내부 immutable `python-runtime`
+  `PYTHONPATH`, 0700 evidence root, copied Go binary,
+  Python/repo/config/absent kill-switch, 1800초 timeout, `expected-count=1`,
+  explicit observation/write guard를 닫힌 ProgramArguments로 전달한다.
+  Stdout은 readiness 원장이 아닌 `controller-shadow.evidence-result.jsonl`
+  metadata-only result log다.
+- Topology preflight는 새 wrapper-only argument/environment/placeholder/log
+  계약을 exact match하고 `evidence_wrapper_connected=true`,
+  `install_supported=false`를 반환한다. Bundle plan/prepare는 owned 0700
+  evidence root의 path/identity와 네 개 최소 runtime source
+  (`lecture_stt/__init__.py`, `lecture_stt/stt/__init__.py`,
+  `controller_evidence.py`, `controller_readiness.py`)를 복제한
+  `python-runtime` tree의 ordered source identity/content digest를 추가로 닫고
+  apply 직전 재계산한다. Prepared bundle과 inspect/replay는 0500 runtime
+  directory, 0400 runtime files, exact runtime tree SHA-256과 unknown entry
+  tamper를 함께 fail-closed한다. Candidate의 `WorkingDirectory`도 같은
+  runtime root로 고정해 `python -m`의 cwd 우선 import가 mutable repo
+  최상위 package로 돌아가는 경계를 닫았다. Manifest는 기존 실행/설치/
+  uninstall/rollback unsupported와 함께 launchd/operational install false,
+  Python polling authority true를 명시한다.
+- `controller_activation.py`를 추가했다. 이름의 install/uninstall/rollback은
+  실제 서비스 제어가 아니라 system temporary directory 안의 offline lifecycle
+  상태 전이다. Exact prepared bundle은 plan SHA별 immutable 0500 binary와
+  0400 plist/manifest, 그리고 같은 0500 immutable `python-runtime` version으로
+  보존하고, 0600 nonblocking lock 아래 0400 action record를 이전
+  record/active state SHA에 연결한다. Uninstall은 파일을 지우지 않는
+  tombstone이고 rollback은 과거 installed version만 허용한다. 모든 apply는
+  기본 비활성 enable/allow-write/count/exact-plan guard와 직전
+  bundle/version/journal/runtime tree 재검증을 요구한다. 동일 replay는
+  `skipped`, crash 뒤 complete orphan version은 새 exact plan으로 forward
+  recovery하고 partial/changed/unknown evidence는 자동 정리 없이
+  recovery-required다.
+- 이 offline ledger는 LaunchAgents를 읽거나 쓰지 않고 `launchctl`/subprocess,
+  운영 DB/root/worker/iCloud 접근 경로가 없다. Python polling은 계속 유일한
+  실행 정본이며 실제 shadow service install/cutover 권한은 생기지 않았다.
+- 검증은 immutable runtime targeted 43개, controller shadow/retry focused
+  119개, Storage v2 301개, 전체 Python 724개를 통과했다. 별도
+  TemporaryDirectory canary는 repository의 wrapper source를 prepare 뒤
+  변경하고 repo 최상위에 poison `lecture_stt` package를 추가해도 rendered
+  plist가 bundle 내부 4-file runtime만으로 evidence wrapper를 정상
+  실행하고 `__pycache__`를 만들지 않는 것과 offline
+  `install applied → skipped`, `uninstall applied → skipped`,
+  `rollback applied → skipped`, version plist mode/runtime tree tamper 거부를
+  확인했다. Python `compileall`, CI YAML parse, 전체 plist lint,
+  tracked/new-file whitespace check도 통과했다. 당시 셸에는 Go가 없어
+  Go test/race/vet와 실제 Darwin 20x100을 재실행하지 않았으며, 위
+  target-Darwin acceptance closeout에서 임시 toolchain으로 후속 검증했다.
+  UI 변경은 없어 frontend/browser 검증도 재실행하지 않았다.
+- 운영 DB/root, LaunchAgents/launchd/worker, iCloud 원본에는
+  migration·copy·install·cutover·restart를 하지 않았고 Git
+  stage/commit/push도 수행하지 않았다.
+
+## 2026-07-27
+
+### Controller shadow immutable attempt evidence journal
+- Candidate raw stdout와 copy-truncate log rotation을 연속 실행 readiness의
+  provenance로 사용하지 않도록
+  `python -m lecture_stt.stt.controller_evidence run|verify`를 추가했다.
+  `run`은 기본 비활성이며 `--enable-observation`, `--allow-write`,
+  `--expected-count 1`을 모두 요구한다. Journal/controller/config/absent
+  kill-switch는 system temporary directory 실제 하위만 허용하고 journal
+  root는 현재 사용자 소유의 exact 0700 directory여야 한다. 기존 Python
+  executable과 repo는 read-only 입력으로만 사용한다.
+- 0600 no-follow single-link lock으로 한 attempt만 소유한 뒤 실제 입력을
+  열기 전 요청 binding의 start record를 먼저 0400/O_EXCL로 durable하게
+  기록한다. Controller/Python/config/repo identity와 content fingerprint를
+  닫고 exact read-only Go argument만 실행하며, 종료 후 입력과 kill-switch
+  부재를 다시 검증한다. Finish는 runner status, exit code, bounded raw
+  report byte count/SHA-256, 닫힌 `report@4`와
+  success/failed/interrupted/timeout/spawn/missing/invalid/input-invalid/
+  input-changed outcome을 구분한다. 실행 후 input drift가 생기면 유효 report는
+  진단 증거로 보존할 수 있지만 readiness 성공으로 승격하지 않는다.
+- Start/finish는 각각 이전 record SHA-256을 포함하는 append-only chain이고,
+  file/root `fsync`, canonical JSON, closed key set, sequence/attempt ID,
+  mode/link/path identity를 재검증한다. Crash로 finish가 없는 start는
+  삭제·덮어쓰기 없이 failure barrier로 남고 다음 실행은 새 sequence로
+  이어진다. `verify`는 마지막 failure/incomplete 이후 final success suffix만
+  세며 unique run ID, strictly increasing start, non-overlap과 기본
+  20 runs/100 verified를 다시 검사한다. 최대 10,000 attempt 이후에는 자동
+  rotation 없이 닫힌다.
+- SIGINT/SIGTERM wrapper는 100ms polling 경계에서 controller process group을
+  terminate하고, SIGTERM을 무시하면 bounded SIGKILL/reap으로 수렴한다.
+  Leader가 먼저 종료돼도 signal을 무시한 descendant group이 남아 있으면
+  SIGKILL과 bounded group-disappearance check를 계속하며, signal을 한 번이라도
+  받았으면 child가 valid success report와 exit 0을 반환해도
+  `interrupted` barrier로 기록한다. Failure report의 plan rejection kind와
+  stable scan link도 closed validation으로 제한했다. CI의 macOS controller
+  contract 목록에 `tests.test_controller_evidence`를 추가했다.
+- Evidence 전용 18개, controller/STT focused Python 148개, Storage v2 301개,
+  전체 Python 703개가 통과했다. 별도 TemporaryDirectory canary 6개는
+  success journal/verify, 외부 SIGTERM parent+descendant cleanup, 실행 중
+  kill-switch drift, incomplete start 보존 후 새 success suffix, symlink/
+  hardlink/partial JSON/mode/hash-chain tamper 거부를 확인했다. Python
+  `compileall`, CI YAML parse, 전체 plist lint, tracked와 신규 파일
+  whitespace check도 통과했다. 현재 셸에는 Go가 없어 이 단계에서 Go
+  build/test는 재실행하지 않았다.
+- 이 journal은 위 후속 작업에서 candidate review plist/bundle의 유일한 실행
+  경계로 연결됐다. 그래도 TemporaryDirectory 전용이고 외부 서명이나 trusted
+  timestamp가 아니며 launchd install/cutover 또는 Python polling 승격을
+  승인하지 않는다.
+  UI 변경은 없어서 frontend test/type/build/browser 검증은 재실행하지 않았다.
+  운영 DB/root, LaunchAgents/launchd/worker, iCloud 원본에는 migration·
+  실행·cutover·restart를 하지 않았고 Git stage/commit/push도 수행하지
+  않았다.
+
+### Controller shadow temporary review bundle
+- Static topology preflight 다음 단계로
+  `python -m lecture_stt.stt.controller_bundle plan|prepare`를 추가했다. 출력
+  root뿐 아니라 rendered plist에 직접 들어가는 source Go binary, config,
+  absent kill-switch, owned 0700 evidence root, synthetic home도 system
+  temporary directory의 실제 하위 경로만 허용하며, Python binary만
+  예외적으로 기존 absolute executable을 받는다. 따라서 review 산출물이
+  운영 home/config/log path를 가리키는 상태를
+  fail-closed하고 LaunchAgents, 운영 DB/root, worker, iCloud에는 접근하지
+  않는다. Plan은 topology/template, source Go binary, Python binary, config,
+  absent kill-switch, home/output identity와 rendered plist를 exact SHA-256으로
+  닫는다.
+- Prepare는 기본 비활성이고 `--enable-prepare`, `--allow-write`,
+  `--expected-count 1`, exact plan SHA-256을 모두 요구한다. Apply 직전 같은
+  증거를 다시 읽어 source/config/template/kill-switch drift를 쓰기 전에
+  차단한다. Bundle directory와 copied binary, `.plist.review`, manifest는
+  no-follow/O_EXCL로 만들고 file/directory `fsync`를 적용하며 manifest를
+  마지막에 기록한다. 동일하게 완료된 replay만 `skipped`이고 partial/extra/
+  tampered bundle은 삭제·덮어쓰기 없이 recovery-required로 거부한다.
+- 실제 canary에서 `.venv/bin/python -> python3` leaf symlink가 흔한 점을 반영해
+  Python binary에 한해서만 요청 경로의 leaf symlink를 resolved executable로
+  정규화했다. Source binary/config/kill-switch/temp 경계는 그대로
+  fail-closed라서 운영 path 우회나 template drift 허용으로 넓어지지 않는다.
+- Manifest는 실행/설치/uninstall/rollback을 모두 unsupported로 닫고 Python
+  polling이 유일한 실행 정본임을 유지한다. 이 초기 bundle 단계의 raw stdout
+  계약은 위 후속 evidence-aware candidate에서 wrapper result log와 immutable
+  journal 연결로 대체됐다.
+- Bundle 전용 11개, controller/STT focused Python 130개, Storage v2 301개,
+  전체 Python 685개가 통과했다. 격리 TemporaryDirectory canary는
+  `prepared → skipped`, artifact 3개, config tamper 전량 무변경 거부,
+  extra-artifact recovery-required, raw stdout와 install/execution false를
+  확인했다. Real-repo static preflight는 candidate template SHA-256
+  `6743d3b22d38ee496c2710766037c4470df6c4abf8f3207eda8e353fc8cee2cc`,
+  topology SHA-256
+  `0174ac1ac082247576fa0631c3cfe93bd2f5e3ddc0cef5a9686f4dd88f39b9af`로
+  통과했다. Python compileall, CI YAML, 모든 plist lint, tracked/new-file
+  diff check도 통과했다. 현재 셸에는 Go binary가 없어 이번 단계에서 Go를
+  재빌드하지 않았고 executable single-link fixture만 bundle canary 입력으로
+  사용했다.
+- 운영 DB/root, LaunchAgents/launchd/worker, iCloud 원본에는
+  migration·render copy·install·cutover·restart를 하지 않았고 Git
+  stage/commit/push도 수행하지 않았다.
+
+### Controller launchd static topology preflight
+- 기존 `setup_launchd.sh`는 venv/package/model/iCloud/log directory를 준비한 뒤
+  4개 운영 label을 `bootout → render → bootstrap → kickstart`하므로 dry-run
+  기반으로 확장하지 않았다. 대신 `controller_topology.py`가 repo 안의 기존
+  launchd template 4개, setup script와 분리된 controller shadow 후보
+  template만 읽는 install-free 정적 preflight를 제공한다.
+- 후보 `com.geonha.lecture-stt-controller-shadow` template는
+  `controller/launchd/` 아래에 두어 기존 setup/install 목록에서 분리했다.
+  Exact Go shadow/Python/repo/config/kill-switch placeholder arguments, 300초
+  interval, background/low-priority, 독립 JSONL stdout·stderr를 고정하고
+  `RunAtLoad`, `KeepAlive`, watch override와 apply/write/enable flag는 허용하지
+  않는다.
+- Preflight는 기존 label/file 이름, setup script의 exact 4-label 목록,
+  전체 기존 template와 후보 digest, label/log path 충돌을 묶는다. Repo 내부
+  parent symlink, leaf symlink/hardlink/non-regular/unstable/oversize file,
+  malformed/duplicate plist key, unknown key와 placeholder/argument drift는
+  fail-closed다. 성공 출력은 path/argument를 제외한
+  `lecture-stt/controller-topology-summary@1` count와 SHA-256뿐이며
+  `mode=read_only`, `install_supported=false`를 명시한다.
+- 이 단계는 plist render/copy, `~/Library/LaunchAgents` 조회·변경,
+  `launchctl`, worker/DB/root/iCloud 접근을 모두 포함하지 않는다. 기존 setup
+  script도 변경하지 않아 후보 service는 설치할 수 없는 정적 계약 상태다.
+- Topology 전용 11개, controller focused Python 130개, Storage v2 301개,
+  전체 Python 685개와 앞선 Go named 29개/full/race/vet를 통과했다. Real-repo
+  preflight는 existing 4/candidate 1, `install_supported=false`, topology
+  SHA-256 `0174ac1ac082247576fa0631c3cfe93bd2f5e3ddc0cef5a9686f4dd88f39b9af`로
+  통과했다. 모든 plist `plutil`, compileall, CI YAML, tracked/new-file diff
+  check와 setup auto-install reference 0건, 관련 잔존 process 0건을 확인했다.
+
+### Controller retry ownership readiness와 Darwin acceptance
+- Fresh inbox source용 single-job plan을 canonical audio retry에 재사용하지 않고
+  `lecture-stt/retry-job-plan@1` exact 계약을 추가했다. Read-only plan은
+  SQLite `mode=ro`/`query_only`, configured DB path와 실제 main DB의
+  inode/mode/link identity, stable-audio/transcript root hash, exact
+  `PENDING` retry row, canonical audio stat/SHA-256, canonical transcript
+  direct-child TXT/JSON 경로, worker/profile fingerprint를 닫힌 SHA-256에
+  포함한다. 후보가 여러 개면 explicit job id가 필요하고 `expected_count=1`만
+  허용한다.
+- `--retry-job-manifest` 실행은 기본 비활성이며
+  `--enable-retry-job`, `--allow-write`, `--expected-count 1`, exact plan
+  digest, 필수 absent `--controller-kill-switch`를 모두 요구한다. Worker
+  `state/stt.lock` 안에서 startup recovery 전후와 claim 직전에 DB/audio/
+  output/config/kill-switch evidence를 재검증한다. 최종 claim은 id/status/
+  updated-at/step/name/base/audio path/transcript paths/engine params 전체가
+  계획 직후 값과 같을 때만 성공하는 conditional SQLite UPDATE라서
+  revalidate→claim 사이 race도 fail-closed다.
+- 실제 retry 실행, quality/output 저장, retry exhaustion과 error move는 기존
+  Python `_process_retryable_transcription_job()`만 사용한다. 중단된
+  `PROCESSING`은 기존 `recover_processing_jobs()`가 persisted retry count로
+  `PENDING`에 복구하고 이전 plan은 stale 처리되어 재계획이 필요하다. Kill
+  switch는 새 exact retry 시작을 차단하는 failback이며 이미 시작된 전사를
+  강제 취소하거나 파일을 되돌리는 rollback은 하지 않는다. 새 schema
+  migration은 없고 Go binary에는 apply/DB/claim 경로를 추가하지 않았다.
+- Go shadow report를 `controller-shadow-report@4`로 올리고 random 128-bit
+  run ID, UTC start/completion time, optional kill-switch configured 여부를
+  추가했다. Marker는 subprocess/scan/plan/close 경계마다 확인하며 regular
+  single-link marker는 `kill_switch_active`, symlink/directory/hardlink는
+  `kill_switch_invalid`로 중단한다. SIGINT/SIGTERM은 context cancellation과
+  exit 130 `interrupted` report로 수렴하고, Python probe를 독립 process
+  group으로 실행해 parent/child/grandchild를 함께 terminate/reap한다.
+- `controller_readiness.py`는 `@4` JSONL ledger를 regular single-link,
+  bounded size/count, stable same-FD/path stat, strict UTF-8와 closed schema로
+  읽는다. Report별 scan/check/count·safe path·verified digest를 검사하고,
+  unique run ID, strictly increasing start, non-overlap을 강제해 복제·재정렬된
+  report가 연속 실행 증거로 오인되지 않게 했다. 기본 20 runs/100 verified
+  기준을 만족하면 aggregate count와 ledger SHA-256만 출력하며, 이 digest는
+  서명이나 cutover 승인으로 취급하지 않는다.
+- Target Darwin opt-in acceptance는 TemporaryDirectory root에서 create,
+  repeated observation, append/reset, delete-before-stable, dot/tilde/tmp/part
+  ignore, same-directory rename, Unicode churn을 20회 연속 실행했다. 각 run
+  5건씩 총 100건의 plan이 모두 verified였고 Python/Go mismatch와 safe-plan
+  rejection은 0이었다. 20회 gate는 156.19초에 통과했으며 report absolute
+  repo/watch/DB path 노출, 격리 output/DB sentinel 변경, kill-switch 생성은
+  모두 0이었다. 20개 report ledger는 실제 Python readiness verifier까지
+  통과했다. Fixture가 명시적으로 다시 쓴 파일은 mtime 경계 오차가 acceptance
+  결과를 흔들지 않도록 격리 root 안에서 충분히 aging했다.
+- Command-level SIGTERM test의 2초 cleanup bound는 helper와 descendant PID가
+  모두 준비된 뒤 signal을 보낸 시점부터 측정하도록 좁혔다. 격리 10회 반복은
+  각 0.46~0.49초에 parent/child/grandchild 종료와 report exit 130을 확인했다.
+- Focused Python 108개, Storage v2 301개, 전체 Python 663개, Go named tests
+  29개를 통과했다. Go full/race/vet, real-Python lockstep soak 3회,
+  native/darwin-arm64/linux-amd64 build, Python `compileall`,
+  `git diff --check`도 통과했다. 별도 CLI canary는 격리 DB/root에서
+  plan→retry-pending apply, stale replay 거부, audio tamper 거부, active kill
+  switch 무변경, simulated PROCESSING crash recovery와 fresh replan을
+  확인했다.
+- macOS `controller-readiness` CI job은 closed Python controller contracts,
+  Go race/vet와 같은 opt-in 20x100 acceptance를 실행하도록 추가했다. 이는
+  repository workflow 설정이며 이번 로컬 검증에서 원격 Actions 실행이나
+  운영 배포를 수행한 것은 아니다.
+- Go controller는 여전히 read-only shadow이고 Python polling이 유일한 실행
+  정본이다. 운영 DB/root, launchd/worker, iCloud 원본에는 연결·migration·
+  cutover·restart하지 않았고 Git stage/commit/push도 수행하지 않았다.
+
+## 2026-07-27
+
+### Hallmark 운영 workbench 디자인 시스템
+- 6개 hash route 화면을 한 사람이 전체 운영 상태를 읽고 guarded 작업을 이어서 처리하는 technical workbench로 통일했다. 장식적 `01–06` index를 제거하고 실제 화면 설명·대기 건수·active route를 보여 주는 command rail로 바꿨으며, 상단에는 현재 화면·런타임·갱신 시각·SSE/polling·알림·theme 제어를 한 runtime strip으로 묶었다.
+- 루트 `DESIGN.md`와 `frontend/web-panel/tokens.css`를 추가해 cool cobalt light/dark palette, Pretendard/telemetry-mono 역할, 4px spacing, focus/motion/radius를 고정했다. 기존 화면의 class와 semantic status 색은 유지하되 hex/rgb, 배경 grid, 장식 gradient, browser-default easing을 제거하고 runtime CSS는 token만 사용한다.
+- desktop은 sticky command rail과 가변 workbench, 60rem 미만은 단일 열, 40rem 미만은 설명을 접은 2열 route grid로 구성한다. root horizontal overflow를 clip하고, 44px touch target, 즉시 표시되는 focus ring, hover-capability query와 reduced-motion 경계를 적용했다.
+- React 변경은 command rail/header/landmark 구조에 한정했다. 기존 hash parser, API/DTO, TanStack Query, SSE/polling, 알림 저장, guarded action과 기본 비활성 materialization 계약은 바꾸지 않았고 웹 업로드나 rename/move 기능도 추가하지 않았다.
+- App focused Vitest 32개와 frontend 전체 31 files/242 tests, TypeScript/Vite production build, scoped `git diff --check`가 통과했다. 격리 fake-state 서버에서 6 routes × 5 viewports(320/375/414/768/1440px) 30개 조합을 확인해 root overflow, console warning/error, upload control, 장식 ordinal, active-route 불일치, command label wrap가 모두 0건이었다. 320px keyboard focus와 light/dark rendering도 확인했고 주요 text/background·semantic 상태·surface focus 대비가 기준을 통과했다.
+- 운영 DB/root, launchd/worker, iCloud 원본에는 연결·migration·cutover·restart하지 않았고 Git stage/commit/push도 수행하지 않았다.
+
+### Go controller lockstep churn shadow
+- 기존 Python/Go 독립 sleep loop는 create/append/rename/delete 경계에서 두
+  scanner가 다른 시점의 filesystem을 볼 수 있었고, 모든 scan 뒤에 plan을
+  검증하면 정상 관측한 파일이 이후 rename/delete된 경우도 거부되는 문제가
+  있었다. Go가 bounded cadence를 소유하고 하나의 persistent Python
+  `PollingWatcher`를 closed
+  `lecture-stt/shadow-scan-request@1` /
+  `lecture-stt/shadow-scan-result@1` stdin/stdout protocol로 scan마다 한 번씩
+  전진시키도록 바꿨다.
+- Go와 Python이 같은 scan에서 안정 파일로 본 교집합은 다음 filesystem churn
+  전에 즉시 `--plan-single-job`으로 검증한다.
+  `lecture-stt/controller-shadow-report@2`는 반복 관측을 합치지 않고 모든 plan
+  check에 원래 `scan_index`를 남긴다. Lockstep protocol은 strict UTF-8,
+  duplicate/unknown/out-of-order field, null/duplicate path, EOF와 64 KiB 초과
+  line을 fail-closed로 거부하며 scan/path/plan 수에도 상한을 유지한다.
+  Scan result read와 final child close는 각각 bounded timeout 안에 끝나지
+  않으면 child를 종료·reap하고 fail-closed로 중단한다.
+- 격리 Go integration soak는 7개 lockstep scan에서 transient create/append/
+  delete-before-stable과 ignored `.part`, 안정된 한글 파일, same-directory
+  rename 뒤 재안정화, Unicode 파일 재안정화와 이후 delete를 실제
+  `PollingWatcher`로 재현했다. Python/Go scan 7개가 모두 일치했고 원본,
+  renamed, Unicode 파일의 plan은 각각 scan 2/4/6에서 즉시 검증됐다.
+  Report의 absolute repo/watch/DB path와 source content SHA 노출은 0건이었고
+  격리 output/DB seed와 sentinel 외 최종 source 상태는 예상값과 같았다.
+- Python shadow probe 11개, single-job 포함 focused Python 63개, Go 21개,
+  Storage v2 301개, 전체 Python 618개를 통과했다. Gated real-Python soak
+  3회 연속 통과했고 Go vet, native/darwin-arm64/linux-amd64 build,
+  `compileall`, `git diff --check`가 통과했다.
+- 이 결과는 controller ownership 승격 근거가 아니라 결정적 evidence seed다.
+  Lockstep scan response와 final close timeout은 bounded 하게 추가됐지만
+  Target Darwin 반복 기준, 외부 interruption cleanup 증거, retry
+  ownership/fencing/crash
+  recovery/rollback/kill switch는 아직 충족되지 않아 Python polling이 계속
+  유일한 실행 정본이다. 운영 DB/root, launchd/worker, iCloud 원본에는
+  연결·실행·migration·cutover·restart하지 않았고 Git stage/commit/push도
+  수행하지 않았다.
+
+### Go controller read-only shadow
+- `src/lecture_stt/stt/shadow_probe.py`에 worker/DB/log setup을 통과하지 않는
+  최소 read-only `config`/`scan` probe를 추가했다. 기존 `PollingWatcher`를
+  bounded scan count로 직접 호출하고 결과에는 scan별 stable 상대 파일명만
+  남긴다. Absolute watch path는 controller 내부 config handoff에만 쓰며 scan
+  보고서에는 포함하지 않는다.
+- `controller/`에 Go module과 `lecture-stt-shadow` CLI를 추가했다. Go tracker가
+  Python canonical watcher와 같은 size/mtime stability state를 독립 관측하고,
+  scan별 결과 교집합에 대해 Python single-job plan을 요청한다. 이후 Go가
+  duplicate/unknown JSON field, exact canonical SHA-256, root-bound no-follow
+  source open과 device/inode/size/mtime/ctime/content hash를 다시 검증한다.
+  외부 syscall 경계는 `golang.org/x/sys/unix`의 `openat`만 사용한다.
+- Shadow report는 `mode=read_only`, 상대 파일명, plan digest와 검증 상태만
+  노출한다. Apply/DB/claim/file rename·move/worker restart 코드는 추가하지
+  않았고, mismatch는 exit 2로 fail-closed 처리한다. Python polling과 기존
+  worker가 계속 실행 정본이며 자동 승격이나 웹 endpoint/UI는 없다.
+- Python probe 7개, single-job 포함 focused Python 59개, Go 15개,
+  Storage v2 301개, 전체 Python 614개와 Go vet/darwin arm64 build/Linux
+  cross-build, `compileall`, `git diff --check`를 통과했다. Go가 설치되지 않은
+  환경에서는 공식 darwin-arm64 archive를 `/tmp`에만 풀고 공개 SHA-256과
+  일치하는지 확인했으며 시스템 설치는 하지 않았다.
+- `/tmp` 격리 root canary에서 정상 파일은 scan 2에 Python/Go가 함께 안정
+  판정하고 plan 1건을 독립 검증했다. Symlink 1건과 hardlink 2건은 watcher
+  관측은 일치했지만 Python plan 단계에서 exit 2로 거부됐다. 세 실행 모두
+  absolute root report leak 0, output/DB 파일 0건이었고 정상 source identity는
+  불변이었다. 운영 DB/root, launchd/worker, iCloud 원본에는 연결·실행·
+  migration·cutover·restart하지 않았고 Git stage/commit/push도 수행하지
+  않았다.
+
+### Manifest 기반 단일-job Python worker 계약
+- 기존 `--once` polling cycle과 분리해 `--plan-single-job` /
+  `--single-job-manifest` CLI를 추가했다. Plan은 watch root 직속 파일 1개만
+  허용하고 regular/single-link/no-follow open, inode, size, mtime/ctime,
+  SHA-256, `stable_for_sec` 이상의 mtime age, active profile과 worker config
+  fingerprint를 닫힌
+  `lecture-stt/single-job-plan@1`에 고정한다. Transcript/audio 본문은 manifest에
+  넣지 않는다. 이 age gate는 watcher의 반복 관측을 대체하지 않는다.
+- 실행은 기본 비활성이며 `--enable-single-job`, `--allow-write`,
+  `--expected-count 1`, exact plan SHA-256가 모두 맞아야 한다. Worker lock
+  안에서 startup recovery 전후와 기존 local staging claim 직전에
+  source/profile/config evidence를 재검증하고, 실제 파일 이동·DB 상태·전사·
+  산출물 처리는 기존 `STTPipeline.process_job()`만 소유한다.
+- `process_job()`의 기존 polling 호출 호환성을 유지하면서 단일-job 호출에는
+  `completed`/`needs_review`/`retry_pending`/`busy`/`skipped`/`failed` 결과와
+  job id를 metadata-only로 반환하게 했다. `retry_pending`은 기존 DB retry
+  queue에 남았음을, `busy`는 worker lock 경합을 숨기지 않으며 둘은 exit
+  75로 구분한다. Retry 실행 정본은 계속 Python polling이다. 새 Go 코드, 웹
+  endpoint/UI, 업로드, rename/move 정책은 추가하지 않았다. 다음 단계는 이
+  manifest를 생성하는 Go controller의 read-only shadow decision과 Python
+  polling 결과 대조다.
+- 구현과 canary는 `TemporaryDirectory`의 inbox/DB/output root만 사용한다.
+  Focused Python 52개, Storage v2 301개, 전체 Python 607개와 `compileall`,
+  `git diff --check`가 통과했다. 격리 canary 8개는 정상 1건 처리, 처리 후
+  one-shot replay 거부, source/plan tamper 거부, 미성숙 source 거부,
+  retry-pending/busy의 exit 75, write/count/digest guard를 확인했다.
+  운영 worker/launchd, 운영 DB/root, iCloud 원본에는 실행·재시작·cutover를
+  하지 않았고 Git stage/commit/push도 수행하지 않았다.
+
+### 누락 legacy transcript pair의 guarded canonical recovery CLI
+- `src/lecture_stt/storage_v2/transcript_recovery.py`와
+  `plan/apply-historical-transcript-recovery` CLI를 추가했다. 명시적 historical
+  transcript root의 exact txt/json pair를 기존 current legacy job에 복구하되
+  기본 비활성 enable, allow-write, expected count 1, exact plan SHA-256를 모두
+  요구한다.
+- 새 migration이나 운영 schema 변경 없이 `job_events`를 prepared/applied
+  recovery journal로 사용한다. Artifact DB prepare 뒤 no-overwrite/fsync copy,
+  atomic manifest replace, applied finalize로 진행하고 동일 plan만 forward
+  recovery한다. `storage_key`, source, title/context, job status, review lifecycle,
+  원본 경로는 바꾸지 않는다.
+- Historical file은 root-bound no-follow, single-link regular, bounded stable
+  UTF-8/JSON read로 검증한다. Apply 직전 DB/review/manifest/source evidence를
+  재검증하고 public plan에는 절대 source path나 transcript 본문을 노출하지
+  않는다. Verifier는 prepared와 invalid/applied journal을 별도 검사한다.
+- Journal-owned same-directory temporary file을 fsync하고 atomic no-overwrite
+  link로 최종 이름을 publish한 뒤 temporary link를 제거한다. 따라서 temp
+  publish 후 cleanup 전 crash는 같은 inode pair로 replay할 수 있다. Expected
+  bytes가 아닌 temp는 recovery 소유권을 증명할 수 없으므로 삭제하지 않고
+  recovery-required로 보존한다. DB/records/historical root 중첩은 lock 전에
+  거부한다.
+- 두 transcript artifact의 media type에 recovery provenance parameter를
+  고정했다. Verifier는 exact kind/path/MIME pair가 있는데 journal이 사라지면
+  review detail/status가 이후 바뀌었더라도 missing-journal을 보고한다.
+- 전용 18개, Storage v2 전체 301개, 전체 Python 581개, `compileall`,
+  `git diff --check`가 통과했다. 별도 `TemporaryDirectory` canary는
+  `planned → applied → already_applied`, transcript artifact 2개,
+  prepared/applied event 각 1개, verifier issue 0을 확인했다. File copy 전
+  crash는 prepared와 filesystem/manifest recovery issue를 남긴 뒤 동일 plan
+  replay가 `recovered`, verifier issue 0으로 닫혔다. Plan 뒤 historical txt
+  변조는 journal/artifact 0건인 채 거부됐다.
+- 이 단계는 코드·문서와 격리된 임시 DB/root 테스트 범위다. 운영 DB/root,
+  worker/launchd, iCloud 원본에는 recovery/cutover/restart를 수행하지 않았고
+  Git stage/commit/push도 수행하지 않았다.
+
 ## 2026-07-27
 
 ### Storage v2 운영 보존 반영과 read-only 웹 패널 전환

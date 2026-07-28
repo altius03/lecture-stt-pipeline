@@ -56,6 +56,12 @@ from lecture_stt.storage_v2.title_materialization import (
     apply_title_materialization,
     plan_title_materialization,
 )
+from lecture_stt.storage_v2.transcript_recovery import (
+    DEFAULT_MAX_ARTIFACT_BYTES,
+    HistoricalTranscriptRecoveryRequiredError,
+    apply_historical_transcript_recovery,
+    plan_historical_transcript_recovery,
+)
 from lecture_stt.storage_v2.verifier import verify_library
 
 
@@ -714,6 +720,92 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         dest="emit_json",
     )
 
+    transcript_recovery_plan_parser = subparsers.add_parser(
+        "plan-historical-transcript-recovery",
+        help=(
+            "Plan recovery of one missing legacy transcript pair from an "
+            "explicit historical transcript root"
+        ),
+    )
+    transcript_recovery_plan_parser.add_argument(
+        "--v2-db",
+        default=str(DEFAULT_V2_DB),
+    )
+    transcript_recovery_plan_parser.add_argument(
+        "--records-root",
+        required=True,
+    )
+    transcript_recovery_plan_parser.add_argument(
+        "--historical-transcript-root",
+        required=True,
+    )
+    transcript_recovery_plan_parser.add_argument(
+        "--storage-key",
+        required=True,
+    )
+    transcript_recovery_plan_parser.add_argument(
+        "--max-artifact-bytes",
+        type=int,
+        default=DEFAULT_MAX_ARTIFACT_BYTES,
+    )
+    transcript_recovery_plan_parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="emit_json",
+    )
+
+    transcript_recovery_apply_parser = subparsers.add_parser(
+        "apply-historical-transcript-recovery",
+        help=(
+            "Apply or forward-recover one guarded historical transcript pair"
+        ),
+    )
+    transcript_recovery_apply_parser.add_argument(
+        "--v2-db",
+        default=str(DEFAULT_V2_DB),
+    )
+    transcript_recovery_apply_parser.add_argument(
+        "--records-root",
+        required=True,
+    )
+    transcript_recovery_apply_parser.add_argument(
+        "--historical-transcript-root",
+        required=True,
+    )
+    transcript_recovery_apply_parser.add_argument(
+        "--storage-key",
+        required=True,
+    )
+    transcript_recovery_apply_parser.add_argument(
+        "--max-artifact-bytes",
+        type=int,
+        default=DEFAULT_MAX_ARTIFACT_BYTES,
+    )
+    transcript_recovery_apply_parser.add_argument(
+        "--expected-count",
+        type=int,
+        required=True,
+    )
+    transcript_recovery_apply_parser.add_argument(
+        "--expected-plan-sha256",
+        type=_sha256_arg,
+        required=True,
+    )
+    transcript_recovery_apply_parser.add_argument(
+        "--enable-recovery",
+        action="store_true",
+        help="Required independent guard for historical transcript writes",
+    )
+    transcript_recovery_apply_parser.add_argument(
+        "--allow-write",
+        action="store_true",
+    )
+    transcript_recovery_apply_parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="emit_json",
+    )
+
     materialization_plan_parser = subparsers.add_parser(
         "plan-timetable-materialization",
         help=(
@@ -1343,6 +1435,59 @@ def run_apply_title_materialization(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_plan_historical_transcript_recovery(
+    args: argparse.Namespace,
+) -> int:
+    try:
+        payload = plan_historical_transcript_recovery(
+            args.v2_db,
+            args.records_root,
+            args.historical_transcript_root,
+            args.storage_key,
+            max_artifact_bytes=args.max_artifact_bytes,
+        )
+    except (ValueError, RuntimeError) as exc:
+        print(
+            f"Historical transcript recovery plan refused: {exc}",
+            file=sys.stderr,
+        )
+        return 2
+    _print_payload(payload, emit_json=args.emit_json)
+    return 0
+
+
+def run_apply_historical_transcript_recovery(
+    args: argparse.Namespace,
+) -> int:
+    try:
+        payload = apply_historical_transcript_recovery(
+            args.v2_db,
+            args.records_root,
+            args.historical_transcript_root,
+            args.storage_key,
+            expected_count=args.expected_count,
+            expected_plan_sha256=args.expected_plan_sha256,
+            recovery_enabled=args.enable_recovery,
+            allow_write=args.allow_write,
+            max_artifact_bytes=args.max_artifact_bytes,
+        )
+    except HistoricalTranscriptRecoveryRequiredError as exc:
+        print(
+            "Historical transcript recovery entered a recovery-required "
+            f"state: {exc}",
+            file=sys.stderr,
+        )
+        return 3
+    except (ValueError, RuntimeError) as exc:
+        print(
+            f"Historical transcript recovery refused: {exc}",
+            file=sys.stderr,
+        )
+        return 2
+    _print_payload(payload, emit_json=args.emit_json)
+    return 0
+
+
 def run_plan_timetable_materialization(args: argparse.Namespace) -> int:
     try:
         payload = plan_classification_materialization(
@@ -1434,6 +1579,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run_plan_title_materialization(args)
     if args.command == "apply-title-materialization":
         return run_apply_title_materialization(args)
+    if args.command == "plan-historical-transcript-recovery":
+        return run_plan_historical_transcript_recovery(args)
+    if args.command == "apply-historical-transcript-recovery":
+        return run_apply_historical_transcript_recovery(args)
     if args.command == "plan-timetable-materialization":
         return run_plan_timetable_materialization(args)
     if args.command == "apply-timetable-materialization":

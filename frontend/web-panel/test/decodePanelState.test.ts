@@ -175,4 +175,21 @@ describe("decodePanelState", () => {
 
     expect(state.counts.NEEDS_REVIEW).toBe(0)
   })
+
+  it("accepts controller as a runtime source", () => {
+    const payload = createStatePayload()
+    payload.runtime_state = {
+      ...payload.runtime_state,
+      source: "controller",
+      managed_running: false,
+      external_worker_pids: [],
+      label: "실행 중",
+      description: "controller 대기 중",
+    }
+
+    const state = decodePanelState(payload)
+
+    expect(state.runtime_state.source).toBe("controller")
+    expect(state.runtime_state.description).toBe("controller 대기 중")
+  })
 })

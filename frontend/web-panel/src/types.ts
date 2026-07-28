@@ -1,5 +1,5 @@
 export type RuntimeStatus = "running" | "paused" | "stopped"
-export type RuntimeSource = "web" | "external" | "none"
+export type RuntimeSource = "web" | "controller" | "external" | "none"
 export type NotificationSelection = "telegram" | "discord" | "both" | "disabled"
 export const PANEL_ACTIONS = [
   "start",

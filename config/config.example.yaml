@@ -5,6 +5,24 @@ app:
   stable_for_sec: 90
   stale_processing_hours: 6
   transcribe_max_retries: 2
+  # "python" keeps the legacy long-running polling worker as execution owner.
+  # Switch to "controller" only after provisioning the guarded Go binary.
+  execution_owner: python
+  # "launchd" controls controller_label. "console" lets the already-authorized
+  # local web console own an exact immutable binary when macOS denies iCloud
+  # access to a newly launched background service.
+  # controller_runtime: launchd
+  # controller_label: com.geonha.lecture-stt-controller
+  # controller_kill_switch: "~/Library/Application Support/lecture_stt/controller/controller.disabled"
+  # Binary and both parent dirs must be mode 0500 + Darwin user-immutable:
+  # <mode-0500-uchg-versions>/<controller_binary_sha256>/lecture-stt-controller
+  # controller_binary: "/absolute/path/to/versions/<sha256>/lecture-stt-controller"
+  # controller_binary_sha256: "<exact 64-char lowercase SHA-256>"
+  # controller_state_dir: "/absolute/path/to/owned-mode-0700-state"
+  # 0600 canonical JSON PID + process-birth fence, outside recovery state.
+  # controller_pid_path: "/absolute/path/outside-the-recovery-state/controller.pid"
+  # controller_stdout_path: "~/Library/Logs/lecture_stt/controller.out.jsonl"
+  # controller_stderr_path: "~/Library/Logs/lecture_stt/controller.err.log"
 
 paths:
   watch_folder: "${LECTURE_RECORDINGS_ROOT}/00_inbox"

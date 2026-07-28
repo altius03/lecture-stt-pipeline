@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import ctypes
+import hashlib
+import json
 import math
 import os
+import re
 import signal
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
@@ -55,6 +60,36 @@ import yaml
 
 
 NOTIFICATION_SELECTIONS = ("telegram", "discord", "both", "disabled")
+DEFAULT_CONTROLLER_LABEL = "com.geonha.lecture-stt-controller"
+CONTROLLER_LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+CONTROLLER_PID_SCHEMA = "lecture-stt/controller-pid@2"
+
+
+class _DarwinProcBsdInfo(ctypes.Structure):
+    _fields_ = [
+        ("pbi_flags", ctypes.c_uint32),
+        ("pbi_status", ctypes.c_uint32),
+        ("pbi_xstatus", ctypes.c_uint32),
+        ("pbi_pid", ctypes.c_uint32),
+        ("pbi_ppid", ctypes.c_uint32),
+        ("pbi_uid", ctypes.c_uint32),
+        ("pbi_gid", ctypes.c_uint32),
+        ("pbi_ruid", ctypes.c_uint32),
+        ("pbi_rgid", ctypes.c_uint32),
+        ("pbi_svuid", ctypes.c_uint32),
+        ("pbi_svgid", ctypes.c_uint32),
+        ("rfu_1", ctypes.c_uint32),
+        ("pbi_comm", ctypes.c_char * 16),
+        ("pbi_name", ctypes.c_char * 32),
+        ("pbi_nfiles", ctypes.c_uint32),
+        ("pbi_pgid", ctypes.c_uint32),
+        ("pbi_pjobc", ctypes.c_uint32),
+        ("e_tdev", ctypes.c_uint32),
+        ("e_tpgid", ctypes.c_uint32),
+        ("pbi_nice", ctypes.c_int32),
+        ("pbi_start_tvsec", ctypes.c_uint64),
+        ("pbi_start_tvusec", ctypes.c_uint64),
+    ]
 
 
 def _prometheus_escape_label(value: str) -> str:
@@ -82,6 +117,7 @@ class ControlState:
     IDLE_POLL_INTERVAL_SEC = 2
     LOG_READ_BYTES = 65536
     RECENT_JOB_LIMIT = 20
+    SUBPROCESS_TIMEOUT_SEC = 8.0
 
     def __init__(self, repo_root: Path):
         self.repo_root = repo_root
@@ -92,6 +128,7 @@ class ControlState:
             self.python_bin = Path(sys.executable)
 
         self.worker_proc: subprocess.Popen | None = None
+        self.controller_proc: subprocess.Popen | None = None
         self.lock = threading.Lock()
         self.notice = "대기중"
         self._shutdown_handler = None
@@ -283,7 +320,10 @@ class ControlState:
 
     def _notification_state(self, managed_running: bool, external_pids: list[int]) -> dict[str, object]:
         selection = self._notification_selection()
-        can_apply_now = bool(managed_running or external_pids)
+        can_apply_now = self._has_active_runtime(
+            managed_running=managed_running,
+            external_pids=external_pids,
+        )
         apply_label = (
             "변경하면 실행 중 워커에 즉시 적용됩니다."
             if can_apply_now
@@ -329,7 +369,7 @@ class ControlState:
         config_data["notification"] = notification_cfg
         self._save_config(config_data)
 
-        if self._is_managed_running() or self._find_worker_pids():
+        if self._has_active_runtime():
             self._notification_restart_required = True
             self.notice = "알림 채널이 저장되었습니다. 실행 중 워커에 즉시 적용합니다."
         else:
@@ -351,7 +391,7 @@ class ControlState:
             self._set_poll_boost()
             return
 
-        if not (self._is_managed_running() or self._find_worker_pids()):
+        if not self._has_active_runtime():
             self._notification_restart_required = False
             self.notice = "알림 채널이 저장되었습니다. 다음 시작부터 적용됩니다."
             self._set_poll_boost()
@@ -368,7 +408,7 @@ class ControlState:
             self._set_poll_boost()
             return
         self.start()
-        if self._is_managed_running():
+        if self._has_active_runtime():
             self._notification_restart_required = False
             self.notice = "알림 채널 변경을 즉시 적용했습니다."
 
@@ -1226,6 +1266,425 @@ class ControlState:
         cmd.extend(extra)
         return cmd
 
+    def _app_config(self) -> dict[str, Any]:
+        config_data = self.config_data if isinstance(getattr(self, "config_data", None), dict) else {}
+        app_cfg = config_data.get("app")
+        return app_cfg if isinstance(app_cfg, dict) else {}
+
+    def _execution_owner(self) -> str:
+        owner = str(self._app_config().get("execution_owner", "python") or "python").strip().lower()
+        return "controller" if owner == "controller" else "python"
+
+    def _is_controller_owner(self) -> bool:
+        return self._execution_owner() == "controller"
+
+    def _controller_label(self) -> str:
+        raw = str(self._app_config().get("controller_label") or DEFAULT_CONTROLLER_LABEL).strip()
+        if not raw or not CONTROLLER_LABEL_RE.fullmatch(raw):
+            raise RuntimeError("controller label 구성이 올바르지 않습니다.")
+        return raw
+
+    def _controller_runtime(self) -> str:
+        raw = str(self._app_config().get("controller_runtime", "launchd") or "launchd").strip().lower()
+        if raw not in {"launchd", "console"}:
+            raise RuntimeError("controller runtime 구성이 올바르지 않습니다.")
+        return raw
+
+    def _is_console_controller(self) -> bool:
+        return self._is_controller_owner() and self._controller_runtime() == "console"
+
+    @staticmethod
+    def _console_runtime_supported() -> bool:
+        return sys.platform == "darwin"
+
+    @staticmethod
+    def _configured_absolute_path(value: Any, *, label: str) -> Path:
+        if not isinstance(value, str) or not value.strip():
+            raise RuntimeError(f"{label} 구성이 필요합니다.")
+        expanded = Path(value).expanduser()
+        if not expanded.is_absolute():
+            raise RuntimeError(f"{label}는 절대경로여야 합니다.")
+        return Path(os.path.abspath(os.fspath(expanded)))
+
+    def _console_controller_settings(self) -> dict[str, Path]:
+        if not self._console_runtime_supported():
+            raise RuntimeError("controller console runtime은 Darwin에서만 지원합니다.")
+        app = self._app_config()
+        expected_sha256 = str(app.get("controller_binary_sha256") or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+            raise RuntimeError("controller binary SHA-256 구성이 올바르지 않습니다.")
+        binary = self._configured_absolute_path(
+            app.get("controller_binary"),
+            label="controller binary",
+        )
+        state_dir = self._configured_absolute_path(
+            app.get("controller_state_dir"),
+            label="controller state directory",
+        )
+        pid_path = self._configured_absolute_path(
+            app.get("controller_pid_path"),
+            label="controller PID path",
+        )
+        stdout_path = self._configured_absolute_path(
+            app.get(
+                "controller_stdout_path",
+                "~/Library/Logs/lecture_stt/controller.out.jsonl",
+            ),
+            label="controller stdout",
+        )
+        stderr_path = self._configured_absolute_path(
+            app.get(
+                "controller_stderr_path",
+                "~/Library/Logs/lecture_stt/controller.err.log",
+            ),
+            label="controller stderr",
+        )
+        self._validate_console_binary(binary, expected_sha256)
+        self._validate_console_state_dir(state_dir)
+        self._validate_console_state_dir(pid_path.parent)
+        if pid_path.parent == state_dir:
+            raise RuntimeError(
+                "controller PID path는 recovery state directory 밖에 있어야 합니다."
+            )
+        return {
+            "binary": binary,
+            "state_dir": state_dir,
+            "stdout_path": stdout_path,
+            "stderr_path": stderr_path,
+            "pid_path": pid_path,
+        }
+
+    @staticmethod
+    def _validate_console_binary(path: Path, expected_sha256: str) -> None:
+        if path.parent.name != expected_sha256:
+            raise RuntimeError("controller binary version directory가 올바르지 않습니다.")
+        for directory in (path.parent, path.parent.parent):
+            try:
+                directory_state = directory.lstat()
+            except OSError as exc:
+                raise RuntimeError(
+                    "controller binary version directory를 안전하게 확인할 수 없습니다."
+                ) from exc
+            if (
+                not stat.S_ISDIR(directory_state.st_mode)
+                or stat.S_ISLNK(directory_state.st_mode)
+                or directory_state.st_uid != os.geteuid()
+                or stat.S_IMODE(directory_state.st_mode) != 0o500
+                or not ControlState._console_binary_path_is_immutable(
+                    directory_state
+                )
+            ):
+                raise RuntimeError(
+                    "controller binary version directory 상태가 올바르지 않습니다."
+                )
+        try:
+            observed = path.lstat()
+        except OSError as exc:
+            raise RuntimeError("controller binary를 안전하게 확인할 수 없습니다.") from exc
+        if (
+            not stat.S_ISREG(observed.st_mode)
+            or stat.S_ISLNK(observed.st_mode)
+            or observed.st_nlink != 1
+            or observed.st_uid != os.geteuid()
+            or stat.S_IMODE(observed.st_mode) != 0o500
+            or not ControlState._console_binary_path_is_immutable(observed)
+        ):
+            raise RuntimeError("controller binary 상태가 올바르지 않습니다.")
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            fd = os.open(path, flags)
+        except OSError as exc:
+            raise RuntimeError("controller binary를 안전하게 열 수 없습니다.") from exc
+        try:
+            opened = os.fstat(fd)
+            if (
+                opened.st_dev != observed.st_dev
+                or opened.st_ino != observed.st_ino
+                or opened.st_nlink != 1
+                or opened.st_uid != os.geteuid()
+                or stat.S_IMODE(opened.st_mode) != 0o500
+                or not ControlState._console_binary_path_is_immutable(opened)
+            ):
+                raise RuntimeError("controller binary identity가 변경되었습니다.")
+            digest = hashlib.sha256()
+            while True:
+                chunk = os.read(fd, 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        finally:
+            os.close(fd)
+        if digest.hexdigest() != expected_sha256:
+            raise RuntimeError("controller binary SHA-256이 일치하지 않습니다.")
+
+    @staticmethod
+    def _console_binary_path_is_immutable(observed: os.stat_result) -> bool:
+        if sys.platform != "darwin":
+            return True
+        immutable_flag = getattr(stat, "UF_IMMUTABLE", 0)
+        return bool(immutable_flag and observed.st_flags & immutable_flag)
+
+    @staticmethod
+    def _validate_console_state_dir(path: Path) -> None:
+        try:
+            observed = path.lstat()
+        except OSError as exc:
+            raise RuntimeError("controller state directory를 안전하게 확인할 수 없습니다.") from exc
+        if (
+            not stat.S_ISDIR(observed.st_mode)
+            or stat.S_ISLNK(observed.st_mode)
+            or observed.st_uid != os.geteuid()
+            or stat.S_IMODE(observed.st_mode) != 0o700
+        ):
+            raise RuntimeError("controller state directory 상태가 올바르지 않습니다.")
+
+    def _console_controller_cmd(self, settings: dict[str, Path]) -> list[str]:
+        return [
+            str(settings["binary"]),
+            "--python-bin",
+            str(self.python_bin),
+            "--repo-root",
+            str(self.repo_root),
+            "--config",
+            str(self.config_path),
+            "--kill-switch",
+            str(self._controller_kill_switch_path()),
+            "--state-dir",
+            str(settings["state_dir"]),
+            "--cycle-interval-sec",
+            "10",
+            "--max-fresh-jobs",
+            "1",
+            "--enable-execution",
+            "--allow-write",
+        ]
+
+    @staticmethod
+    def _secure_pid_file_fd(path: Path, *, create: bool) -> int:
+        flags = os.O_RDWR
+        if create:
+            flags |= os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(path, flags, 0o600)
+        observed = os.fstat(fd)
+        if (
+            not stat.S_ISREG(observed.st_mode)
+            or observed.st_nlink != 1
+            or observed.st_uid != os.geteuid()
+            or stat.S_IMODE(observed.st_mode) != 0o600
+        ):
+            os.close(fd)
+            raise RuntimeError("controller PID file 상태가 올바르지 않습니다.")
+        return fd
+
+    def _read_console_controller_identity(
+        self,
+        settings: dict[str, Path],
+    ) -> tuple[int, tuple[int, int]] | None:
+        path = settings["pid_path"]
+        try:
+            fd = self._secure_pid_file_fd(path, create=False)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise RuntimeError("controller PID file을 안전하게 확인할 수 없습니다.") from exc
+        try:
+            payload = os.read(fd, 512)
+            if os.read(fd, 1):
+                raise RuntimeError("controller PID file 내용이 올바르지 않습니다.")
+        finally:
+            os.close(fd)
+        try:
+            decoded = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("controller PID file 내용이 올바르지 않습니다.") from exc
+        if (
+            type(decoded) is not dict
+            or set(decoded) != {"schema_version", "pid", "process_birth"}
+            or decoded.get("schema_version") != CONTROLLER_PID_SCHEMA
+            or type(decoded.get("pid")) is not int
+            or decoded["pid"] <= 1
+            or type(decoded.get("process_birth")) is not dict
+            or set(decoded["process_birth"]) != {"tv_sec", "tv_usec"}
+            or type(decoded["process_birth"].get("tv_sec")) is not int
+            or decoded["process_birth"]["tv_sec"] <= 0
+            or type(decoded["process_birth"].get("tv_usec")) is not int
+            or not 0 <= decoded["process_birth"]["tv_usec"] < 1_000_000
+        ):
+            raise RuntimeError("controller PID file 내용이 올바르지 않습니다.")
+        return decoded["pid"], (
+            decoded["process_birth"]["tv_sec"],
+            decoded["process_birth"]["tv_usec"],
+        )
+
+    @staticmethod
+    def _console_controller_process_identity(
+        pid: int,
+    ) -> tuple[int, int, int] | None:
+        if sys.platform != "darwin":
+            raise RuntimeError(
+                "controller process kernel identity는 Darwin에서만 지원합니다."
+            )
+        try:
+            libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        except OSError as exc:
+            raise RuntimeError(
+                "controller process kernel identity를 확인할 수 없습니다."
+            ) from exc
+        libproc.proc_pidinfo.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint64,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        libproc.proc_pidinfo.restype = ctypes.c_int
+        info = _DarwinProcBsdInfo()
+        result = libproc.proc_pidinfo(
+            pid,
+            3,  # PROC_PIDTBSDINFO
+            0,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+        )
+        if result != ctypes.sizeof(info) or info.pbi_pid != pid:
+            return None
+        if (
+            info.pbi_start_tvsec <= 0
+            or info.pbi_start_tvusec >= 1_000_000
+            or info.pbi_pgid <= 1
+        ):
+            return None
+        return (
+            int(info.pbi_start_tvsec),
+            int(info.pbi_start_tvusec),
+            int(info.pbi_pgid),
+        )
+
+    def _console_controller_process_matches(
+        self,
+        pid: int,
+        process_birth: tuple[int, int],
+        settings: dict[str, Path],
+    ) -> bool:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError as exc:
+            raise RuntimeError("controller process identity를 확인할 수 없습니다.") from exc
+        kernel_identity = self._console_controller_process_identity(pid)
+        if (
+            kernel_identity is None
+            or kernel_identity[:2] != process_birth
+            or kernel_identity[2] != pid
+        ):
+            return False
+        result = self._run_control_cmd(["/bin/ps", "-p", str(pid), "-o", "comm="])
+        if result.returncode != 0:
+            return False
+        if (result.stdout or "").strip() != str(settings["binary"]):
+            return False
+        command_result = self._run_control_cmd(
+            ["/bin/ps", "-ww", "-p", str(pid), "-o", "command="]
+        )
+        if command_result.returncode != 0:
+            return False
+        return (command_result.stdout or "").strip() == " ".join(
+            self._console_controller_cmd(settings)
+        )
+
+    def _console_controller_pid(self, settings: dict[str, Path] | None = None) -> int | None:
+        resolved = self._console_controller_settings() if settings is None else settings
+        identity = self._read_console_controller_identity(resolved)
+        if identity is None:
+            return None
+        pid, process_birth = identity
+        return (
+            pid
+            if self._console_controller_process_matches(
+                pid,
+                process_birth,
+                resolved,
+            )
+            else None
+        )
+
+    def _remove_stale_console_pid_file(self, settings: dict[str, Path]) -> None:
+        identity = self._read_console_controller_identity(settings)
+        if identity is None:
+            return
+        pid, process_birth = identity
+        if self._console_controller_process_matches(
+            pid,
+            process_birth,
+            settings,
+        ):
+            raise RuntimeError("controller가 이미 실행 중입니다.")
+        try:
+            settings["pid_path"].unlink()
+            self._fsync_directory(settings["pid_path"].parent)
+        except OSError as exc:
+            raise RuntimeError("stale controller PID file 정리에 실패했습니다.") from exc
+
+    @staticmethod
+    def _open_console_log(path: Path) -> int:
+        try:
+            parent = path.parent.lstat()
+        except OSError as exc:
+            raise RuntimeError("controller log directory를 확인할 수 없습니다.") from exc
+        if (
+            not stat.S_ISDIR(parent.st_mode)
+            or stat.S_ISLNK(parent.st_mode)
+            or parent.st_uid != os.geteuid()
+            or stat.S_IMODE(parent.st_mode) & 0o022
+        ):
+            raise RuntimeError("controller log directory 상태가 올바르지 않습니다.")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            fd = os.open(path, flags, 0o600)
+        except OSError as exc:
+            raise RuntimeError("controller log file을 열 수 없습니다.") from exc
+        observed = os.fstat(fd)
+        if (
+            not stat.S_ISREG(observed.st_mode)
+            or observed.st_nlink != 1
+            or observed.st_uid != os.geteuid()
+        ):
+            os.close(fd)
+            raise RuntimeError("controller log file 상태가 올바르지 않습니다.")
+        os.fchmod(fd, 0o600)
+        return fd
+
+    def _controller_service_target(self) -> str:
+        return f"gui/{os.getuid()}/{self._controller_label()}"
+
+    def _controller_kill_switch_path(self) -> Path:
+        configured = self._app_config().get("controller_kill_switch")
+        if configured is None or not str(configured).strip():
+            raise RuntimeError("controller kill-switch가 설정되지 않았습니다.")
+        return Path(os.path.abspath(os.fspath(Path(str(configured)).expanduser())))
+
+    def _run_control_cmd(
+        self,
+        cmd: list[str],
+        *,
+        timeout: float | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=self.SUBPROCESS_TIMEOUT_SEC if timeout is None else timeout,
+            cwd=str(self.repo_root),
+        )
+
     def _run_main_cmd(self, *extra: str) -> str:
         cmd = self._worker_cmd(*extra, "--config", str(self.config_path))
         result = subprocess.run(
@@ -1245,11 +1704,8 @@ class ControlState:
     def _find_worker_pids(self) -> list[int]:
         # 관리 상태 확인을 위해 STT 워커 모듈 PID를 찾는다.
         try:
-            result = subprocess.run(
+            result = self._run_control_cmd(
                 ["pgrep", "-f", self.worker_module],
-                capture_output=True,
-                text=True,
-                check=False,
             )
         except Exception:
             return []
@@ -1272,6 +1728,324 @@ class ControlState:
 
     def _is_paused(self) -> bool:
         return self.pause_flag.exists()
+
+    def _controller_kill_switch_state(self) -> str:
+        path = self._controller_kill_switch_path()
+        try:
+            observed = path.lstat()
+        except FileNotFoundError:
+            return "absent"
+        except OSError as exc:
+            raise RuntimeError("controller kill-switch marker를 안전하게 확인할 수 없습니다.") from exc
+        if (
+            not stat.S_ISREG(observed.st_mode)
+            or stat.S_ISLNK(observed.st_mode)
+            or observed.st_nlink != 1
+            or observed.st_uid != os.geteuid()
+            or stat.S_IMODE(observed.st_mode) != 0o600
+        ):
+            return "invalid"
+        return "active"
+
+    def _controller_kill_switch_active(self) -> bool:
+        return self._controller_kill_switch_state() == "active"
+
+    def _fsync_directory(self, directory: Path) -> None:
+        flags = os.O_RDONLY
+        if hasattr(os, "O_DIRECTORY"):
+            flags |= os.O_DIRECTORY
+        fd = os.open(directory, flags)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def _remove_controller_kill_switch_marker(self) -> None:
+        path = self._controller_kill_switch_path()
+        state = self._controller_kill_switch_state()
+        if state == "absent":
+            return
+        if state != "active":
+            raise RuntimeError("controller kill-switch marker 상태가 올바르지 않습니다.")
+        try:
+            path.unlink()
+            self._fsync_directory(path.parent)
+        except OSError as exc:
+            raise RuntimeError("controller kill-switch marker 제거에 실패했습니다.") from exc
+
+    def _write_controller_kill_switch_marker(self) -> None:
+        path = self._controller_kill_switch_path()
+        try:
+            parent = path.parent.lstat()
+        except OSError as exc:
+            raise RuntimeError(
+                "controller kill-switch 디렉터리를 안전하게 확인할 수 없습니다."
+            ) from exc
+        if (
+            not stat.S_ISDIR(parent.st_mode)
+            or stat.S_ISLNK(parent.st_mode)
+            or parent.st_uid != os.geteuid()
+            or stat.S_IMODE(parent.st_mode) & 0o022
+        ):
+            raise RuntimeError(
+                "controller kill-switch 디렉터리 상태가 올바르지 않습니다."
+            )
+        state = self._controller_kill_switch_state()
+        if state == "invalid":
+            raise RuntimeError("controller kill-switch marker 상태가 올바르지 않습니다.")
+        if state == "active":
+            return
+        try:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            fd = os.open(path, flags, 0o600)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            observed = path.lstat()
+            if not stat.S_ISREG(observed.st_mode) or stat.S_ISLNK(observed.st_mode) or observed.st_nlink != 1:
+                raise RuntimeError("controller kill-switch marker 상태가 올바르지 않습니다.")
+            self._fsync_directory(path.parent)
+        except FileExistsError:
+            if self._controller_kill_switch_state() != "active":
+                raise RuntimeError(
+                    "controller kill-switch marker 상태가 올바르지 않습니다."
+                )
+        except RuntimeError:
+            raise
+        except OSError as exc:
+            raise RuntimeError("controller kill-switch marker 생성에 실패했습니다.") from exc
+
+    def _controller_service_loaded(self) -> bool:
+        try:
+            result = self._run_control_cmd(["launchctl", "print", self._controller_service_target()])
+        except Exception:
+            return False
+        return result.returncode == 0
+
+    def _run_launchctl(self, *args: str) -> None:
+        result = self._run_control_cmd(["launchctl", *args])
+        if result.returncode != 0:
+            raise RuntimeError("controller 서비스 제어 명령이 실패했습니다.")
+
+    def _cleanup_console_pid_file(self, settings: dict[str, Path]) -> None:
+        path = settings["pid_path"]
+        try:
+            if path.exists():
+                fd = self._secure_pid_file_fd(path, create=False)
+                os.close(fd)
+                path.unlink()
+                self._fsync_directory(settings["pid_path"].parent)
+        except OSError as exc:
+            raise RuntimeError("controller PID file 정리에 실패했습니다.") from exc
+
+    def _start_console_controller(self) -> None:
+        settings = self._console_controller_settings()
+        existing = self._console_controller_pid(settings)
+        if existing is not None:
+            self._remove_controller_kill_switch_marker()
+            self._set_paused(False)
+            self.notice = "controller 실행을 재개했습니다."
+            return
+
+        self._remove_stale_console_pid_file(settings)
+        self._write_controller_kill_switch_marker()
+        pid_fd: int | None = None
+        stdout_fd: int | None = None
+        stderr_fd: int | None = None
+        proc: subprocess.Popen[bytes] | None = None
+        try:
+            pid_fd = self._secure_pid_file_fd(settings["pid_path"], create=True)
+            stdout_fd = self._open_console_log(settings["stdout_path"])
+            stderr_fd = self._open_console_log(settings["stderr_path"])
+            env = package_env()
+            env["PYTHONDONTWRITEBYTECODE"] = "1"
+            self._validate_console_binary(
+                settings["binary"],
+                settings["binary"].parent.name,
+            )
+            proc = subprocess.Popen(
+                self._console_controller_cmd(settings),
+                cwd=str(self.repo_root),
+                env=env,
+                stdout=stdout_fd,
+                stderr=stderr_fd,
+                start_new_session=True,
+            )
+            kernel_identity = self._console_controller_process_identity(proc.pid)
+            if kernel_identity is None or kernel_identity[2] != proc.pid:
+                raise RuntimeError("controller process 시작 identity를 확인할 수 없습니다.")
+            process_birth = kernel_identity[:2]
+            pid_payload = (
+                json.dumps(
+                    {
+                        "schema_version": CONTROLLER_PID_SCHEMA,
+                        "pid": proc.pid,
+                        "process_birth": {
+                            "tv_sec": process_birth[0],
+                            "tv_usec": process_birth[1],
+                        },
+                    },
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                + "\n"
+            ).encode("ascii")
+            if os.write(pid_fd, pid_payload) != len(pid_payload):
+                raise RuntimeError("controller PID file 기록이 완료되지 않았습니다.")
+            os.fsync(pid_fd)
+            self._fsync_directory(settings["pid_path"].parent)
+            time.sleep(0.05)
+            if proc.poll() is not None:
+                raise RuntimeError(
+                    f"controller가 즉시 종료되었습니다. (코드={proc.returncode})"
+                )
+            if not self._console_controller_process_matches(
+                proc.pid,
+                process_birth,
+                settings,
+            ):
+                raise RuntimeError("controller process 실행 identity가 올바르지 않습니다.")
+            self._remove_controller_kill_switch_marker()
+            self._set_paused(False)
+            self.controller_proc = proc
+            self.notice = "controller 실행을 시작했습니다."
+        except Exception:
+            if proc is not None and proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                    proc.wait(timeout=2)
+                except Exception:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except Exception:
+                        pass
+            try:
+                self._write_controller_kill_switch_marker()
+            except Exception:
+                pass
+            try:
+                self._cleanup_console_pid_file(settings)
+            except Exception:
+                pass
+            raise
+        finally:
+            for fd in (pid_fd, stdout_fd, stderr_fd):
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+
+    def _console_process_stopped(
+        self,
+        pid: int,
+        process_birth: tuple[int, int],
+        settings: dict[str, Path],
+    ) -> bool:
+        try:
+            reaped, _ = os.waitpid(pid, os.WNOHANG)
+            if reaped == pid:
+                return True
+        except ChildProcessError:
+            pass
+        return not self._console_controller_process_matches(
+            pid,
+            process_birth,
+            settings,
+        )
+
+    def _stop_console_controller(self) -> None:
+        settings = self._console_controller_settings()
+        self._write_controller_kill_switch_marker()
+        identity = self._read_console_controller_identity(settings)
+        if identity is None:
+            self.notice = "controller kill-switch가 적용되었습니다."
+            return
+        pid, process_birth = identity
+        if not self._console_controller_process_matches(
+            pid,
+            process_birth,
+            settings,
+        ):
+            self._cleanup_console_pid_file(settings)
+            self.notice = "controller kill-switch가 적용되었습니다."
+            return
+        try:
+            if os.getpgid(pid) != pid:
+                raise RuntimeError("controller process group 상태가 올바르지 않습니다.")
+            os.killpg(pid, signal.SIGTERM)
+            deadline = time.monotonic() + 8.0
+            while time.monotonic() < deadline:
+                if self._console_process_stopped(
+                    pid,
+                    process_birth,
+                    settings,
+                ):
+                    break
+                time.sleep(0.1)
+            else:
+                if not self._console_controller_process_matches(
+                    pid,
+                    process_birth,
+                    settings,
+                ):
+                    self._cleanup_console_pid_file(settings)
+                    self.notice = "controller 중지 요청을 완료했습니다."
+                    return
+                os.killpg(pid, signal.SIGKILL)
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline:
+                    if self._console_process_stopped(
+                        pid,
+                        process_birth,
+                        settings,
+                    ):
+                        break
+                    time.sleep(0.1)
+                else:
+                    raise RuntimeError("controller process group을 종료하지 못했습니다.")
+            self._cleanup_console_pid_file(settings)
+            if self.controller_proc is not None and self.controller_proc.pid == pid:
+                try:
+                    self.controller_proc.wait(timeout=0)
+                except Exception:
+                    pass
+                self.controller_proc = None
+            self.notice = "controller 중지 요청을 완료했습니다."
+        except ProcessLookupError:
+            self._cleanup_console_pid_file(settings)
+            self.notice = "controller kill-switch가 적용되었습니다."
+
+    def _controller_runtime_active(self, external_pids: list[int] | None = None) -> bool:
+        if not self._is_controller_owner():
+            return False
+        if self._is_console_controller():
+            return (
+                self._console_controller_pid() is not None
+                and not self._controller_kill_switch_active()
+            )
+        pids = self._find_worker_pids() if external_pids is None else external_pids
+        if pids:
+            return True
+        if not self._controller_service_loaded():
+            return False
+        return not self._controller_kill_switch_active()
+
+    def _has_active_runtime(
+        self,
+        *,
+        managed_running: bool | None = None,
+        external_pids: list[int] | None = None,
+    ) -> bool:
+        running = self._is_managed_running() if managed_running is None else managed_running
+        pids = self._find_worker_pids() if external_pids is None else external_pids
+        if self._is_controller_owner():
+            return running or self._controller_runtime_active(pids)
+        return running or bool(pids)
 
     def _set_poll_boost(self, seconds: float = 6.0) -> None:
         # 사용자 동작 직후에는 빠르게 반영되도록 폴링을 잠깐 촉진한다.
@@ -1316,6 +2090,26 @@ class ControlState:
 
     def start(self) -> None:
         with self.lock:
+            if self._is_controller_owner():
+                try:
+                    if self._is_console_controller():
+                        self._start_console_controller()
+                        self._notification_restart_required = False
+                        self._set_poll_boost()
+                        return
+                    if not self._controller_service_loaded():
+                        self.notice = "controller 서비스가 load되지 않아 시작할 수 없습니다."
+                        return
+                    self._remove_controller_kill_switch_marker()
+                    self._set_paused(False)
+                    self._run_launchctl("kickstart", "-k", self._controller_service_target())
+                    self._notification_restart_required = False
+                    self.notice = "controller 실행을 재개했습니다."
+                    self._set_poll_boost()
+                except Exception as exc:
+                    self.notice = f"시작 실패: {exc}"
+                return
+
             if self._is_managed_running():
                 if self._is_paused():
                     try:
@@ -1391,6 +2185,21 @@ class ControlState:
 
     def stop(self) -> None:
         with self.lock:
+            if self._is_controller_owner():
+                try:
+                    if self._is_console_controller():
+                        self._stop_console_controller()
+                        self._set_poll_boost()
+                        return
+                    self._write_controller_kill_switch_marker()
+                    self._run_launchctl("kill", "SIGTERM", self._controller_service_target())
+                    self.notice = "controller 중지 요청을 보냈습니다."
+                    self._set_poll_boost()
+                except Exception as exc:
+                    self.notice = f"중지 실패: {exc}"
+                    self._set_poll_boost()
+                return
+
             stopped: list[int] = []
             errors: list[str] = []
             pause_clear_failed: str | None = None
@@ -1703,17 +2512,25 @@ class ControlState:
         managed_running: bool,
         external_pids: list[int],
         paused: bool,
+        controller_ready: bool = False,
     ) -> str:
         if paused:
             return "paused"
-        if managed_running or external_pids:
+        if managed_running or external_pids or controller_ready:
             return "running"
         return "stopped"
 
     @staticmethod
-    def _runtime_source_key(*, managed_running: bool, external_pids: list[int]) -> str:
+    def _runtime_source_key(
+        *,
+        managed_running: bool,
+        external_pids: list[int],
+        controller_ready: bool = False,
+    ) -> str:
         if managed_running:
             return "web"
+        if controller_ready:
+            return "controller"
         if external_pids:
             return "external"
         return "none"
@@ -1754,19 +2571,43 @@ class ControlState:
             managed_running = self._is_managed_running()
             pids = self._find_worker_pids()
             paused = self._is_paused()
+            controller_ready = False
+            controller_source = False
+            controller_idle_kill_switch = False
+            if self._is_controller_owner():
+                if self._is_console_controller():
+                    controller_loaded = True
+                    controller_process_active = self._console_controller_pid() is not None
+                else:
+                    controller_loaded = self._controller_service_loaded()
+                    controller_process_active = controller_loaded
+                kill_switch_active = self._controller_kill_switch_active()
+                controller_ready = controller_process_active and not kill_switch_active
+                controller_source = controller_loaded
+                controller_idle_kill_switch = controller_loaded and kill_switch_active and not pids
             runtime_status = self._runtime_status_key(
                 managed_running=managed_running,
                 external_pids=pids,
                 paused=paused,
+                controller_ready=controller_ready,
             )
             runtime_source = self._runtime_source_key(
                 managed_running=managed_running,
                 external_pids=pids,
+                controller_ready=controller_source,
             )
 
-            if managed_running or pids:
+            if controller_idle_kill_switch:
+                runtime = "중지"
+                runtime_desc = "controller kill-switch가 적용되어 대기 중입니다."
+            elif managed_running or pids or controller_ready:
                 runtime = "일시정지" if paused else "실행중"
-                runtime_desc = "일시정지 상태(큐/파일 대기 중)" if paused else "큐/파일 대기 중"
+                if controller_source and not managed_running and not pids:
+                    runtime_desc = "일시정지 상태(controller 대기 중)" if paused else "controller 대기 중"
+                elif controller_source and pids:
+                    runtime_desc = "일시정지 상태(controller apply worker 실행 중)" if paused else "controller apply worker 실행 중"
+                else:
+                    runtime_desc = "일시정지 상태(큐/파일 대기 중)" if paused else "큐/파일 대기 중"
             elif paused:
                 runtime = "일시정지"
                 runtime_desc = "일시정지 상태(워커 미실행)"
@@ -1774,11 +2615,15 @@ class ControlState:
                 runtime = "중지"
                 runtime_desc = "워커가 실행 중이 아닙니다."
 
-            if not managed_running and not pids and paused:
+            if not managed_running and not pids and not controller_ready and paused:
                 runtime = "일시정지"
                 runtime_desc = "일시정지 플래그가 적용되어 있습니다."
 
-            origin = "웹에서 실행 중" if managed_running else ("외부 실행 중" if pids else "-")
+            origin = (
+                "웹에서 실행 중"
+                if managed_running
+                else ("controller에서 실행 중" if controller_source else ("외부 실행 중" if pids else "-"))
+            )
             jobs = self._recent_jobs()
             processing = self._processing_jobs()
             jobs_v2 = [self._serialize_job_row(row) for row in jobs]

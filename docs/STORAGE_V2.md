@@ -853,3 +853,47 @@ Phase 0 전체 125건을 current root만 대상으로 다시 계획한 read-only
 - 기존 worker cut-over
 - 운영 physical layout 전환
 - content-title canonical materialization의 HTTP endpoint/UI와 다중 materialization chain
+## Historical transcript recovery
+
+- 과거 transcript 보관 root는 운영 records root와 별도로 명시한다. Plan은
+  `<canonical_base>.txt`와 `<canonical_base>.json`만 direct child로 열고,
+  symlink/hardlink/non-regular file을 거부한다. 각 파일은 bounded stable read,
+  SHA-256/bytes, UTF-8, JSON 구조 검증을 통과해야 한다. 절대 source path와
+  transcript 본문은 public plan이나 manifest에 저장하지 않는다.
+- `plan-historical-transcript-recovery`는 read-only이며 `storage_key` 한 건,
+  expected count 1, exact private plan SHA-256을 반환한다. Apply는
+  `--enable-recovery`, `--allow-write`, `--expected-count 1`,
+  `--expected-plan-sha256`가 모두 있어야 한다.
+- 대상 recording은 current `needs_review` legacy-import job, succeeded selected
+  legacy engine, open `legacy_import_review`, `transcript_pair_incomplete`와 양쪽
+  missing issue, 현재 transcript artifact 0건을 모두 만족해야 한다. Apply
+  직전 recording/title/context/job/engine/review/legacy map, manifest, historical
+  bytes를 다시 비교한다.
+- Prepare transaction은 selected engine 소유의 `transcript_raw_text`와
+  `transcript_segments_json` revision 1을 insert하고 동일 transaction의
+  `job_events`에 closed plan을 기록한다. 파일은 기존 job directory의
+  journal-owned temporary file을 먼저 fsync한 뒤 atomic no-overwrite link로
+  `transcript.txt`, `transcript.segments.json`을 publish하고 temporary link를
+  제거해 최종 파일을 single-link로 고정한다. Publish 직후 cleanup 전 crash는
+  같은 inode와 expected bytes를 확인해 복구한다. Expected bytes와 다른 temp는
+  recovery 소유를 증명할 수 없으므로 자동 삭제하지 않고 보존·거부한다.
+  Manifest는 해당 artifact index와 current job
+  `artifact_paths`만 추가해 atomic replace/fsync하며 source/title/context/job
+  status/review lifecycle과 `storage_key`는 바꾸지 않는다.
+- `prepared` journal은 verifier에서 recovery-required issue다. 같은 source
+  bytes, DB evidence, plan digest, 이전 또는 목표 manifest digest가 모두
+  일치할 때만 replay한다. `applied` journal은 목표 manifest와 두 artifact가
+  정확히 일치해야 하며 동일 apply는 `already_applied`로 끝난다. Source,
+  review, title/context/job, destination file, manifest 또는 journal 변조는
+  fail-closed한다.
+- 복구 artifact의 media type에는
+  `provenance=historical-transcript-recovery` parameter를 넣어 journal과
+  독립적인 durable provenance를 남긴다. Verifier는 이 exact pair/path marker가
+  있는데 prepared/applied event가 모두 사라진 경우 review detail이 이후
+  변경됐더라도 missing-journal issue를 낸다.
+- 이 경로는 missing transcript review를 자동 resolve하지 않는다. 원래 review
+  detail은 import 당시의 보존 증거이므로 그대로 남고, 이후 사람이 별도 검토
+  흐름에서 판단한다. 웹 endpoint/UI, upload, 원본 rename/move는 제공하지 않는다.
+- V2 DB, records root, historical transcript root는 서로 겹치지 않아야 한다.
+  Root 중첩은 lock 전에 거부해 자기 자신에 대한 중복 flock과 source/target
+  alias를 막는다.

@@ -63,6 +63,62 @@ jobs:
       - name: Compile operator sources
         run: python -m compileall -q scripts/hermes_postprocess scripts/lecture_stt_postprocess_operator.py tests/test_hermes_postprocess_hardening.py
 
+  controller-readiness:
+    name: Controller readiness
+    runs-on: macos-latest
+    timeout-minutes: 20
+    env:
+      PYTHONPATH: src
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: controller/go.mod
+          cache-dependency-path: controller/go.sum
+
+      - name: Prepare isolated project Python
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install -q -r requirements.txt
+
+      - name: Run controller Python contracts
+        run: |
+          .venv/bin/python -m unittest \
+            tests.test_controller_topology \
+            tests.test_controller_bundle \
+            tests.test_controller_activation \
+            tests.test_controller_readiness \
+            tests.test_controller_evidence \
+            tests.test_shadow_probe \
+            tests.test_single_job_contract \
+            tests.test_retry_job_contract \
+            tests.test_controller_gate \
+            -v
+
+      - name: Run Go controller tests with race detector
+        working-directory: controller
+        run: go test -race ./...
+
+      - name: Vet Go controller
+        working-directory: controller
+        run: go vet ./...
+
+      - name: Run target-Darwin 20x100 acceptance gate
+        working-directory: controller
+        env:
+          LECTURE_STT_RUN_DARWIN_ACCEPTANCE: "1"
+        run: go test ./internal/shadow -run TestRunDarwinAcceptance20ConsecutiveRuns -count=1 -v
+
   web-panel:
     name: Web panel tests
     runs-on: ubuntu-latest

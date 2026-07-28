@@ -1375,6 +1375,18 @@ def verify_library(
             latest_title_materializations,
         ) = title_materialization_integrity_issues(conn, root_lock_fd)
         issues.extend(title_materialization_issues)
+        # Imported lazily because transcript_recovery runs verify_library after
+        # its guarded forward-recovery finalization.
+        from lecture_stt.storage_v2.transcript_recovery import (
+            historical_transcript_recovery_integrity_issues,
+        )
+
+        issues.extend(
+            historical_transcript_recovery_integrity_issues(
+                conn,
+                root_lock_fd,
+            )
+        )
         recordings = conn.execute(
             """
             SELECT

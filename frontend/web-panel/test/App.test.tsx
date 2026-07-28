@@ -505,4 +505,66 @@ describe("App", () => {
       expect(screen.getByText("TimetablePanel")).toBeTruthy()
     })
   })
+
+  it("renders an accessible command rail with valid route links and no decorative ordinal labels", () => {
+    setHash("home")
+    render(<App />)
+
+    const commandRail = screen.getByRole("navigation", { name: "운영 워크벤치" })
+    const links = within(commandRail).getAllByRole("link")
+    expect(links).toHaveLength(6)
+
+    const home = within(commandRail).getByRole("link", { name: /홈\./ })
+    const processing = within(commandRail).getByRole("link", { name: /처리 현황\./ })
+    const library = within(commandRail).getByRole("link", { name: /녹음 보관함\./ })
+    const review = within(commandRail).getByRole("link", { name: /검토 큐\./ })
+    const timetable = within(commandRail).getByRole("link", { name: /시간표\./ })
+    const settings = within(commandRail).getByRole("link", { name: /설정\./ })
+
+    expect(home.getAttribute("href")).toBe("#")
+    expect(processing.getAttribute("href")).toBe("#processing")
+    expect(library.getAttribute("href")).toBe("#library")
+    expect(review.getAttribute("href")).toBe("#review")
+    expect(timetable.getAttribute("href")).toBe("#timetable")
+    expect(settings.getAttribute("href")).toBe("#settings")
+
+    expect(home.getAttribute("aria-current")).toBe("page")
+    expect(processing.getAttribute("aria-current")).toBeNull()
+    expect(screen.getByRole("navigation", { name: "운영 워크벤치" }).getAttribute("aria-label")).toBe("운영 화면")
+
+    for (const link of links) {
+      expect(link.textContent).not.toMatch(/\b0[1-6]\b/)
+    }
+  })
+
+  it("updates active nav semantics and screen header context after hash navigation", async () => {
+    render(<App />)
+
+    expect(screen.getByRole("heading", { name: "전사 운영과 품질을 한눈에" })).toBeTruthy()
+
+    const commandRail = screen.getByRole("navigation", { name: "운영 워크벤치" })
+    expect(within(commandRail).getByRole("link", { name: /홈\./ }).getAttribute("aria-current")).toBe("page")
+
+    act(() => {
+      window.location.hash = "#processing"
+      window.dispatchEvent(new HashChangeEvent("hashchange"))
+    })
+
+    await waitFor(() => {
+      expect(screen.getByRole("heading", { name: "워커 진행과 운영 기록" })).toBeTruthy()
+      expect(
+        within(commandRail).getByRole("link", { name: /처리 현황\./ }).getAttribute("aria-current"),
+      ).toBe("page")
+      expect(within(commandRail).getByRole("link", { name: /홈\./ }).getAttribute("aria-current")).toBeNull()
+    })
+  })
+
+  it("does not introduce upload buttons or file inputs in App-level controls", () => {
+    setHash("review")
+    render(<App />)
+
+    expect(screen.queryByRole("button", { name: /upload|업로드/i })).toBeNull()
+    expect(screen.queryByRole("link", { name: /업로드/i })).toBeNull()
+    expect(document.querySelector('input[type="file"]')).toBeNull()
+  })
 })

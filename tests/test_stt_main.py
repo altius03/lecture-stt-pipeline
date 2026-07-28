@@ -6,7 +6,7 @@ import logging
 import os
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -153,6 +153,30 @@ class _FailingWorker(_FakeWorker):
         pass
 
 
+class _BadQualityReport:
+    health = "bad"
+    summary = "품질 위험"
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "quality_score": 10,
+            "health": "bad",
+            "summary": "품질 위험",
+            "total_segments": 1,
+            "empty_segments": 0,
+            "dot_noise_segments": 0,
+            "short_segments": 1,
+            "rep_mass": 0.0,
+            "avg_segment_length": 1.0,
+            "empty_ratio": 0.0,
+            "dot_noise_ratio": 0.0,
+            "short_segment_ratio": 1.0,
+            "nonempty_segments": 1,
+            "nonspace_chars": 1,
+            "last_segment_end_sec": 1.0,
+        }
+
+
 class SttPipelineBehaviorTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmpdir = tempfile.TemporaryDirectory()
@@ -220,6 +244,13 @@ class SttPipelineBehaviorTests(unittest.TestCase):
         self.pipeline.conn.close()
         self.tmpdir.cleanup()
 
+    def _write_stable_source(self, name: str, payload: bytes) -> Path:
+        path = self.watch_dir / name
+        path.write_bytes(payload)
+        aged = path.stat().st_mtime - 10
+        os.utime(path, (aged, aged))
+        return path
+
     def _quality_metadata(self, canonical_base: str, txt_path: Path, json_path: Path) -> dict:
         return {
             "canonical_base": canonical_base,
@@ -243,6 +274,9 @@ class SttPipelineBehaviorTests(unittest.TestCase):
             },
         }
 
+    def _controller_kill_switch(self) -> Path:
+        return self.root / "controller.stop"
+
     def test_process_job_uses_local_staging_before_canonical_move(self) -> None:
         source_path = self.watch_dir / "sample.m4a"
         source_path.write_bytes(b"fake-audio")
@@ -263,9 +297,418 @@ class SttPipelineBehaviorTests(unittest.TestCase):
         self.assertEqual(rows[0]["status"], stt_main.STATUS_DONE)
         self.assertEqual(rows[0]["current_step"], "전체 완료")
 
+    def test_single_job_plan_executes_exactly_one_source_with_explicit_result(self) -> None:
+        source_path = self._write_stable_source("manifest-job.m4a", b"manifest-audio")
+        plan = stt_main.build_single_job_plan(self.pipeline.config, source_path.name)
+
+        result = self.pipeline.process_single_job_plan(
+            plan,
+            kill_switch_path=self._controller_kill_switch(),
+        )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["plan_sha256"], plan["plan_sha256"])
+        self.assertIsInstance(result["job_id"], int)
+        self.assertFalse(source_path.exists())
+        self.assertTrue((self.audio_dir / "manifest-job.m4a").exists())
+        self.assertEqual(
+            self.pipeline.conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0],
+            1,
+        )
+
+    def test_single_job_plan_rejects_changed_source_before_any_job_write(self) -> None:
+        source_path = self._write_stable_source("stale-manifest-job.m4a", b"planned-audio")
+        plan = stt_main.build_single_job_plan(self.pipeline.config, source_path.name)
+        source_path.write_bytes(b"changed-audio")
+        aged = source_path.stat().st_mtime - 10
+        os.utime(source_path, (aged, aged))
+
+        with self.assertRaisesRegex(
+            stt_main.SingleJobContractError,
+            "source changed after planning",
+        ):
+            self.pipeline.process_single_job_plan(
+                plan,
+                kill_switch_path=self._controller_kill_switch(),
+            )
+
+        self.assertTrue(source_path.exists())
+        self.assertEqual(
+            self.pipeline.conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0],
+            0,
+        )
+
+    def test_single_job_plan_replay_is_rejected_after_source_is_claimed(self) -> None:
+        source_path = self._write_stable_source("one-shot-manifest-job.m4a", b"one-shot-audio")
+        plan = stt_main.build_single_job_plan(self.pipeline.config, source_path.name)
+        first_result = self.pipeline.process_single_job_plan(
+            plan,
+            kill_switch_path=self._controller_kill_switch(),
+        )
+        self.assertEqual(first_result["status"], "completed")
+
+        with self.assertRaisesRegex(
+            stt_main.SingleJobContractError,
+            "not safely openable",
+        ):
+            self.pipeline.process_single_job_plan(
+                plan,
+                kill_switch_path=self._controller_kill_switch(),
+            )
+
+        self.assertEqual(
+            self.pipeline.conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0],
+            1,
+        )
+
+    def test_single_job_plan_returns_retry_pending_on_transient_error(self) -> None:
+        source_path = self._write_stable_source("transcription-fail.m4a", b"transcription-fail-audio")
+        plan = stt_main.build_single_job_plan(self.pipeline.config, source_path.name)
+        self.pipeline.worker.transcribe_file = mock.Mock(side_effect=RuntimeError("simulated"))
+
+        result = self.pipeline.process_single_job_plan(
+            plan,
+            kill_switch_path=self._controller_kill_switch(),
+        )
+
+        self.assertEqual(result["status"], "retry_pending")
+        self.assertEqual(result["plan_sha256"], plan["plan_sha256"])
+        self.assertIsInstance(result["job_id"], int)
+        row = self.pipeline.conn.execute(
+            "SELECT status, current_step FROM jobs WHERE id = ?",
+            (int(result["job_id"]),),
+        ).fetchone()
+        self.assertEqual(row["status"], stt_main.STATUS_PENDING)
+        self.assertIn("전사 재시도 대기", row["current_step"])
+
+    def _plan_retry_after_transient_failure(
+        self,
+        name: str,
+    ) -> tuple[dict[str, object], int, Path]:
+        source_path = self._write_stable_source(name, b"retry-contract-audio")
+        single_plan = stt_main.build_single_job_plan(
+            self.pipeline.config,
+            source_path.name,
+        )
+        with mock.patch.object(
+            self.pipeline.worker,
+            "transcribe_file",
+            side_effect=RuntimeError("simulated retryable failure"),
+        ):
+            first_result = self.pipeline.process_single_job_plan(
+                single_plan,
+                kill_switch_path=self._controller_kill_switch(),
+            )
+        self.assertEqual(first_result["status"], "retry_pending")
+        job_id = int(first_result["job_id"])
+        retry_plan = stt_main.build_retry_job_plan(
+            self.pipeline.config,
+            job_id=job_id,
+        )
+        return retry_plan, job_id, self.audio_dir / name
+
+    def test_single_job_plan_active_kill_switch_rejects_without_mutation(self) -> None:
+        source_path = self._write_stable_source("kill-switched-single.m4a", b"audio")
+        plan = stt_main.build_single_job_plan(self.pipeline.config, source_path.name)
+        kill_switch = self._controller_kill_switch()
+        kill_switch.write_text("stop\n", encoding="utf-8")
+
+        with mock.patch.object(
+            self.pipeline.worker,
+            "transcribe_file",
+            wraps=self.pipeline.worker.transcribe_file,
+        ) as transcribe:
+            with self.assertRaises(stt_main.ControllerGateError):
+                self.pipeline.process_single_job_plan(
+                    plan,
+                    kill_switch_path=kill_switch,
+                )
+
+        transcribe.assert_not_called()
+        self.assertTrue(source_path.exists())
+        self.assertEqual(
+            self.pipeline.conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0],
+            0,
+        )
+
+    def test_single_job_plan_invalid_kill_switch_rejects_without_mutation(self) -> None:
+        source_path = self._write_stable_source("invalid-switch-single.m4a", b"audio")
+        plan = stt_main.build_single_job_plan(self.pipeline.config, source_path.name)
+        kill_switch = self._controller_kill_switch()
+        target = self.root / "kill-target"
+        target.write_text("target\n", encoding="utf-8")
+        kill_switch.symlink_to(target)
+
+        with self.assertRaisesRegex(
+            stt_main.ControllerGateError,
+            "regular single-link marker",
+        ):
+            self.pipeline.process_single_job_plan(
+                plan,
+                kill_switch_path=kill_switch,
+            )
+
+        self.assertTrue(source_path.exists())
+        self.assertEqual(
+            self.pipeline.conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0],
+            0,
+        )
+
+    def test_single_job_plan_activation_between_revalidation_and_claim_is_fail_closed(self) -> None:
+        source_path = self._write_stable_source("race-single.m4a", b"audio")
+        plan = stt_main.build_single_job_plan(self.pipeline.config, source_path.name)
+        kill_switch = self._controller_kill_switch()
+
+        with (
+            mock.patch.object(
+                self.pipeline,
+                "startup_recovery",
+                side_effect=lambda: kill_switch.write_text("stop\n", encoding="utf-8"),
+            ),
+            mock.patch.object(
+                self.pipeline.worker,
+                "transcribe_file",
+                wraps=self.pipeline.worker.transcribe_file,
+            ) as transcribe,
+        ):
+            with self.assertRaises(stt_main.ControllerGateError):
+                self.pipeline.process_single_job_plan(
+                    plan,
+                    kill_switch_path=kill_switch,
+                )
+
+        transcribe.assert_not_called()
+        self.assertTrue(source_path.exists())
+        self.assertEqual(
+            self.pipeline.conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0],
+            0,
+        )
+
+    def test_single_job_plan_pause_flag_rejects_without_mutation(self) -> None:
+        source_path = self._write_stable_source("paused-single.m4a", b"audio")
+        plan = stt_main.build_single_job_plan(self.pipeline.config, source_path.name)
+        stt_main.utils.set_paused(True, self.pipeline.config)
+
+        with self.assertRaisesRegex(
+            stt_main.ControllerGateError,
+            "pause flag is active",
+        ):
+            self.pipeline.process_single_job_plan(
+                plan,
+                kill_switch_path=self._controller_kill_switch(),
+            )
+
+        self.assertTrue(source_path.exists())
+        self.assertEqual(
+            self.pipeline.conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0],
+            0,
+        )
+
+    def test_retry_job_plan_executes_exact_row_and_replay_is_distinct(self) -> None:
+        retry_plan, job_id, canonical_audio = self._plan_retry_after_transient_failure(
+            "exact-retry.m4a"
+        )
+        kill_switch = self.root / "controller.stop"
+
+        result = self.pipeline.process_retry_job_plan(
+            retry_plan,
+            kill_switch_path=kill_switch,
+        )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["job_id"], job_id)
+        self.assertEqual(result["plan_sha256"], retry_plan["plan_sha256"])
+        self.assertTrue(canonical_audio.exists())
+        self.assertEqual(
+            self.pipeline.conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0],
+            1,
+        )
+        with self.assertRaisesRegex(
+            stt_main.RetryJobContractError,
+            "eligible retry job",
+        ):
+            self.pipeline.process_retry_job_plan(
+                retry_plan,
+                kill_switch_path=kill_switch,
+            )
+
+    def test_retry_job_plan_kill_switch_rejects_before_claim(self) -> None:
+        retry_plan, job_id, _ = self._plan_retry_after_transient_failure(
+            "kill-switched-retry.m4a"
+        )
+        kill_switch = self._controller_kill_switch()
+        kill_switch.write_text("stop\n", encoding="utf-8")
+
+        with mock.patch.object(
+            self.pipeline.worker,
+            "transcribe_file",
+            wraps=self.pipeline.worker.transcribe_file,
+        ) as transcribe:
+            with self.assertRaises(stt_main.ControllerGateError):
+                self.pipeline.process_retry_job_plan(
+                    retry_plan,
+                    kill_switch_path=kill_switch,
+                )
+
+        transcribe.assert_not_called()
+        row = stt_main.db.get_job(self.pipeline.conn, job_id)
+        self.assertEqual(row["status"], stt_main.STATUS_PENDING)
+        self.assertEqual(row["current_step"], "전사 재시도 대기 1/2")
+
+    def test_retry_job_plan_pause_flag_rejects_before_claim(self) -> None:
+        retry_plan, job_id, _ = self._plan_retry_after_transient_failure(
+            "paused-retry.m4a"
+        )
+        stt_main.utils.set_paused(True, self.pipeline.config)
+
+        with mock.patch.object(
+            self.pipeline.worker,
+            "transcribe_file",
+            wraps=self.pipeline.worker.transcribe_file,
+        ) as transcribe:
+            with self.assertRaisesRegex(
+                stt_main.ControllerGateError,
+                "pause flag is active",
+            ):
+                self.pipeline.process_retry_job_plan(
+                    retry_plan,
+                    kill_switch_path=self._controller_kill_switch(),
+                )
+
+        transcribe.assert_not_called()
+        row = stt_main.db.get_job(self.pipeline.conn, job_id)
+        self.assertEqual(row["status"], stt_main.STATUS_PENDING)
+        self.assertEqual(row["current_step"], "전사 재시도 대기 1/2")
+
+    def test_retry_job_plan_rejects_changed_audio_before_claim(self) -> None:
+        retry_plan, job_id, canonical_audio = self._plan_retry_after_transient_failure(
+            "tampered-retry.m4a"
+        )
+        canonical_audio.write_bytes(b"tampered-after-plan")
+
+        with mock.patch.object(
+            self.pipeline.worker,
+            "transcribe_file",
+            wraps=self.pipeline.worker.transcribe_file,
+        ) as transcribe:
+            with self.assertRaisesRegex(
+                stt_main.RetryJobContractError,
+                "changed after planning",
+            ):
+                self.pipeline.process_retry_job_plan(
+                    retry_plan,
+                    kill_switch_path=self.root / "controller.stop",
+                )
+
+        transcribe.assert_not_called()
+        row = stt_main.db.get_job(self.pipeline.conn, job_id)
+        self.assertEqual(row["status"], stt_main.STATUS_PENDING)
+
+    def test_retry_job_atomic_claim_fence_rejects_post_validation_race(self) -> None:
+        retry_plan, job_id, _ = self._plan_retry_after_transient_failure(
+            "claim-race-retry.m4a"
+        )
+        original_claim = stt_main.db.claim_retry_job_for_processing
+
+        def race_then_claim(conn, **kwargs):
+            stt_main.db.update_job(
+                conn,
+                job_id,
+                orig_name="changed-after-validation.m4a",
+            )
+            return original_claim(conn, **kwargs)
+
+        with (
+            mock.patch.object(
+                stt_main.db,
+                "claim_retry_job_for_processing",
+                side_effect=race_then_claim,
+            ),
+            mock.patch.object(
+                self.pipeline.worker,
+                "transcribe_file",
+                wraps=self.pipeline.worker.transcribe_file,
+            ) as transcribe,
+        ):
+            with self.assertRaisesRegex(
+                stt_main.RetryJobContractError,
+                "exact claim fence changed",
+            ):
+                self.pipeline.process_retry_job_plan(
+                    retry_plan,
+                    kill_switch_path=self.root / "controller.stop",
+                )
+
+        transcribe.assert_not_called()
+        row = stt_main.db.get_job(self.pipeline.conn, job_id)
+        self.assertEqual(row["status"], stt_main.STATUS_PENDING)
+
+    def test_retry_job_atomic_claim_db_error_is_not_counted_as_worker_failure(self) -> None:
+        retry_plan, job_id, _ = self._plan_retry_after_transient_failure(
+            "claim-error-retry.m4a"
+        )
+        before = dict(stt_main.db.get_job(self.pipeline.conn, job_id))
+
+        with (
+            mock.patch.object(
+                stt_main.db,
+                "claim_retry_job_for_processing",
+                side_effect=stt_main.sqlite3.OperationalError("locked"),
+            ),
+            mock.patch.object(
+                self.pipeline.worker,
+                "transcribe_file",
+                wraps=self.pipeline.worker.transcribe_file,
+            ) as transcribe,
+        ):
+            with self.assertRaisesRegex(
+                stt_main.RetryJobContractError,
+                "could not acquire ownership",
+            ):
+                self.pipeline.process_retry_job_plan(
+                    retry_plan,
+                    kill_switch_path=self.root / "controller.stop",
+                )
+
+        transcribe.assert_not_called()
+        after = dict(stt_main.db.get_job(self.pipeline.conn, job_id))
+        self.assertEqual(after, before)
+
+    def test_retry_job_crash_recovery_fences_old_plan_and_allows_replan(self) -> None:
+        retry_plan, job_id, _ = self._plan_retry_after_transient_failure(
+            "recovered-retry.m4a"
+        )
+        self.assertTrue(
+            stt_main.db.claim_job_for_processing(self.pipeline.conn, job_id)
+        )
+
+        self.pipeline.startup_recovery()
+
+        recovered = stt_main.db.get_job(self.pipeline.conn, job_id)
+        self.assertEqual(recovered["status"], stt_main.STATUS_PENDING)
+        self.assertEqual(recovered["current_step"], "전사 재시도 대기 1/2")
+        with self.assertRaisesRegex(
+            stt_main.RetryJobContractError,
+            "row changed after planning",
+        ):
+            self.pipeline.process_retry_job_plan(
+                retry_plan,
+                kill_switch_path=self.root / "controller.stop",
+            )
+
+        replacement_plan = stt_main.build_retry_job_plan(
+            self.pipeline.config,
+            job_id=job_id,
+        )
+        result = self.pipeline.process_retry_job_plan(
+            replacement_plan,
+            kill_switch_path=self.root / "controller.stop",
+        )
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["job_id"], job_id)
+
     def test_process_job_writes_quality_scorecard_without_transcript_body(self) -> None:
-        source_path = self.watch_dir / "scorecard.m4a"
-        source_path.write_bytes(b"fake-audio")
+        source_path = self._write_stable_source("scorecard.m4a", b"fake-audio")
 
         self.pipeline.process_job(source_path)
 
@@ -877,7 +1320,19 @@ class SttPipelineBehaviorTests(unittest.TestCase):
             self.assertEqual(worker.calls, 2)
             self.assertEqual(second_row["status"], stt_main.STATUS_PENDING)
             self.assertEqual(second_row["current_step"], "전사 재시도 대기 2/2")
-            self.assertEqual(json.loads(second_row["engine_params"])["transcription_failures"], 2)
+            second_metadata = json.loads(second_row["engine_params"])
+            self.assertEqual(second_metadata["transcription_failures"], 2)
+            second_metadata["terminal_error_recovery"] = {
+                "schema_version": "lecture-stt/terminal-error-recovery-metadata@1",
+                "plan_sha256": "a" * 64,
+                "source_error_relative_path": "retry-success.m4a",
+                "target_audio_relative_path": "retry-success.m4a",
+            }
+            self.pipeline.conn.execute(
+                "UPDATE jobs SET engine_params = ? WHERE id = (SELECT id FROM jobs ORDER BY id DESC LIMIT 1)",
+                (json.dumps(second_metadata, ensure_ascii=False),),
+            )
+            self.pipeline.conn.commit()
 
             self.assertEqual(self.pipeline.process_retryable_jobs(), 1)
 
@@ -898,7 +1353,83 @@ class SttPipelineBehaviorTests(unittest.TestCase):
         self.assertIn("재시도 성공", Path(row["transcript_txt_path"]).read_text(encoding="utf-8"))
         payload = json.loads(Path(row["transcript_json_path"]).read_text(encoding="utf-8"))
         self.assertEqual(payload["metadata"]["canonical_base"], "retry-success")
-        self.assertEqual(json.loads(row["engine_params"])["transcription_failures_before_success"], 2)
+        row_metadata = json.loads(row["engine_params"])
+        self.assertEqual(row_metadata["transcription_failures_before_success"], 2)
+        self.assertEqual(
+            row_metadata["terminal_error_recovery"]["plan_sha256"],
+            "a" * 64,
+        )
+        self.assertEqual(
+            payload["metadata"]["terminal_error_recovery"]["plan_sha256"],
+            "a" * 64,
+        )
+
+    def test_retry_success_without_terminal_recovery_audit_remains_unchanged(self) -> None:
+        source_path = self.watch_dir / "retry-success-no-audit.m4a"
+        source_path.write_bytes(b"fake-audio")
+        worker = _FailingWorker(self.tmp_dir, failures_before_success=1)
+
+        with mock.patch.object(self.pipeline, "worker", worker):
+            self.pipeline.process_job(source_path)
+            self.assertEqual(self.pipeline.process_retryable_jobs(), 1)
+
+        row = self.pipeline.conn.execute(
+            "SELECT status, engine_params FROM jobs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["status"], stt_main.STATUS_DONE)
+        row_metadata = json.loads(row["engine_params"])
+        self.assertEqual(row_metadata["transcription_failures_before_success"], 1)
+        self.assertNotIn("terminal_error_recovery", row_metadata)
+
+    def test_retry_bad_quality_preserves_terminal_recovery_audit(self) -> None:
+        source_path = self.watch_dir / "retry-bad-quality.m4a"
+        source_path.write_bytes(b"fake-audio")
+        worker = _FailingWorker(self.tmp_dir, failures_before_success=1)
+
+        with mock.patch.object(self.pipeline, "worker", worker):
+            self.pipeline.process_job(source_path)
+            pending_row = self.pipeline.conn.execute(
+                "SELECT id, engine_params FROM jobs ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            self.assertIsNotNone(pending_row)
+            second_metadata = json.loads(pending_row["engine_params"])
+            second_metadata["terminal_error_recovery"] = {
+                "schema_version": "lecture-stt/terminal-error-recovery-metadata@1",
+                "plan_sha256": "b" * 64,
+                "source_error_relative_path": "retry-bad-quality.m4a",
+                "target_audio_relative_path": "retry-bad-quality.m4a",
+                "prior_status": "ERROR",
+                "prior_current_step": "실패: 전사 실행",
+            }
+            self.pipeline.conn.execute(
+                "UPDATE jobs SET engine_params = ? WHERE id = ?",
+                (json.dumps(second_metadata, ensure_ascii=False), int(pending_row["id"])),
+            )
+            self.pipeline.conn.commit()
+
+            with mock.patch.object(
+                stt_main,
+                "quality_evaluate",
+                return_value=_BadQualityReport(),
+            ):
+                self.assertEqual(self.pipeline.process_retryable_jobs(), 1)
+
+        row = self.pipeline.conn.execute(
+            "SELECT status, engine_params, transcript_json_path FROM jobs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["status"], stt_main.STATUS_NEEDS_REVIEW)
+        row_metadata = json.loads(row["engine_params"])
+        self.assertEqual(
+            row_metadata["terminal_error_recovery"]["plan_sha256"],
+            "b" * 64,
+        )
+        payload = json.loads(Path(row["transcript_json_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(
+            payload["metadata"]["terminal_error_recovery"]["plan_sha256"],
+            "b" * 64,
+        )
 
     def test_redacts_authorization_bearer_and_jwt_tokens(self) -> None:
         sample_jwt = ".".join([
@@ -1043,3 +1574,743 @@ class SttPipelineBehaviorTests(unittest.TestCase):
 
         self.assertEqual(lock_args, [(self.db_path.parent / "stt.lock", True)])
         pipeline_mock.run.assert_called_once_with(run_once=False)
+
+
+class SttSingleJobCliTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmpdir.name)
+        self.config_path = self.root / "config.yaml"
+        self.watch_dir = self.root / "watch"
+        self.audio_dir = self.root / "audio"
+        self.transcript_dir = self.root / "transcripts"
+        self.error_dir = self.root / "errors"
+        self.tmp_dir = self.root / "tmp"
+        self.db_path = self.root / "state" / "jobs.sqlite3"
+        for directory in (
+            self.watch_dir,
+            self.audio_dir,
+            self.transcript_dir,
+            self.error_dir,
+            self.tmp_dir,
+            self.db_path.parent,
+        ):
+            directory.mkdir(parents=True, exist_ok=True)
+        self.config = {
+            "app": {
+                "polling_interval_sec": 10,
+                "stable_for_sec": 1,
+                "stale_processing_hours": 6,
+                "transcribe_max_retries": 2,
+            },
+            "paths": {
+                "watch_folder": str(self.watch_dir),
+                "stable_audio_folder": str(self.audio_dir),
+                "transcript_folder": str(self.transcript_dir),
+                "error_folder": str(self.error_dir),
+                "tmp_dir": str(self.tmp_dir),
+                "db_path": str(self.db_path),
+            },
+            "transcribe": {
+                "model_size": "tiny",
+                "device": "cpu",
+                "compute_type": "int8",
+                "language": "ko",
+                "task": "transcribe",
+                "beam_size": 1,
+                "vad_filter": False,
+                "word_timestamps": False,
+                "condition_on_previous_text": False,
+            },
+            "ffmpeg": {"binary_path": "/usr/bin/true"},
+            "logging": {
+                "file": str(self.root / "app.log"),
+                "max_bytes": 1024,
+                "backup_count": 1,
+            },
+        }
+        self.config_path.write_text(json.dumps(self.config, ensure_ascii=False), encoding="utf-8")
+        self.logger = logging.getLogger(f"lecture_stt.test.cli.{id(self)}")
+        self.logger.handlers = []
+        self.logger.addHandler(logging.NullHandler())
+        self.logger.setLevel(logging.INFO)
+
+    def tearDown(self) -> None:
+        self.tmpdir.cleanup()
+
+    class _NoopSingleInstanceLock:
+        def __init__(self, path: Path, blocking: bool = False):
+            self.path = path
+            self.blocking = blocking
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+    def _run_main(self, *args: str) -> tuple[str, str]:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(sys, "argv", ["lecture-stt", *args]),
+            mock.patch.object(stt_main, "load_config", return_value=self.config),
+            mock.patch.object(stt_main, "validate_config", return_value=self.config),
+            mock.patch.object(stt_main, "setup_logging", return_value=self.logger),
+            mock.patch.object(stt_main, "SingleInstanceLock", self._NoopSingleInstanceLock),
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+        ):
+            stt_main.main()
+        return stdout.getvalue(), stderr.getvalue()
+
+    def _write_stable_source(self, name: str, payload: bytes) -> Path:
+        path = self.watch_dir / name
+        path.write_bytes(payload)
+        aged = path.stat().st_mtime - 10
+        os.utime(path, (aged, aged))
+        return path
+
+    def _write_plan(self, source_name: str) -> dict[str, object]:
+        plan = stt_main.build_single_job_plan(self.config, source_name)
+        manifest_path = self.root / "single-job.json"
+        manifest_path.write_text(json.dumps(plan), encoding="utf-8")
+        return {"plan": plan, "path": manifest_path}
+
+    def _write_retry_plan(
+        self,
+        *,
+        name: str = "retry-cli.m4a",
+    ) -> dict[str, object]:
+        audio_path = self.audio_dir / name
+        audio_path.write_bytes(b"retry-cli-audio")
+        conn = stt_main.db.init_db(str(self.db_path))
+        try:
+            job_id = stt_main.db.create_job(
+                conn,
+                status=stt_main.STATUS_PENDING,
+                orig_inbox_path=str(self.watch_dir / name),
+                orig_name=name,
+                canonical_base=Path(name).stem,
+                canonical_audio_path=str(audio_path),
+                transcript_txt_path=str(
+                    self.transcript_dir / f"{Path(name).stem}.txt"
+                ),
+                transcript_json_path=str(
+                    self.transcript_dir / f"{Path(name).stem}.json"
+                ),
+                engine_params={
+                    "transcription_failures": 1,
+                    "transcription_max_retries": 2,
+                },
+                current_step="전사 재시도 대기 1/2",
+                progress_pct=18,
+            )
+        finally:
+            conn.close()
+        plan = stt_main.build_retry_job_plan(self.config, job_id=job_id)
+        manifest_path = self.root / "retry-job.json"
+        manifest_path.write_text(json.dumps(plan), encoding="utf-8")
+        return {"plan": plan, "path": manifest_path, "job_id": job_id}
+
+    def test_plan_single_job_produces_closed_manifest_json(self) -> None:
+        source = self._write_stable_source("cli-source.m4a", b"audio")
+        stdout, _ = self._run_main(
+            "--config",
+            str(self.config_path),
+            "--plan-single-job",
+            source.name,
+        )
+        payload = json.loads(stdout)
+        self.assertEqual(payload["expected_count"], 1)
+        self.assertEqual(payload["source"]["relative_path"], source.name)
+
+    def test_plan_single_job_uses_read_only_config_validation(self) -> None:
+        source = self._write_stable_source("read-only-plan.m4a", b"audio")
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "lecture-stt",
+                    "--config",
+                    str(self.config_path),
+                    "--plan-single-job",
+                    source.name,
+                ],
+            ),
+            mock.patch.object(stt_main, "load_config", return_value=self.config),
+            mock.patch.object(
+                stt_main,
+                "validate_config",
+                return_value=self.config,
+            ) as mocked_validate,
+            redirect_stdout(stdout),
+        ):
+            stt_main.main()
+
+        mocked_validate.assert_called_once_with(
+            str(self.config_path),
+            self.config,
+            check_writable=False,
+        )
+
+    def test_plan_single_job_rejects_execution_flags(self) -> None:
+        source = self._write_stable_source("cli-source.m4a", b"audio")
+
+        with self.assertRaises(SystemExit) as exc:
+            self._run_main(
+                "--config",
+                str(self.config_path),
+                "--plan-single-job",
+                source.name,
+                "--enable-single-job",
+            )
+        self.assertIsInstance(exc.exception.code, str)
+
+    def test_plan_retry_job_produces_closed_manifest_with_read_only_validation(self) -> None:
+        retry_ref = self._write_retry_plan()
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "lecture-stt",
+                    "--config",
+                    str(self.config_path),
+                    "--plan-retry-job",
+                    str(retry_ref["job_id"]),
+                ],
+            ),
+            mock.patch.object(stt_main, "load_config", return_value=self.config),
+            mock.patch.object(
+                stt_main,
+                "validate_config",
+                return_value=self.config,
+            ) as mocked_validate,
+            redirect_stdout(stdout),
+        ):
+            stt_main.main()
+
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["expected_count"], 1)
+        self.assertEqual(payload["retry_job"]["job_id"], retry_ref["job_id"])
+        mocked_validate.assert_called_once_with(
+            str(self.config_path),
+            self.config,
+            check_writable=False,
+        )
+
+    def test_plan_next_retry_job_returns_empty_or_oldest_candidate_read_only(self) -> None:
+        conn = stt_main.db.init_db(str(self.db_path))
+        conn.close()
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "lecture-stt",
+                    "--config",
+                    str(self.config_path),
+                    "--plan-next-retry-job",
+                ],
+            ),
+            mock.patch.object(stt_main, "load_config", return_value=self.config),
+            mock.patch.object(
+                stt_main,
+                "validate_config",
+                return_value=self.config,
+            ) as mocked_validate,
+            redirect_stdout(stdout),
+        ):
+            stt_main.main()
+
+        empty_payload = json.loads(stdout.getvalue())
+        self.assertEqual(empty_payload["schema_version"], "lecture-stt/controller-next-retry@1")
+        self.assertEqual(empty_payload["status"], "empty")
+        self.assertIsNone(empty_payload["plan"])
+        mocked_validate.assert_called_once_with(
+            str(self.config_path),
+            self.config,
+            check_writable=False,
+        )
+
+        first = self._write_retry_plan(name="older-retry.m4a")
+        second = self._write_retry_plan(name="newer-retry.m4a")
+        conn = stt_main.db.init_db(str(self.db_path))
+        try:
+            stt_main.db.update_job(conn, int(first["job_id"]), updated_at="2026-07-27T08:00:00+09:00")
+            stt_main.db.update_job(conn, int(second["job_id"]), updated_at="2026-07-27T09:00:00+09:00")
+        finally:
+            conn.close()
+
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "lecture-stt",
+                    "--config",
+                    str(self.config_path),
+                    "--plan-next-retry-job",
+                ],
+            ),
+            mock.patch.object(stt_main, "load_config", return_value=self.config),
+            mock.patch.object(
+                stt_main,
+                "validate_config",
+                return_value=self.config,
+            ),
+            redirect_stdout(stdout),
+        ):
+            stt_main.main()
+
+        planned_payload = json.loads(stdout.getvalue())
+        self.assertEqual(planned_payload["status"], "planned")
+        self.assertEqual(planned_payload["plan"]["retry_job"]["job_id"], first["job_id"])
+
+    def test_retry_job_manifest_requires_all_guards_and_kill_switch(self) -> None:
+        retry_ref = self._write_retry_plan()
+        plan = retry_ref["plan"]
+        base_args = (
+            "--config",
+            str(self.config_path),
+            "--retry-job-manifest",
+            str(retry_ref["path"]),
+        )
+
+        with self.assertRaises(SystemExit) as disabled:
+            self._run_main(*base_args)
+        self.assertEqual(disabled.exception.code, 2)
+
+        with self.assertRaises(SystemExit) as missing_switch:
+            self._run_main(
+                *base_args,
+                "--enable-retry-job",
+                "--allow-write",
+                "--expected-count",
+                "1",
+                "--expected-plan-sha256",
+                str(plan["plan_sha256"]),
+            )
+        self.assertEqual(missing_switch.exception.code, 2)
+
+        with self.assertRaises(SystemExit) as wrong_digest:
+            self._run_main(
+                *base_args,
+                "--enable-retry-job",
+                "--allow-write",
+                "--expected-count",
+                "1",
+                "--expected-plan-sha256",
+                "0" * 64,
+                "--controller-kill-switch",
+                str(self.root / "controller.stop"),
+            )
+        self.assertEqual(wrong_digest.exception.code, 2)
+
+    def test_disabled_retry_manifest_is_rejected_before_writable_validation(self) -> None:
+        retry_ref = self._write_retry_plan()
+        with (
+            mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "lecture-stt",
+                    "--config",
+                    str(self.config_path),
+                    "--retry-job-manifest",
+                    str(retry_ref["path"]),
+                ],
+            ),
+            mock.patch.object(stt_main, "load_config", return_value=self.config),
+            mock.patch.object(
+                stt_main,
+                "validate_config",
+                side_effect=AssertionError("writable validation must not run"),
+            ),
+            redirect_stderr(io.StringIO()),
+        ):
+            with self.assertRaises(SystemExit) as exc:
+                stt_main.main()
+
+        self.assertEqual(exc.exception.code, 2)
+
+    def test_retry_job_manifest_active_kill_switch_rejects_before_pipeline(self) -> None:
+        retry_ref = self._write_retry_plan()
+        plan = retry_ref["plan"]
+        kill_switch = self.root / "controller.stop"
+        kill_switch.write_text("stop\n", encoding="utf-8")
+
+        with mock.patch.object(stt_main, "STTPipeline") as pipeline_type:
+            with self.assertRaises(SystemExit) as exc:
+                self._run_main(
+                    "--config",
+                    str(self.config_path),
+                    "--retry-job-manifest",
+                    str(retry_ref["path"]),
+                    "--enable-retry-job",
+                    "--allow-write",
+                    "--expected-count",
+                    "1",
+                    "--expected-plan-sha256",
+                    str(plan["plan_sha256"]),
+                    "--controller-kill-switch",
+                    str(kill_switch),
+                )
+
+        self.assertEqual(exc.exception.code, 2)
+        pipeline_type.assert_not_called()
+
+    def test_retry_job_manifest_pause_rejects_before_pipeline(self) -> None:
+        retry_ref = self._write_retry_plan()
+        plan = retry_ref["plan"]
+        stt_main.utils.set_paused(True, self.config)
+
+        with mock.patch.object(stt_main, "STTPipeline") as pipeline_type:
+            with self.assertRaises(SystemExit) as exc:
+                self._run_main(
+                    "--config",
+                    str(self.config_path),
+                    "--retry-job-manifest",
+                    str(retry_ref["path"]),
+                    "--enable-retry-job",
+                    "--allow-write",
+                    "--expected-count",
+                    "1",
+                    "--expected-plan-sha256",
+                    str(plan["plan_sha256"]),
+                    "--controller-kill-switch",
+                    str(self.root / "controller.stop"),
+                )
+
+        self.assertEqual(exc.exception.code, 2)
+        pipeline_type.assert_not_called()
+
+    def test_main_dispatches_retry_job_manifest_to_exact_pipeline_path(self) -> None:
+        retry_ref = self._write_retry_plan()
+        plan = retry_ref["plan"]
+        kill_switch = self.root / "controller.stop"
+        pipeline_mock = mock.Mock()
+        pipeline_mock.process_retry_job_plan.return_value = {
+            "schema_version": "lecture-stt/retry-job-result@1",
+            "expected_count": 1,
+            "plan_sha256": plan["plan_sha256"],
+            "status": "completed",
+            "job_id": retry_ref["job_id"],
+        }
+        with mock.patch.object(
+            stt_main,
+            "STTPipeline",
+            return_value=pipeline_mock,
+        ):
+            stdout, _ = self._run_main(
+                "--config",
+                str(self.config_path),
+                "--retry-job-manifest",
+                str(retry_ref["path"]),
+                "--enable-retry-job",
+                "--allow-write",
+                "--expected-count",
+                "1",
+                "--expected-plan-sha256",
+                str(plan["plan_sha256"]),
+                "--controller-kill-switch",
+                str(kill_switch),
+            )
+
+        result = json.loads(stdout)
+        self.assertEqual(result["status"], "completed")
+        pipeline_mock.process_retry_job_plan.assert_called_once_with(
+            plan,
+            kill_switch_path=stt_main.normalize_controller_kill_switch_path(
+                kill_switch
+            ),
+        )
+
+    def test_retry_job_lock_contention_returns_busy_exact_job_result(self) -> None:
+        retry_ref = self._write_retry_plan()
+        plan = retry_ref["plan"]
+
+        class _BusyLock:
+            def __init__(self, path: Path, blocking: bool = False):
+                pass
+
+            def __enter__(self):
+                raise BlockingIOError("busy")
+
+            def __exit__(self, exc_type, exc, tb):
+                return None
+
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "lecture-stt",
+                    "--config",
+                    str(self.config_path),
+                    "--retry-job-manifest",
+                    str(retry_ref["path"]),
+                    "--enable-retry-job",
+                    "--allow-write",
+                    "--expected-count",
+                    "1",
+                    "--expected-plan-sha256",
+                    str(plan["plan_sha256"]),
+                    "--controller-kill-switch",
+                    str(self.root / "controller.stop"),
+                ],
+            ),
+            mock.patch.object(stt_main, "load_config", return_value=self.config),
+            mock.patch.object(stt_main, "validate_config", return_value=self.config),
+            mock.patch.object(stt_main, "setup_logging", return_value=self.logger),
+            mock.patch.object(stt_main, "SingleInstanceLock", _BusyLock),
+            redirect_stdout(stdout),
+        ):
+            with self.assertRaises(SystemExit) as exc:
+                stt_main.main()
+
+        self.assertEqual(exc.exception.code, 75)
+        result = json.loads(stdout.getvalue())
+        self.assertEqual(result["status"], "busy")
+        self.assertEqual(result["job_id"], retry_ref["job_id"])
+
+    def test_single_job_manifest_requires_all_guards(self) -> None:
+        source = self._write_stable_source("manifest.m4a", b"audio")
+        plan_ref = self._write_plan(source.name)
+        manifest_path = plan_ref["path"]
+        plan = plan_ref["plan"]
+        kill_switch = self.root / "controller.stop"
+
+        with self.assertRaises(SystemExit):
+            self._run_main(
+                "--config",
+                str(self.config_path),
+                "--single-job-manifest",
+                str(manifest_path),
+            )
+
+        with self.assertRaises(SystemExit):
+            self._run_main(
+                "--config",
+                str(self.config_path),
+                "--single-job-manifest",
+                str(manifest_path),
+                "--enable-single-job",
+                "--allow-write",
+                "--expected-count",
+                "2",
+                "--expected-plan-sha256",
+                str(plan["plan_sha256"]),
+                "--controller-kill-switch",
+                str(kill_switch),
+            )
+
+        with self.assertRaises(SystemExit):
+            self._run_main(
+                "--config",
+                str(self.config_path),
+                "--single-job-manifest",
+                str(manifest_path),
+                "--enable-single-job",
+                "--allow-write",
+                "--expected-count",
+                "1",
+                "--expected-plan-sha256",
+                str(plan["plan_sha256"]),
+            )
+
+        with self.assertRaises(SystemExit):
+            self._run_main(
+                "--config",
+                str(self.config_path),
+                "--single-job-manifest",
+                str(manifest_path),
+                "--enable-single-job",
+                "--allow-write",
+                "--expected-count",
+                "1",
+                "--expected-plan-sha256",
+                "0" * 64,
+                "--controller-kill-switch",
+                str(kill_switch),
+            )
+
+    def test_disabled_manifest_is_rejected_before_writable_config_validation(self) -> None:
+        source = self._write_stable_source("disabled-before-config.m4a", b"audio")
+        plan_ref = self._write_plan(source.name)
+        with (
+            mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "lecture-stt",
+                    "--config",
+                    str(self.config_path),
+                    "--single-job-manifest",
+                    str(plan_ref["path"]),
+                ],
+            ),
+            mock.patch.object(stt_main, "load_config", return_value=self.config),
+            mock.patch.object(
+                stt_main,
+                "validate_config",
+                side_effect=AssertionError("writable validation must not run"),
+            ),
+            redirect_stderr(io.StringIO()),
+        ):
+            with self.assertRaises(SystemExit) as exc:
+                stt_main.main()
+
+        self.assertEqual(exc.exception.code, 2)
+
+    def test_main_dispatches_single_job_manifest_to_pipeline(self) -> None:
+        source = self._write_stable_source("dispatch.m4a", b"audio")
+        plan_ref = self._write_plan(source.name)
+        manifest_path = plan_ref["path"]
+        plan = plan_ref["plan"]
+        kill_switch = self.root / "controller.stop"
+        pipeline_mock = mock.Mock()
+        pipeline_mock.process_single_job_plan.return_value = {
+            "schema_version": "lecture-stt/single-job-result@1",
+            "expected_count": 1,
+            "plan_sha256": plan["plan_sha256"],
+            "status": "completed",
+            "job_id": 123,
+        }
+        with (
+            mock.patch.object(stt_main, "STTPipeline", return_value=pipeline_mock),
+        ):
+            stdout, _ = self._run_main(
+                "--config",
+                str(self.config_path),
+                "--single-job-manifest",
+                str(manifest_path),
+                "--enable-single-job",
+                "--allow-write",
+                "--expected-count",
+                "1",
+                "--expected-plan-sha256",
+                plan["plan_sha256"],
+                "--controller-kill-switch",
+                str(kill_switch),
+            )
+
+        result = json.loads(stdout)
+        self.assertEqual(result["status"], "completed")
+        pipeline_mock.process_single_job_plan.assert_called_once_with(
+            plan,
+            kill_switch_path=stt_main.normalize_controller_kill_switch_path(
+                kill_switch,
+                operation="controller single-job execution",
+            ),
+        )
+
+    def test_single_job_manifest_pause_rejects_before_pipeline(self) -> None:
+        source = self._write_stable_source("paused-cli-single.m4a", b"audio")
+        plan_ref = self._write_plan(source.name)
+        stt_main.utils.set_paused(True, self.config)
+
+        with mock.patch.object(stt_main, "STTPipeline") as pipeline_type:
+            with self.assertRaises(SystemExit) as exc:
+                self._run_main(
+                    "--config",
+                    str(self.config_path),
+                    "--single-job-manifest",
+                    str(plan_ref["path"]),
+                    "--enable-single-job",
+                    "--allow-write",
+                    "--expected-count",
+                    "1",
+                    "--expected-plan-sha256",
+                    str(plan_ref["plan"]["plan_sha256"]),
+                    "--controller-kill-switch",
+                    str(self.root / "controller.stop"),
+                )
+
+        self.assertEqual(exc.exception.code, 2)
+        pipeline_type.assert_not_called()
+
+    def test_retry_pending_result_uses_temporary_failure_exit(self) -> None:
+        source = self._write_stable_source("retry-pending.m4a", b"audio")
+        plan_ref = self._write_plan(source.name)
+        plan = plan_ref["plan"]
+        pipeline_mock = mock.Mock()
+        pipeline_mock.process_single_job_plan.return_value = {
+            "schema_version": "lecture-stt/single-job-result@1",
+            "expected_count": 1,
+            "plan_sha256": plan["plan_sha256"],
+            "status": "retry_pending",
+            "job_id": 123,
+        }
+        with mock.patch.object(stt_main, "STTPipeline", return_value=pipeline_mock):
+            with self.assertRaises(SystemExit) as exc:
+                self._run_main(
+                    "--config",
+                    str(self.config_path),
+                    "--single-job-manifest",
+                    str(plan_ref["path"]),
+                    "--enable-single-job",
+                    "--allow-write",
+                    "--expected-count",
+                    "1",
+                    "--expected-plan-sha256",
+                    str(plan["plan_sha256"]),
+                    "--controller-kill-switch",
+                    str(self.root / "controller.stop"),
+                )
+        self.assertEqual(exc.exception.code, 75)
+
+    def test_lock_contention_returns_busy_result_and_temporary_failure_exit(self) -> None:
+        source = self._write_stable_source("busy.m4a", b"audio")
+        plan_ref = self._write_plan(source.name)
+        plan = plan_ref["plan"]
+
+        class _BusyLock:
+            def __init__(self, path: Path, blocking: bool = False):
+                pass
+
+            def __enter__(self):
+                raise BlockingIOError("busy")
+
+            def __exit__(self, exc_type, exc, tb):
+                return None
+
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "lecture-stt",
+                    "--config",
+                    str(self.config_path),
+                    "--single-job-manifest",
+                    str(plan_ref["path"]),
+                    "--enable-single-job",
+                    "--allow-write",
+                    "--expected-count",
+                    "1",
+                    "--expected-plan-sha256",
+                    str(plan["plan_sha256"]),
+                    "--controller-kill-switch",
+                    str(self.root / "controller.stop"),
+                ],
+            ),
+            mock.patch.object(stt_main, "load_config", return_value=self.config),
+            mock.patch.object(stt_main, "validate_config", return_value=self.config),
+            mock.patch.object(stt_main, "setup_logging", return_value=self.logger),
+            mock.patch.object(stt_main, "SingleInstanceLock", _BusyLock),
+            redirect_stdout(stdout),
+        ):
+            with self.assertRaises(SystemExit) as exc:
+                stt_main.main()
+
+        self.assertEqual(exc.exception.code, 75)
+        self.assertEqual(json.loads(stdout.getvalue())["status"], "busy")

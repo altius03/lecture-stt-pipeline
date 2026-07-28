@@ -287,6 +287,54 @@ def claim_job_for_processing(conn: sqlite3.Connection, job_id: int) -> bool:
     return cur.rowcount == 1
 
 
+def claim_retry_job_for_processing(
+    conn: sqlite3.Connection,
+    *,
+    job_id: int,
+    expected_updated_at: str,
+    expected_current_step: str,
+    expected_orig_name: str,
+    expected_canonical_base: str,
+    expected_canonical_audio_path: str,
+    expected_transcript_txt_path: str,
+    expected_transcript_json_path: str,
+    expected_engine_params: str,
+) -> bool:
+    """Atomically fence an exact planned retry row before taking ownership."""
+    now = _now()
+    cur = conn.execute(
+        "UPDATE jobs "
+        "SET status = :processing, started_at = :started_at, updated_at = :updated_at "
+        "WHERE id = :job_id "
+        "AND status = :pending "
+        "AND updated_at = :expected_updated_at "
+        "AND current_step = :expected_current_step "
+        "AND orig_name = :expected_orig_name "
+        "AND canonical_base = :expected_canonical_base "
+        "AND canonical_audio_path = :expected_canonical_audio_path "
+        "AND transcript_txt_path = :expected_transcript_txt_path "
+        "AND transcript_json_path = :expected_transcript_json_path "
+        "AND engine_params = :expected_engine_params",
+        {
+            "job_id": job_id,
+            "pending": STATUS_PENDING,
+            "processing": STATUS_PROCESSING,
+            "started_at": now,
+            "updated_at": now,
+            "expected_updated_at": expected_updated_at,
+            "expected_current_step": expected_current_step,
+            "expected_orig_name": expected_orig_name,
+            "expected_canonical_base": expected_canonical_base,
+            "expected_canonical_audio_path": expected_canonical_audio_path,
+            "expected_transcript_txt_path": expected_transcript_txt_path,
+            "expected_transcript_json_path": expected_transcript_json_path,
+            "expected_engine_params": expected_engine_params,
+        },
+    )
+    conn.commit()
+    return cur.rowcount == 1
+
+
 def set_status(conn: sqlite3.Connection, job_id: int, status: str, **extra: Any) -> None:
     update_job(conn, job_id, status=status, **extra)
 

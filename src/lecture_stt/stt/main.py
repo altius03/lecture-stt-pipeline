@@ -8,9 +8,11 @@ import os
 from pathlib import Path
 import re
 import shutil
+import sqlite3
+import sys
 import time
 import traceback
-from typing import Any, Callable, Dict, cast
+from typing import Any, Callable, Dict, Mapping, cast
 
 from dotenv import load_dotenv
 import yaml
@@ -44,6 +46,41 @@ from lecture_stt.stt.quality_gate import (
     evaluate as quality_evaluate,
     validate_quality_scorecard,
     write_quality_scorecard,
+)
+from lecture_stt.stt.controller_gate import (
+    ControllerGateError,
+    controller_kill_switch_is_active,
+    ensure_controller_execution_unpaused,
+    ensure_controller_kill_switch_inactive,
+    normalize_controller_kill_switch_path,
+)
+from lecture_stt.stt.retry_job import (
+    RetryJobConflictError,
+    RetryJobContractError,
+    build_next_retry_job_plan,
+    build_retry_job_plan,
+    load_retry_job_plan,
+    retry_job_result,
+    revalidate_retry_job_plan,
+    validate_next_retry_job_plan,
+    validate_retry_apply_guards,
+)
+from lecture_stt.stt.single_job import (
+    SingleJobContractError,
+    build_single_job_plan,
+    load_single_job_plan,
+    revalidate_single_job_plan,
+    single_job_result,
+    validate_apply_guards,
+)
+from lecture_stt.stt.terminal_error_recovery import (
+    TerminalErrorRecoveryConflictError,
+    TerminalErrorRecoveryContractError,
+    build_terminal_error_recovery_plan,
+    load_terminal_error_recovery_plan,
+    terminal_error_recovery_result,
+    apply_terminal_error_recovery_plan,
+    validate_terminal_error_recovery_apply_guards,
 )
 from lecture_stt.stt.transcribe import EngineParams, STTWorker
 from lecture_stt.stt.watcher import PollingWatcher
@@ -140,7 +177,12 @@ def load_config(config_path: str = "config/config.yaml") -> dict:
 
     return loaded
 
-def validate_config(config_path: str, config: dict) -> dict:
+def validate_config(
+    config_path: str,
+    config: dict,
+    *,
+    check_writable: bool = True,
+) -> dict:
     # 설정 섹션/타입/값 범위를 검증해 실행 시 실패를 앞당긴다.
     config = _normalize_config_paths(config)
     config_path_obj = Path(config_path)
@@ -226,42 +268,51 @@ def validate_config(config_path: str, config: dict) -> dict:
     if not watch_folder.is_dir():
         raise NotADirectoryError(f"Config error: watch_folder is not a directory: {watch_folder}")
 
-    writable_dirs = [
-        ("paths.stable_audio_folder", Path(paths["stable_audio_folder"])),
-        ("paths.transcript_folder", Path(paths["transcript_folder"])),
-        ("paths.error_folder", Path(paths["error_folder"])),
-        ("paths.tmp_dir", Path(paths["tmp_dir"])),
-    ]
-    for label, directory in writable_dirs:
+    if check_writable:
+        writable_dirs = [
+            ("paths.stable_audio_folder", Path(paths["stable_audio_folder"])),
+            ("paths.transcript_folder", Path(paths["transcript_folder"])),
+            ("paths.error_folder", Path(paths["error_folder"])),
+            ("paths.tmp_dir", Path(paths["tmp_dir"])),
+        ]
+        for label, directory in writable_dirs:
+            try:
+                directory.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                raise PermissionError(
+                    f"Config error: cannot create {label} directory {directory}"
+                ) from exc
+            probe = directory / f".lecture_stt_write_probe_{os.getpid()}"
+            try:
+                probe.write_text("", encoding="utf-8")
+                probe.unlink()
+            except OSError as exc:
+                raise PermissionError(
+                    f"Config error: cannot write in {label} directory {directory}"
+                ) from exc
+
+        db_parent = Path(paths["db_path"]).parent
         try:
-            directory.mkdir(parents=True, exist_ok=True)
+            db_parent.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
-            raise PermissionError(f"Config error: cannot create {label} directory {directory}") from exc
-        probe = directory / f".lecture_stt_write_probe_{os.getpid()}"
+            raise PermissionError(
+                f"Config error: cannot create db_path parent directory {db_parent}"
+            ) from exc
+        state_log_dir = db_parent / "logs"
         try:
+            state_log_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise PermissionError(
+                f"Config error: cannot create state logs directory {state_log_dir}"
+            ) from exc
+        try:
+            probe = state_log_dir / f".lecture_stt_state_probe_{os.getpid()}"
             probe.write_text("", encoding="utf-8")
             probe.unlink()
         except OSError as exc:
-            raise PermissionError(f"Config error: cannot write in {label} directory {directory}") from exc
-
-    db_parent = Path(paths["db_path"]).parent
-    try:
-        db_parent.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        raise PermissionError(f"Config error: cannot create db_path parent directory {db_parent}") from exc
-    state_log_dir = db_parent / "logs"
-    try:
-        state_log_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        raise PermissionError(
-            f"Config error: cannot create state logs directory {state_log_dir}"
-        ) from exc
-    try:
-        probe = state_log_dir / f".lecture_stt_state_probe_{os.getpid()}"
-        probe.write_text("", encoding="utf-8")
-        probe.unlink()
-    except OSError as exc:
-        raise PermissionError(f"Config error: cannot write in state logs directory {state_log_dir}") from exc
+            raise PermissionError(
+                f"Config error: cannot write in state logs directory {state_log_dir}"
+            ) from exc
 
     if "binary_path" not in ffmpeg_cfg:
         raise ValueError(f"Config error in {config_path_obj}: missing key 'binary_path' under 'ffmpeg'")
@@ -1053,6 +1104,23 @@ class STTPipeline:
             return {}
         return loaded if isinstance(loaded, dict) else {}
 
+    @staticmethod
+    def _preserve_terminal_error_recovery_audit(
+        metadata: dict[str, Any],
+        prior_engine_params: Mapping[str, Any],
+    ) -> None:
+        terminal_recovery_metadata = prior_engine_params.get("terminal_error_recovery")
+        if not isinstance(terminal_recovery_metadata, dict):
+            return
+        if (
+            terminal_recovery_metadata.get("schema_version")
+            != "lecture-stt/terminal-error-recovery-metadata@1"
+        ):
+            return
+        metadata["terminal_error_recovery"] = json.loads(
+            json.dumps(terminal_recovery_metadata, ensure_ascii=False)
+        )
+
     def _transcription_failure_metadata(self, job_id: int, safe_error: str) -> tuple[int, dict[str, Any]]:
         row = db.get_job(self.conn, job_id)
         metadata = self._load_engine_params(row["engine_params"] if row else None)
@@ -1206,7 +1274,13 @@ class STTPipeline:
         self._log(logging.WARNING, "bad quality transcript preserved for remediation: %s", {"job_id": str(job_id), "canonical_base": canonical_base}, safe_summary)
 
     # 하나의 파일에 대해 이동, 중복 처리, 전사, 저장, 알림까지 수행한다.
-    def process_job(self, source_path: Path) -> None:
+    def process_job(
+        self,
+        source_path: Path,
+        *,
+        single_job_plan: Mapping[str, Any] | None = None,
+        kill_switch_path: Path | None = None,
+    ) -> dict[str, Any]:
         paths = self._job_paths(source_path)
         canonical_base = paths["canonical_base"]
         canonical_audio = paths["canonical_audio_path"]
@@ -1227,6 +1301,9 @@ class STTPipeline:
         fail_step = "파이프라인 시작"
 
         try:
+            if kill_switch_path is not None:
+                ensure_controller_execution_unpaused(self.config)
+                ensure_controller_kill_switch_inactive(kill_switch_path)
             if not source_path.exists():
                 self._skip_disappeared_source(
                     job_ctx=job_ctx,
@@ -1234,11 +1311,22 @@ class STTPipeline:
                     staging_path=staging_source,
                     canonical_audio=canonical_audio,
                 )
-                return
+                return single_job_result(
+                    plan_sha256=str(single_job_plan["plan_sha256"]) if single_job_plan else "",
+                    status="skipped",
+                    job_id=None,
+                )
 
             # iCloud inbox 원본은 먼저 로컬 staging으로 옮겨 이후 처리에서 rename/sync 영향을 줄인다.
             fail_step = "로컬 staging"
             self._update_progress(job_id, "로컬 staging", 15)
+            if single_job_plan is not None:
+                # Manifest evidence is checked again at the last practical boundary
+                # before the pathname is claimed into local staging.
+                if kill_switch_path is not None:
+                    ensure_controller_execution_unpaused(self.config)
+                    ensure_controller_kill_switch_inactive(kill_switch_path)
+                source_path = revalidate_single_job_plan(self.config, single_job_plan)
             try:
                 utils.safe_move_file(source_path, staging_source)
             except FileNotFoundError:
@@ -1248,7 +1336,11 @@ class STTPipeline:
                     staging_path=staging_source,
                     canonical_audio=canonical_audio,
                 )
-                return
+                return single_job_result(
+                    plan_sha256=str(single_job_plan["plan_sha256"]) if single_job_plan else "",
+                    status="skipped",
+                    job_id=None,
+                )
             source_claim_path = staging_source
 
             job_id = db.create_job(
@@ -1329,7 +1421,11 @@ class STTPipeline:
                     duplicate=duplicate,
                 ):
                     self._log(logging.INFO, "dedupe completed", job_ctx)
-                    return
+                    return single_job_result(
+                        plan_sha256=str(single_job_plan["plan_sha256"]) if single_job_plan else "",
+                        status="completed",
+                        job_id=job_id,
+                    )
 
             if not db.claim_job_for_processing(self.conn, job_id):
                 # 상태를 PROCESSING으로 바꿔 다른 워커가 같은 작업을 중복 처리하지 않게 막는다.
@@ -1451,7 +1547,11 @@ class STTPipeline:
                     transcribe_sec=transcribe_sec,
                     total_sec=total_sec,
                 )
-                return
+                return single_job_result(
+                    plan_sha256=str(single_job_plan["plan_sha256"]) if single_job_plan else "",
+                    status="needs_review",
+                    job_id=job_id,
+                )
             self.notifier.notify_transcript_generated({
                 "job_id": job_id,
                 "orig_name": source_path.name,
@@ -1502,6 +1602,11 @@ class STTPipeline:
                 "processing_count": queue.get("PROCESSING", 0),
             })
             self._log(logging.INFO, "done", job_ctx)
+            return single_job_result(
+                plan_sha256=str(single_job_plan["plan_sha256"]) if single_job_plan else "",
+                status="completed",
+                job_id=job_id,
+            )
 
         except Exception as exc:
             self._handle_job_failure(
@@ -1516,10 +1621,103 @@ class STTPipeline:
                 txt_path=txt_path,
                 json_path=json_path,
             )
+            result_status = "failed"
+            if job_id is not None:
+                failed_row = db.get_job(self.conn, job_id)
+                if failed_row is not None and failed_row["status"] == STATUS_PENDING:
+                    result_status = "retry_pending"
+            return single_job_result(
+                plan_sha256=str(single_job_plan["plan_sha256"]) if single_job_plan else "",
+                status=result_status,
+                job_id=job_id,
+            )
         finally:
             if tmp_wav:
                 self.worker.cleanup_tmp(tmp_wav)
             self._release_worker_model_if_idle()
+
+    def process_single_job_plan(
+        self,
+        plan: Mapping[str, Any],
+        *,
+        kill_switch_path: Path,
+    ) -> dict[str, Any]:
+        # Startup recovery remains owned by the existing Python worker. The
+        # manifest source is checked both before recovery and immediately before
+        # process_job claims it into local staging.
+        ensure_controller_execution_unpaused(self.config)
+        ensure_controller_kill_switch_inactive(kill_switch_path)
+        revalidate_single_job_plan(self.config, plan)
+        self.startup_recovery()
+        ensure_controller_execution_unpaused(self.config)
+        ensure_controller_kill_switch_inactive(kill_switch_path)
+        source_path = revalidate_single_job_plan(self.config, plan)
+        return self.process_job(
+            source_path,
+            single_job_plan=plan,
+            kill_switch_path=kill_switch_path,
+        )
+
+    def process_retry_job_plan(
+        self,
+        plan: Mapping[str, Any],
+        *,
+        kill_switch_path: Path,
+    ) -> dict[str, Any]:
+        ensure_controller_execution_unpaused(self.config)
+        validated = revalidate_retry_job_plan(self.config, self.conn, plan)
+        ensure_controller_kill_switch_inactive(kill_switch_path)
+        self.startup_recovery()
+        ensure_controller_execution_unpaused(self.config)
+        validated = revalidate_retry_job_plan(self.config, self.conn, plan)
+        ensure_controller_kill_switch_inactive(kill_switch_path)
+
+        job_id = int(validated["job_id"])
+        try:
+            row = db.get_job(self.conn, job_id)
+        except sqlite3.Error as exc:
+            raise RetryJobConflictError(
+                "retry-job row could not be read before execution"
+            ) from exc
+        if row is None:
+            raise RetryJobContractError("retry-job row disappeared before execution")
+        ensure_controller_execution_unpaused(self.config)
+        ensure_controller_kill_switch_inactive(kill_switch_path)
+        self._process_retryable_transcription_job(
+            row,
+            exact_claim=validated["claim_fence"],
+        )
+
+        try:
+            final_row = db.get_job(self.conn, job_id)
+        except sqlite3.Error as exc:
+            raise RetryJobConflictError(
+                "retry-job row could not be read after execution"
+            ) from exc
+        if final_row is None:
+            raise RetryJobContractError("retry-job row disappeared after execution")
+        status_map = {
+            STATUS_DONE: "completed",
+            STATUS_NEEDS_REVIEW: "needs_review",
+            STATUS_PENDING: "retry_pending",
+            STATUS_ERROR: "failed",
+        }
+        status = status_map.get(str(final_row["status"]))
+        if status is None:
+            raise RetryJobContractError(
+                f"retry-job ended in unsupported status: {final_row['status']}"
+            )
+        if status == "retry_pending" and not str(final_row["current_step"] or "").startswith(
+            "전사 재시도 대기 "
+        ):
+            raise RetryJobContractError(
+                "retry-job remained PENDING without exact retry ownership evidence"
+            )
+        return retry_job_result(
+            plan_sha256=str(plan["plan_sha256"]),
+            status=status,
+            job_id=job_id,
+        )
 
     def _retryable_transcription_rows(self) -> list[Any]:
         return self.conn.execute(
@@ -1536,7 +1734,12 @@ class STTPipeline:
             processed += 1
         return processed
 
-    def _process_retryable_transcription_job(self, row: Any) -> None:
+    def _process_retryable_transcription_job(
+        self,
+        row: Any,
+        *,
+        exact_claim: Mapping[str, Any] | None = None,
+    ) -> None:
         job_id = int(row["id"])
         canonical_base = str(row["canonical_base"])
         source_path = Path(str(row["orig_inbox_path"]))
@@ -1553,7 +1756,37 @@ class STTPipeline:
                 fail_step = "전사 재시도 입력 확인"
                 raise FileNotFoundError(f"Missing retry input audio: {canonical_audio}")
 
-            if not db.claim_job_for_processing(self.conn, job_id):
+            if exact_claim is None:
+                claimed = db.claim_job_for_processing(self.conn, job_id)
+            else:
+                try:
+                    claimed = db.claim_retry_job_for_processing(
+                        self.conn,
+                        job_id=job_id,
+                        expected_updated_at=str(exact_claim["updated_at"]),
+                        expected_current_step=str(exact_claim["current_step"]),
+                        expected_orig_name=str(exact_claim["orig_name"]),
+                        expected_canonical_base=str(exact_claim["canonical_base"]),
+                        expected_canonical_audio_path=str(
+                            exact_claim["canonical_audio_path"]
+                        ),
+                        expected_transcript_txt_path=str(
+                            exact_claim["transcript_txt_path"]
+                        ),
+                        expected_transcript_json_path=str(
+                            exact_claim["transcript_json_path"]
+                        ),
+                        expected_engine_params=str(exact_claim["engine_params"]),
+                    )
+                except sqlite3.Error as exc:
+                    raise RetryJobConflictError(
+                        "retry-job exact claim could not acquire ownership"
+                    ) from exc
+            if not claimed:
+                if exact_claim is not None:
+                    raise RetryJobConflictError(
+                        "retry-job exact claim fence changed before ownership"
+                    )
                 self._log(logging.WARNING, "retry job was not claimable", job_ctx)
                 return
 
@@ -1649,6 +1882,7 @@ class STTPipeline:
             retry_metadata = self._load_engine_params(row["engine_params"])
             if retry_metadata.get("transcription_failures") is not None:
                 metadata["transcription_failures_before_success"] = retry_metadata["transcription_failures"]
+            self._preserve_terminal_error_recovery_audit(metadata, retry_metadata)
             metadata["quality"] = quality_report.to_dict()
 
             fail_step = "산출물 저장/검증"
@@ -1722,6 +1956,8 @@ class STTPipeline:
             })
             self._log(logging.INFO, "retry done", job_ctx)
 
+        except RetryJobConflictError:
+            raise
         except Exception as exc:
             self._handle_job_failure(
                 exc=exc,
@@ -1799,6 +2035,71 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Always-on lecture STT worker")
     parser.add_argument("--once", action="store_true", help="Process at most one stable file")
     parser.add_argument("--watch-folder", dest="watch_folder", help="Override paths.watch_folder in runtime")
+    worker_plan_group = parser.add_mutually_exclusive_group()
+    worker_plan_group.add_argument(
+        "--plan-single-job",
+        metavar="RELATIVE_PATH",
+        help="Print a closed manifest for one direct child of the watch folder",
+    )
+    worker_plan_group.add_argument(
+        "--single-job-manifest",
+        metavar="PATH",
+        help="Execute exactly one previously planned single-job manifest",
+    )
+    worker_plan_group.add_argument(
+        "--plan-next-retry-job",
+        action="store_true",
+        help="Read-only controller selector for the next retry-job candidate",
+    )
+    worker_plan_group.add_argument(
+        "--plan-retry-job",
+        nargs="?",
+        const="auto",
+        metavar="JOB_ID",
+        help="Print a closed manifest for one exact retry row; omit JOB_ID only when unique",
+    )
+    worker_plan_group.add_argument(
+        "--retry-job-manifest",
+        metavar="PATH",
+        help="Execute exactly one previously planned retry-job manifest",
+    )
+    worker_plan_group.add_argument(
+        "--plan-terminal-error-recovery",
+        metavar="JOB_ID",
+        help="Print a closed manifest for one exact terminal transcription ERROR row",
+    )
+    worker_plan_group.add_argument(
+        "--terminal-error-recovery-manifest",
+        metavar="PATH",
+        help="Execute exactly one previously planned terminal-error-recovery manifest",
+    )
+    parser.add_argument(
+        "--enable-single-job",
+        action="store_true",
+        help="Explicitly enable the single-job execution path",
+    )
+    parser.add_argument(
+        "--allow-write",
+        action="store_true",
+        help="Allow the single-job worker to perform its normal file and DB writes",
+    )
+    parser.add_argument(
+        "--enable-retry-job",
+        action="store_true",
+        help="Explicitly enable the exact retry-job execution path",
+    )
+    parser.add_argument(
+        "--enable-terminal-error-recovery",
+        action="store_true",
+        help="Explicitly enable the exact terminal-error-recovery execution path",
+    )
+    parser.add_argument(
+        "--controller-kill-switch",
+        metavar="PATH",
+        help="Required fail-closed marker path for controller-owned single/retry execution",
+    )
+    parser.add_argument("--expected-count", type=int)
+    parser.add_argument("--expected-plan-sha256")
     control_group = parser.add_mutually_exclusive_group()
     control_group.add_argument("--pause", action="store_true", help="Pause scanning/processing")
     control_group.add_argument("--resume", action="store_true", help="Resume scanning/processing")
@@ -1817,6 +2118,23 @@ def main() -> None:
     load_dotenv(str(env_file()), override=False)
 
     if args.pause or args.resume or args.status:
+        if (
+            args.once
+            or args.plan_single_job
+            or args.single_job_manifest
+            or args.plan_retry_job is not None
+            or args.retry_job_manifest
+            or args.plan_terminal_error_recovery
+            or args.terminal_error_recovery_manifest
+            or args.enable_single_job
+            or args.enable_retry_job
+            or args.enable_terminal_error_recovery
+            or args.controller_kill_switch
+            or args.allow_write
+            or args.expected_count is not None
+            or args.expected_plan_sha256 is not None
+        ):
+            raise SystemExit("pause/resume/status cannot be combined with worker execution arguments")
         control_config = _normalize_config_paths(load_config(args.config))
         if args.pause:
             utils.set_paused(True, control_config)
@@ -1836,6 +2154,200 @@ def main() -> None:
     config = load_config(args.config)
     if args.watch_folder:
         config.setdefault("paths", {})["watch_folder"] = args.watch_folder
+
+    if args.plan_single_job:
+        if (
+            args.once
+            or args.plan_next_retry_job
+            or args.enable_single_job
+            or args.enable_retry_job
+            or args.enable_terminal_error_recovery
+            or args.controller_kill_switch
+            or args.allow_write
+            or args.expected_count is not None
+            or args.expected_plan_sha256 is not None
+        ):
+            raise SystemExit(
+                "--plan-single-job cannot be combined with execution-only arguments"
+            )
+        try:
+            config = validate_config(args.config, config, check_writable=False)
+            plan = build_single_job_plan(config, args.plan_single_job)
+        except (SingleJobContractError, OSError, ValueError) as exc:
+            print(f"Single-job plan rejected: {exc}", file=sys.stderr)
+            raise SystemExit(2) from exc
+        print(json.dumps(plan, ensure_ascii=False, sort_keys=True))
+        return
+
+    if args.plan_next_retry_job:
+        if (
+            args.once
+            or args.enable_single_job
+            or args.enable_retry_job
+            or args.enable_terminal_error_recovery
+            or args.controller_kill_switch
+            or args.allow_write
+            or args.expected_count is not None
+            or args.expected_plan_sha256 is not None
+        ):
+            raise SystemExit(
+                "--plan-next-retry-job cannot be combined with execution-only arguments"
+            )
+        try:
+            config = validate_config(args.config, config, check_writable=False)
+            plan = validate_next_retry_job_plan(build_next_retry_job_plan(config))
+        except (RetryJobContractError, OSError, ValueError) as exc:
+            print(f"Retry-job plan rejected: {exc}", file=sys.stderr)
+            raise SystemExit(2) from exc
+        print(json.dumps(plan, ensure_ascii=False, sort_keys=True))
+        return
+
+    if args.plan_retry_job is not None:
+        if (
+            args.once
+            or args.plan_next_retry_job
+            or args.enable_single_job
+            or args.enable_retry_job
+            or args.enable_terminal_error_recovery
+            or args.controller_kill_switch
+            or args.allow_write
+            or args.expected_count is not None
+            or args.expected_plan_sha256 is not None
+        ):
+            raise SystemExit(
+                "--plan-retry-job cannot be combined with execution-only arguments"
+            )
+        try:
+            retry_job_id = (
+                None
+                if args.plan_retry_job == "auto"
+                else int(args.plan_retry_job)
+            )
+            if retry_job_id is not None and retry_job_id <= 0:
+                raise ValueError("JOB_ID must be a positive integer")
+            config = validate_config(args.config, config, check_writable=False)
+            plan = build_retry_job_plan(config, job_id=retry_job_id)
+        except (RetryJobContractError, OSError, ValueError) as exc:
+            print(f"Retry-job plan rejected: {exc}", file=sys.stderr)
+            raise SystemExit(2) from exc
+        print(json.dumps(plan, ensure_ascii=False, sort_keys=True))
+        return
+
+    if args.plan_terminal_error_recovery is not None:
+        if (
+            args.once
+            or args.plan_next_retry_job
+            or args.enable_single_job
+            or args.enable_retry_job
+            or args.enable_terminal_error_recovery
+            or args.controller_kill_switch
+            or args.allow_write
+            or args.expected_count is not None
+            or args.expected_plan_sha256 is not None
+        ):
+            raise SystemExit(
+                "--plan-terminal-error-recovery cannot be combined with execution-only arguments"
+            )
+        try:
+            job_id = int(args.plan_terminal_error_recovery)
+            if job_id <= 0:
+                raise ValueError("JOB_ID must be a positive integer")
+            config = validate_config(args.config, config, check_writable=False)
+            plan = build_terminal_error_recovery_plan(config, job_id=job_id)
+        except (TerminalErrorRecoveryContractError, OSError, ValueError) as exc:
+            print(f"Terminal-error-recovery plan rejected: {exc}", file=sys.stderr)
+            raise SystemExit(2) from exc
+        print(json.dumps(plan, ensure_ascii=False, sort_keys=True))
+        return
+
+    single_job_plan: dict[str, Any] | None = None
+    retry_job_plan: dict[str, Any] | None = None
+    terminal_error_recovery_plan: dict[str, Any] | None = None
+    controller_kill_switch_path: Path | None = None
+    if args.single_job_manifest:
+        if args.once or args.enable_retry_job or args.enable_terminal_error_recovery:
+            raise SystemExit(
+                "--single-job-manifest cannot be combined with --once or other guarded worker modes"
+            )
+        try:
+            single_job_plan = load_single_job_plan(Path(args.single_job_manifest))
+            validate_apply_guards(
+                single_job_plan,
+                enabled=args.enable_single_job,
+                allow_write=args.allow_write,
+                expected_count=args.expected_count,
+                expected_plan_sha256=args.expected_plan_sha256,
+            )
+            controller_kill_switch_path = normalize_controller_kill_switch_path(
+                args.controller_kill_switch,
+                operation="controller single-job execution",
+            )
+            ensure_controller_kill_switch_inactive(controller_kill_switch_path)
+        except (ControllerGateError, SingleJobContractError) as exc:
+            print(f"Single-job execution rejected: {exc}", file=sys.stderr)
+            raise SystemExit(2) from exc
+    elif args.retry_job_manifest:
+        if args.once or args.enable_single_job or args.enable_terminal_error_recovery:
+            raise SystemExit(
+                "--retry-job-manifest cannot be combined with --once or other guarded worker modes"
+            )
+        try:
+            retry_job_plan = load_retry_job_plan(Path(args.retry_job_manifest))
+            validate_retry_apply_guards(
+                retry_job_plan,
+                enabled=args.enable_retry_job,
+                allow_write=args.allow_write,
+                expected_count=args.expected_count,
+                expected_plan_sha256=args.expected_plan_sha256,
+            )
+            controller_kill_switch_path = normalize_controller_kill_switch_path(
+                args.controller_kill_switch,
+                operation="controller retry execution",
+            )
+            ensure_controller_kill_switch_inactive(controller_kill_switch_path)
+        except (ControllerGateError, RetryJobContractError) as exc:
+            print(f"Retry-job execution rejected: {exc}", file=sys.stderr)
+            raise SystemExit(2) from exc
+    elif args.terminal_error_recovery_manifest:
+        if args.once or args.enable_single_job or args.enable_retry_job:
+            raise SystemExit(
+                "--terminal-error-recovery-manifest cannot be combined with --once or other guarded worker modes"
+            )
+        try:
+            terminal_error_recovery_plan = load_terminal_error_recovery_plan(
+                Path(args.terminal_error_recovery_manifest)
+            )
+            validate_terminal_error_recovery_apply_guards(
+                terminal_error_recovery_plan,
+                enabled=args.enable_terminal_error_recovery,
+                allow_write=args.allow_write,
+                expected_count=args.expected_count,
+                expected_plan_sha256=args.expected_plan_sha256,
+            )
+            controller_kill_switch_path = normalize_controller_kill_switch_path(
+                args.controller_kill_switch,
+                operation="controller terminal error recovery",
+            )
+            if not controller_kill_switch_is_active(controller_kill_switch_path):
+                raise ControllerGateError(
+                    "terminal-error-recovery execution requires an active controller kill switch"
+                )
+        except (ControllerGateError, TerminalErrorRecoveryContractError) as exc:
+            print(f"Terminal-error-recovery execution rejected: {exc}", file=sys.stderr)
+            raise SystemExit(2) from exc
+    elif (
+        args.enable_single_job
+        or args.enable_retry_job
+        or args.enable_terminal_error_recovery
+        or args.controller_kill_switch
+        or args.allow_write
+        or args.expected_count is not None
+        or args.expected_plan_sha256 is not None
+    ):
+        raise SystemExit(
+            "worker execution guards require a single-job, retry-job, or terminal-error-recovery manifest"
+        )
+
     config = validate_config(args.config, config)
     logging_cfg = config["logging"]
     logger = setup_logging(
@@ -1852,9 +2364,118 @@ def main() -> None:
             logger.info("Waiting for main worker lock at %s", lock_path)
         with SingleInstanceLock(lock_path, blocking=wait_for_lock):
             logger.info("Acquired main worker lock at %s", lock_path)
-            STTPipeline(config=config, logger=logger).run(run_once=args.once)
+            if controller_kill_switch_path is not None:
+                try:
+                    if terminal_error_recovery_plan is None:
+                        ensure_controller_execution_unpaused(config)
+                        ensure_controller_kill_switch_inactive(controller_kill_switch_path)
+                    elif not controller_kill_switch_is_active(controller_kill_switch_path):
+                        raise ControllerGateError(
+                            "terminal-error-recovery execution requires an active controller kill switch"
+                        )
+                except ControllerGateError as exc:
+                    if single_job_plan is not None:
+                        print(f"Single-job execution rejected: {exc}", file=sys.stderr)
+                    elif retry_job_plan is not None:
+                        print(f"Retry-job execution rejected: {exc}", file=sys.stderr)
+                    else:
+                        print(
+                            f"Terminal-error-recovery execution rejected: {exc}",
+                            file=sys.stderr,
+                        )
+                    raise SystemExit(2) from exc
+            pipeline = STTPipeline(config=config, logger=logger)
+            if single_job_plan is not None:
+                try:
+                    result = pipeline.process_single_job_plan(
+                        single_job_plan,
+                        kill_switch_path=controller_kill_switch_path,
+                    )
+                except (ControllerGateError, SingleJobContractError) as exc:
+                    print(f"Single-job execution rejected: {exc}", file=sys.stderr)
+                    raise SystemExit(2) from exc
+                print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+                if result["status"] == "retry_pending":
+                    raise SystemExit(75)
+                if result["status"] in {"failed", "skipped"}:
+                    raise SystemExit(2)
+                return
+            if retry_job_plan is not None:
+                assert controller_kill_switch_path is not None
+                try:
+                    result = pipeline.process_retry_job_plan(
+                        retry_job_plan,
+                        kill_switch_path=controller_kill_switch_path,
+                    )
+                except (ControllerGateError, RetryJobContractError) as exc:
+                    print(f"Retry-job execution rejected: {exc}", file=sys.stderr)
+                    raise SystemExit(2) from exc
+                print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+                if result["status"] == "retry_pending":
+                    raise SystemExit(75)
+                if result["status"] == "failed":
+                    raise SystemExit(2)
+                return
+            if terminal_error_recovery_plan is not None:
+                assert controller_kill_switch_path is not None
+                try:
+                    terminal_conn = db.connect_db(str(config["paths"]["db_path"]))
+                    try:
+                        result = apply_terminal_error_recovery_plan(
+                            config,
+                            terminal_conn,
+                            terminal_error_recovery_plan,
+                            kill_switch_path=controller_kill_switch_path,
+                        )
+                    finally:
+                        terminal_conn.close()
+                except (ControllerGateError, TerminalErrorRecoveryContractError) as exc:
+                    print(f"Terminal-error-recovery execution rejected: {exc}", file=sys.stderr)
+                    raise SystemExit(2) from exc
+                print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+                return
+            pipeline.run(run_once=args.once)
     except BlockingIOError:
         logger.warning("Another STT worker is already running; exiting (lock=%s)", lock_path)
+        if single_job_plan is not None:
+            print(
+                json.dumps(
+                    single_job_result(
+                        plan_sha256=str(single_job_plan["plan_sha256"]),
+                        status="busy",
+                        job_id=None,
+                    ),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            raise SystemExit(75)
+        if retry_job_plan is not None:
+            print(
+                json.dumps(
+                    retry_job_result(
+                        plan_sha256=str(retry_job_plan["plan_sha256"]),
+                        status="busy",
+                        job_id=int(retry_job_plan["retry_job"]["job_id"]),
+                    ),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            raise SystemExit(75)
+        if terminal_error_recovery_plan is not None:
+            print(
+                json.dumps(
+                    terminal_error_recovery_result(
+                        plan_sha256=str(terminal_error_recovery_plan["plan_sha256"]),
+                        status="busy",
+                        job_id=int(terminal_error_recovery_plan["error_job"]["job_id"]),
+                    ),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            raise SystemExit(75)
 
 
 if __name__ == "__main__":

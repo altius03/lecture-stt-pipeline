@@ -464,6 +464,7 @@ export default function App() {
         runtimeState={panelState.runtime_state}
         summary={panelState.summary}
         realtimeConnected={realtimeConnected}
+        currentScreenLabel={currentScreenItem.label}
         notification={panelState.notification}
         pendingNotificationSelection={pendingNotificationSelection}
         pendingNotificationApplyNow={pendingNotificationApplyNow}
@@ -477,16 +478,26 @@ export default function App() {
       {sharedError ? <ErrorBanner message={sharedError} /> : null}
 
       <section className="control-layout" aria-label="Lecture STT 운영 현황">
-        <DashboardScreenNav currentScreen={currentScreen} items={screenItems} />
-        <section className="dashboard-screen-shell" aria-label={`${currentScreenItem.label} 화면`}>
+        <aside aria-label="운영 화면 전환">
+          <DashboardScreenNav currentScreen={currentScreen} items={screenItems} />
+        </aside>
+        <section
+          className="dashboard-screen-shell"
+          aria-labelledby={`screen-shell-title-${currentScreen}`}
+          aria-describedby={`screen-shell-description-${currentScreen} screen-shell-status-${currentScreen}`}
+        >
           <header className="screen-shell-header">
             <p className="screen-shell-kicker">{currentScreenCopy.eyebrow}</p>
             <div className="screen-shell-title-row">
-              <h2>{currentScreenCopy.title}</h2>
+              <h2 id={`screen-shell-title-${currentScreen}`}>{currentScreenCopy.title}</h2>
               {currentScreenItem.badge ? <span className="screen-shell-badge">{currentScreenItem.badge}</span> : null}
             </div>
-            <p className="screen-shell-description">{currentScreenCopy.description}</p>
-            <p className="screen-shell-status">{screenStatus}</p>
+            <p id={`screen-shell-description-${currentScreen}`} className="screen-shell-description">
+              {currentScreenCopy.description}
+            </p>
+            <p id={`screen-shell-status-${currentScreen}`} className="screen-shell-status">
+              {screenStatus}
+            </p>
           </header>
           <div className="screen-shell-body">{renderCurrentScreen()}</div>
         </section>

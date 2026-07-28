@@ -171,4 +171,47 @@ describe("panelEvents", () => {
 
     unsubscribe()
   })
+
+  it("delivers controller-backed state events without treating them as fatal", () => {
+    const onEvent = vi.fn()
+    const onFatalError = vi.fn()
+
+    const unsubscribe = subscribePanelEvents({
+      onEvent,
+      onFatalError,
+    })
+
+    expect(FakeEventSource.instances).toHaveLength(1)
+
+    const source = FakeEventSource.instances[0]
+    source?.emit("open")
+    source?.emit(
+      "state",
+      JSON.stringify({
+        ...createPanelState(),
+        runtime_state: {
+          ...createPanelState().runtime_state,
+          source: "controller",
+          managed_running: false,
+          description: "controller 대기 중",
+        },
+      }),
+    )
+
+    expect(onFatalError).not.toHaveBeenCalled()
+    expect(onEvent).toHaveBeenCalledWith({
+      type: "state",
+      state: {
+        ...createPanelState(),
+        runtime_state: {
+          ...createPanelState().runtime_state,
+          source: "controller",
+          managed_running: false,
+          description: "controller 대기 중",
+        },
+      },
+    })
+
+    unsubscribe()
+  })
 })

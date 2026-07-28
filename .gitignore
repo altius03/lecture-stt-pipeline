@@ -28,10 +28,16 @@ models/
 
 # Local tooling / IDE / backups
 .claude/
+.codex/skills/
+.hallmark/
+.playwright-cli/
+**/.playwright-cli/
 .idea/
 *.bak*
+output/
 
 # Frontend dependencies/build artifacts
+node_modules/
 frontend/web-panel/node_modules/
 frontend/web-panel/dist/
 frontend/web-panel/*.tsbuildinfo

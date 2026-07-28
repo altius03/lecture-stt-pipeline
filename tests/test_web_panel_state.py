@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import sqlite3
+import stat
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -107,6 +111,35 @@ class WebPanelStateSnapshotTests(unittest.TestCase):
                 "clear_history",
             },
         )
+
+    def test_snapshot_controller_idle_with_kill_switch_is_stopped(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            marker = Path(temp_dir) / "controller.disabled"
+            state = self._make_state()
+            state.config_data = {
+                "app": {
+                    "execution_owner": "controller",
+                    "controller_label": "com.geonha.lecture-stt-controller",
+                    "controller_kill_switch": str(marker),
+                },
+                "notification": {
+                    "provider": "telegram",
+                    "enabled": True,
+                    "dual_send_providers": [],
+                },
+            }
+            state._is_managed_running = mock.Mock(return_value=False)
+            state._find_worker_pids = mock.Mock(return_value=[])
+            state._is_paused = mock.Mock(return_value=False)
+            state._controller_service_loaded = mock.Mock(return_value=True)
+            state._controller_kill_switch_active = mock.Mock(return_value=True)
+
+            snapshot = state.snapshot(include_log=False)
+
+            self.assertEqual(snapshot["runtime_state"]["status"], "stopped")
+            self.assertEqual(snapshot["runtime_state"]["source"], "controller")
+            self.assertEqual(snapshot["runtime"], "중지")
+            self.assertIn("kill-switch", snapshot["runtime_desc"])
 
     def test_update_notification_selection_writes_config(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1012,6 +1045,683 @@ class WebPanelStateSnapshotTests(unittest.TestCase):
                     status="rejected",
                     allow_write=True,
                 )
+
+
+class WebPanelControllerExecutionOwnerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._immutable_path_check = (
+            web_panel_state.ControlState._console_binary_path_is_immutable
+        )
+        self._immutable_path_patcher = mock.patch.object(
+            web_panel_state.ControlState,
+            "_console_binary_path_is_immutable",
+            return_value=True,
+        )
+        self._immutable_path_patcher.start()
+        self.addCleanup(self._immutable_path_patcher.stop)
+        self._console_runtime_patcher = mock.patch.object(
+            web_panel_state.ControlState,
+            "_console_runtime_supported",
+            return_value=True,
+        )
+        self._console_runtime_patcher.start()
+        self.addCleanup(self._console_runtime_patcher.stop)
+
+    def _write_config(
+        self,
+        root: Path,
+        *,
+        execution_owner: str = "python",
+        controller_label: str = "com.geonha.lecture-stt-controller",
+        controller_kill_switch: Path | None = None,
+        controller_runtime: str = "launchd",
+        controller_binary: Path | None = None,
+        controller_binary_sha256: str | None = None,
+        controller_state_dir: Path | None = None,
+        controller_pid_path: Path | None = None,
+        controller_stdout_path: Path | None = None,
+        controller_stderr_path: Path | None = None,
+    ) -> None:
+        config_dir = root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        app_lines: list[str] = []
+        if execution_owner == "controller":
+            marker = controller_kill_switch or (root / "state" / "controller.disabled")
+            app_lines = [
+                "app:\n",
+                f"  execution_owner: {execution_owner}\n",
+                f"  controller_label: {controller_label}\n",
+                f"  controller_kill_switch: {marker}\n",
+                f"  controller_runtime: {controller_runtime}\n",
+            ]
+            if controller_binary is not None:
+                app_lines.append(f"  controller_binary: {controller_binary}\n")
+            if controller_binary_sha256 is not None:
+                app_lines.append(
+                    f"  controller_binary_sha256: {controller_binary_sha256}\n"
+                )
+            if controller_state_dir is not None:
+                app_lines.append(f"  controller_state_dir: {controller_state_dir}\n")
+            if controller_pid_path is not None:
+                app_lines.append(f"  controller_pid_path: {controller_pid_path}\n")
+            if controller_stdout_path is not None:
+                app_lines.append(f"  controller_stdout_path: {controller_stdout_path}\n")
+            if controller_stderr_path is not None:
+                app_lines.append(f"  controller_stderr_path: {controller_stderr_path}\n")
+        (config_dir / "config.yaml").write_text(
+            "".join(
+                [
+                    "paths:\n",
+                    "  db_path: state/jobs.sqlite3\n",
+                    "logging:\n",
+                    "  file: logs/app.log\n",
+                    *app_lines,
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def _completed_process(
+        cmd: list[str],
+        *,
+        returncode: int = 0,
+        stdout: str = "",
+        stderr: str = "",
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(cmd, returncode, stdout=stdout, stderr=stderr)
+
+    def test_controller_start_uses_launchctl_and_never_spawns_python(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            marker = root / "state" / "controller.disabled"
+            self._write_config(
+                root,
+                execution_owner="controller",
+                controller_kill_switch=marker,
+            )
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text("", encoding="utf-8")
+            marker.chmod(0o600)
+            paused = root / "state" / "paused"
+            paused.write_text("", encoding="utf-8")
+            state = web_panel_state.ControlState(repo_root=root)
+            state._set_poll_boost = mock.Mock()
+
+            def fake_run(cmd, **kwargs):
+                if cmd[:2] == ["launchctl", "print"]:
+                    return self._completed_process(cmd, stdout="loaded")
+                if cmd[:2] == ["launchctl", "kickstart"]:
+                    return self._completed_process(cmd)
+                raise AssertionError(cmd)
+
+            with mock.patch.object(web_panel_state.subprocess, "run", side_effect=fake_run) as run_mock:
+                with mock.patch.object(web_panel_state.subprocess, "Popen") as popen_mock:
+                    state.start()
+
+            popen_mock.assert_not_called()
+            self.assertFalse(marker.exists())
+            self.assertFalse(paused.exists())
+            self.assertIn("재개", state.notice)
+            self.assertEqual(run_mock.call_args_list[0].args[0][:2], ["launchctl", "print"])
+            self.assertEqual(run_mock.call_args_list[1].args[0][:3], ["launchctl", "kickstart", "-k"])
+
+    def test_controller_start_fails_closed_when_service_not_loaded(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            marker = root / "state" / "controller.disabled"
+            self._write_config(
+                root,
+                execution_owner="controller",
+                controller_kill_switch=marker,
+            )
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text("", encoding="utf-8")
+            state = web_panel_state.ControlState(repo_root=root)
+
+            with mock.patch.object(
+                web_panel_state.subprocess,
+                "run",
+                return_value=self._completed_process(
+                    ["launchctl", "print"],
+                    returncode=113,
+                    stderr="not loaded",
+                ),
+            ) as run_mock:
+                with mock.patch.object(web_panel_state.subprocess, "Popen") as popen_mock:
+                    state.start()
+
+            popen_mock.assert_not_called()
+            self.assertTrue(marker.exists())
+            self.assertIn("load되지 않아", state.notice)
+            run_mock.assert_called_once()
+
+    def test_controller_start_rejects_invalid_kill_switch_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            marker = root / "state" / "controller.disabled"
+            self._write_config(
+                root,
+                execution_owner="controller",
+                controller_kill_switch=marker,
+            )
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            target = marker.parent / "marker-target"
+            target.write_text("x", encoding="utf-8")
+            marker.symlink_to(target)
+            state = web_panel_state.ControlState(repo_root=root)
+
+            def fake_run(cmd, **kwargs):
+                if cmd[:2] == ["launchctl", "print"]:
+                    return self._completed_process(cmd, stdout="loaded")
+                if cmd[:2] == ["launchctl", "kickstart"]:
+                    return self._completed_process(cmd)
+                raise AssertionError(cmd)
+
+            with mock.patch.object(
+                web_panel_state.subprocess,
+                "run",
+                side_effect=fake_run,
+            ) as run_mock:
+                state.start()
+
+            self.assertIn("상태가 올바르지 않습니다", state.notice)
+            self.assertEqual(len(run_mock.call_args_list), 1)
+            self.assertTrue(marker.is_symlink())
+
+    def test_controller_stop_creates_kill_switch_and_uses_launchctl_kill(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            marker = root / "state" / "controller.disabled"
+            self._write_config(
+                root,
+                execution_owner="controller",
+                controller_kill_switch=marker,
+            )
+            state = web_panel_state.ControlState(repo_root=root)
+            marker.parent.chmod(0o700)
+            state._set_poll_boost = mock.Mock()
+
+            with mock.patch.object(
+                web_panel_state.subprocess,
+                "run",
+                return_value=self._completed_process(["launchctl", "kill"]),
+            ) as run_mock:
+                state.stop()
+
+            run_mock.assert_called_once()
+            self.assertTrue(marker.exists())
+            self.assertTrue(marker.is_file())
+            self.assertIn("중지 요청", state.notice)
+            self.assertEqual(run_mock.call_args.args[0][:3], ["launchctl", "kill", "SIGTERM"])
+
+    def test_controller_stop_reports_launchctl_failure_and_keeps_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            marker = root / "state" / "controller.disabled"
+            self._write_config(
+                root,
+                execution_owner="controller",
+                controller_kill_switch=marker,
+            )
+            state = web_panel_state.ControlState(repo_root=root)
+            marker.parent.chmod(0o700)
+            state._set_poll_boost = mock.Mock()
+
+            with mock.patch.object(
+                web_panel_state.subprocess,
+                "run",
+                return_value=self._completed_process(
+                    ["launchctl", "kill"],
+                    returncode=1,
+                    stderr="permission denied",
+                ),
+            ):
+                state.stop()
+
+            self.assertTrue(marker.exists())
+            self.assertNotIn("permission denied", state.notice)
+            self.assertIn("서비스 제어 명령이 실패", state.notice)
+            self.assertIn("중지 실패", state.notice)
+
+    def _console_fixture(self, root: Path) -> tuple[Path, Path, Path, Path, Path]:
+        state_dir = root / "controller-state"
+        state_dir.mkdir(mode=0o700)
+        binary_payload = b"controller"
+        binary_sha256 = hashlib.sha256(binary_payload).hexdigest()
+        versions = root / "versions"
+        versions.mkdir(mode=0o700)
+        version_dir = versions / binary_sha256
+        version_dir.mkdir(mode=0o700)
+        binary = version_dir / "lecture-stt-controller"
+        binary.write_bytes(binary_payload)
+        binary.chmod(0o500)
+        version_dir.chmod(0o500)
+        versions.chmod(0o500)
+        logs = root / "logs"
+        logs.mkdir(mode=0o700)
+        marker = state_dir / "controller.disabled"
+        pid_path = root / "controller.pid"
+        stdout_path = logs / "controller.out.jsonl"
+        stderr_path = logs / "controller.err.log"
+        self._write_config(
+            root,
+            execution_owner="controller",
+            controller_kill_switch=marker,
+            controller_runtime="console",
+            controller_binary=binary,
+            controller_binary_sha256=binary_sha256,
+            controller_state_dir=state_dir,
+            controller_pid_path=pid_path,
+            controller_stdout_path=stdout_path,
+            controller_stderr_path=stderr_path,
+        )
+        return binary, state_dir, marker, stdout_path, stderr_path
+
+    @staticmethod
+    def _console_pid_payload(
+        pid: int,
+        *,
+        tv_sec: int = 1_753_684_496,
+        tv_usec: int = 123_456,
+    ) -> str:
+        return (
+            json.dumps(
+                {
+                    "schema_version": web_panel_state.CONTROLLER_PID_SCHEMA,
+                    "pid": pid,
+                    "process_birth": {
+                        "tv_sec": tv_sec,
+                        "tv_usec": tv_usec,
+                    },
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n"
+        )
+
+    def test_console_controller_start_spawns_exact_guarded_command_without_launchctl(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            binary, state_dir, marker, _, _ = self._console_fixture(root)
+            marker.write_text("", encoding="utf-8")
+            marker.chmod(0o600)
+            state = web_panel_state.ControlState(repo_root=root)
+            state._set_poll_boost = mock.Mock()
+            proc = mock.Mock()
+            proc.pid = 4242
+            proc.poll.return_value = None
+
+            with mock.patch.object(
+                web_panel_state.subprocess,
+                "Popen",
+                return_value=proc,
+            ) as popen_mock:
+                with mock.patch.object(
+                    state,
+                    "_console_controller_process_identity",
+                    return_value=(1_753_684_496, 123_456, 4242),
+                ):
+                    with mock.patch.object(
+                        state,
+                        "_console_controller_process_matches",
+                        return_value=True,
+                    ):
+                        with mock.patch.object(
+                            web_panel_state.subprocess,
+                            "run",
+                            side_effect=AssertionError("launchctl/ps must not run"),
+                        ):
+                            state.start()
+
+            command = popen_mock.call_args.args[0]
+            self.assertEqual(command[0], str(binary))
+            self.assertIn("--enable-execution", command)
+            self.assertIn("--allow-write", command)
+            self.assertEqual(command[command.index("--max-fresh-jobs") + 1], "1")
+            self.assertTrue(popen_mock.call_args.kwargs["start_new_session"])
+            self.assertFalse(marker.exists())
+            self.assertEqual(
+                (root / "controller.pid").read_text(),
+                self._console_pid_payload(4242),
+            )
+            self.assertEqual((root / "controller.pid").stat().st_mode & 0o777, 0o600)
+            self.assertIn("시작", state.notice)
+
+    def test_console_controller_start_rejects_exact_sha256_mismatch_without_spawning(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            binary, _, _, _, _ = self._console_fixture(root)
+            expected_sha256 = "a" * 64
+            versions = binary.parent.parent
+            versions.chmod(0o700)
+            mismatch_dir = versions / expected_sha256
+            mismatch_dir.mkdir(mode=0o700)
+            binary = mismatch_dir / "lecture-stt-controller"
+            binary.write_bytes(b"controller")
+            binary.chmod(0o500)
+            mismatch_dir.chmod(0o500)
+            versions.chmod(0o500)
+
+            mismatch_yaml = (
+                "paths:\n"
+                "  db_path: state/jobs.sqlite3\n"
+                "logging:\n"
+                "  file: logs/app.log\n"
+                "app:\n"
+                "  execution_owner: controller\n"
+                "  controller_label: com.geonha.lecture-stt-controller\n"
+                f"  controller_binary: {binary}\n"
+                f"  controller_binary_sha256: {expected_sha256}\n"
+                f"  controller_kill_switch: {root / 'controller-state' / 'controller.disabled'}\n"
+                "  controller_runtime: console\n"
+                f"  controller_state_dir: {root / 'controller-state'}\n"
+                f"  controller_pid_path: {root / 'controller.pid'}\n"
+                f"  controller_stdout_path: {root / 'logs' / 'controller.out.jsonl'}\n"
+                f"  controller_stderr_path: {root / 'logs' / 'controller.err.log'}\n"
+            )
+            (root / "config" / "config.yaml").write_text(mismatch_yaml, encoding="utf-8")
+            state = web_panel_state.ControlState(repo_root=root)
+            state._set_poll_boost = mock.Mock()
+
+            with mock.patch.object(web_panel_state.subprocess, "Popen") as popen_mock:
+                state.start()
+
+            popen_mock.assert_not_called()
+            self.assertIn("시작 실패", state.notice)
+            self.assertIn("SHA-256", state.notice)
+            self.assertFalse((root / "controller.pid").exists())
+
+    def test_console_controller_start_rejects_invalid_pid_file_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            binary, _, marker, _, _ = self._console_fixture(root)
+            pid_path = root / "controller.pid"
+            pid_path.write_text("invalid-pid", encoding="ascii")
+            pid_path.chmod(0o600)
+            state = web_panel_state.ControlState(repo_root=root)
+            state._set_poll_boost = mock.Mock()
+
+            with mock.patch.object(web_panel_state.subprocess, "Popen") as popen_mock:
+                state.start()
+
+            popen_mock.assert_not_called()
+            self.assertIn("시작 실패", state.notice)
+            self.assertIn("PID file", state.notice)
+            self.assertEqual(pid_path.read_text(), "invalid-pid")
+
+    def test_console_controller_rejects_pid_payload_schema_tamper_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self._console_fixture(root)
+            pid_path = root / "controller.pid"
+            tampered = json.loads(self._console_pid_payload(4242))
+            tampered["unexpected"] = "field"
+            pid_path.write_text(
+                json.dumps(tampered, separators=(",", ":"), sort_keys=True) + "\n",
+                encoding="ascii",
+            )
+            pid_path.chmod(0o600)
+            state = web_panel_state.ControlState(repo_root=root)
+            state._set_poll_boost = mock.Mock()
+
+            with mock.patch.object(web_panel_state.subprocess, "Popen") as popen_mock:
+                state.start()
+
+            popen_mock.assert_not_called()
+            self.assertIn("시작 실패", state.notice)
+            self.assertIn("PID file", state.notice)
+            self.assertTrue(pid_path.exists())
+
+    def test_console_controller_stale_pid_file_is_removed_before_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            binary, _, marker, _, _ = self._console_fixture(root)
+            marker.write_text("", encoding="utf-8")
+            marker.chmod(0o600)
+            pid_path = root / "controller.pid"
+            pid_path.write_text(self._console_pid_payload(9999), encoding="ascii")
+            pid_path.chmod(0o600)
+            state = web_panel_state.ControlState(repo_root=root)
+            proc = mock.Mock()
+            proc.pid = 4242
+            proc.poll.return_value = None
+            state._set_poll_boost = mock.Mock()
+
+            with mock.patch.object(
+                web_panel_state.subprocess,
+                "Popen",
+                return_value=proc,
+            ) as popen_mock:
+                with mock.patch.object(
+                    state,
+                    "_console_controller_process_matches",
+                    side_effect=[False, False, True],
+                ):
+                    with mock.patch.object(
+                        state,
+                        "_console_controller_process_identity",
+                        return_value=(1_753_684_496, 654_321, 4242),
+                    ):
+                        state.start()
+
+            popen_mock.assert_called_once()
+            self.assertEqual(
+                pid_path.read_text(),
+                self._console_pid_payload(4242, tv_usec=654_321),
+            )
+            self.assertEqual(pid_path.stat().st_mode & 0o777, 0o600)
+            self.assertFalse(marker.exists())
+            self.assertIn("시작", state.notice)
+            self.assertEqual(popen_mock.call_args.args[0][0], str(binary))
+
+    def test_console_controller_stop_fails_if_process_group_breaks_fencing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            _, state_dir, marker, _, _ = self._console_fixture(root)
+            pid_path = root / "controller.pid"
+            pid_path.write_text(self._console_pid_payload(4242), encoding="ascii")
+            pid_path.chmod(0o600)
+            state = web_panel_state.ControlState(repo_root=root)
+            state._set_poll_boost = mock.Mock()
+
+            with mock.patch.object(
+                web_panel_state.os,
+                "getpgid",
+                return_value=9999,
+            ):
+                with mock.patch.object(
+                    state,
+                    "_console_controller_process_matches",
+                    return_value=True,
+                ):
+                    with mock.patch.object(web_panel_state.os, "killpg") as killpg_mock:
+                        with mock.patch.object(
+                            web_panel_state.subprocess,
+                            "run",
+                            side_effect=AssertionError("launchctl must not run"),
+                        ):
+                            state.stop()
+
+            self.assertIn("중지 실패", state.notice)
+            self.assertIn("process group", state.notice)
+            self.assertTrue(marker.exists())
+            self.assertTrue(pid_path.exists())
+            killpg_mock.assert_not_called()
+
+    def test_console_controller_stop_fences_identity_and_signals_process_group(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            _, state_dir, marker, _, _ = self._console_fixture(root)
+            pid_path = root / "controller.pid"
+            pid_path.write_text(self._console_pid_payload(4242), encoding="ascii")
+            pid_path.chmod(0o600)
+            state = web_panel_state.ControlState(repo_root=root)
+            state._set_poll_boost = mock.Mock()
+
+            with mock.patch.object(
+                state,
+                "_console_controller_process_matches",
+                return_value=True,
+            ):
+                with mock.patch.object(
+                    state,
+                    "_console_process_stopped",
+                    return_value=True,
+                ):
+                    with mock.patch.object(web_panel_state.os, "getpgid", return_value=4242):
+                        with mock.patch.object(web_panel_state.os, "killpg") as killpg_mock:
+                            with mock.patch.object(
+                                web_panel_state.subprocess,
+                                "run",
+                                side_effect=AssertionError("launchctl must not run"),
+                            ):
+                                state.stop()
+
+            killpg_mock.assert_called_once_with(4242, web_panel_state.signal.SIGTERM)
+            self.assertTrue(marker.exists())
+            self.assertFalse(pid_path.exists())
+            self.assertIn("완료", state.notice)
+
+    def test_console_controller_rejects_symlink_binary_and_pid_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            binary, state_dir, marker, _, _ = self._console_fixture(root)
+            target = root / "real-controller"
+            target.write_bytes(b"controller")
+            target.chmod(0o500)
+            binary.parent.parent.chmod(0o700)
+            binary.parent.chmod(0o700)
+            binary.unlink()
+            binary.symlink_to(target)
+            binary.parent.chmod(0o500)
+            binary.parent.parent.chmod(0o500)
+            state = web_panel_state.ControlState(repo_root=root)
+            with mock.patch.object(web_panel_state.subprocess, "Popen") as popen_mock:
+                state.start()
+            popen_mock.assert_not_called()
+            self.assertIn("binary 상태", state.notice)
+
+            binary.parent.parent.chmod(0o700)
+            binary.parent.chmod(0o700)
+            binary.unlink()
+            binary.write_bytes(b"controller")
+            binary.chmod(0o500)
+            binary.parent.chmod(0o500)
+            binary.parent.parent.chmod(0o500)
+            pid_target = state_dir / "pid-target"
+            pid_target.write_text(self._console_pid_payload(4242), encoding="ascii")
+            pid_target.chmod(0o600)
+            (root / "controller.pid").symlink_to(pid_target)
+            state.stop()
+            self.assertTrue(marker.exists())
+            self.assertIn("중지 실패", state.notice)
+
+    def test_console_controller_rejects_pid_reuse_with_different_birth_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self._console_fixture(root)
+            pid_path = root / "controller.pid"
+            pid_path.write_text(self._console_pid_payload(4242), encoding="ascii")
+            pid_path.chmod(0o600)
+            state = web_panel_state.ControlState(repo_root=root)
+            settings = state._console_controller_settings()
+
+            with mock.patch.object(web_panel_state.os, "kill", return_value=None):
+                with mock.patch.object(
+                    state,
+                    "_console_controller_process_identity",
+                    return_value=(1_753_684_496, 654_321, 4242),
+                ):
+                    self.assertIsNone(state._console_controller_pid(settings))
+
+    def test_console_controller_rejects_adoption_when_process_is_not_group_leader(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self._console_fixture(root)
+            pid_path = root / "controller.pid"
+            pid_path.write_text(self._console_pid_payload(4242), encoding="ascii")
+            pid_path.chmod(0o600)
+            state = web_panel_state.ControlState(repo_root=root)
+            settings = state._console_controller_settings()
+
+            with mock.patch.object(web_panel_state.os, "kill", return_value=None):
+                with mock.patch.object(
+                    state,
+                    "_console_controller_process_identity",
+                    return_value=(1_753_684_496, 123_456, 9999),
+                ):
+                    self.assertIsNone(state._console_controller_pid(settings))
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin proc_pidinfo contract")
+    def test_console_controller_reads_kernel_birth_and_process_group_identity(self) -> None:
+        identity = self._immutable_process_identity_for_current_test()
+        self.assertIsNotNone(identity)
+        assert identity is not None
+        tv_sec, tv_usec, pgid = identity
+        self.assertGreater(tv_sec, 0)
+        self.assertGreaterEqual(tv_usec, 0)
+        self.assertLess(tv_usec, 1_000_000)
+        self.assertEqual(pgid, os.getpgid(os.getpid()))
+
+    @staticmethod
+    def _immutable_process_identity_for_current_test() -> tuple[int, int, int] | None:
+        return web_panel_state.ControlState._console_controller_process_identity(
+            os.getpid()
+        )
+
+    def test_console_controller_rejects_writable_binary_version_store(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            binary, _, _, _, _ = self._console_fixture(root)
+            binary.parent.chmod(0o700)
+            state = web_panel_state.ControlState(repo_root=root)
+            state._set_poll_boost = mock.Mock()
+
+            with mock.patch.object(web_panel_state.subprocess, "Popen") as popen_mock:
+                state.start()
+
+            popen_mock.assert_not_called()
+            self.assertIn("시작 실패", state.notice)
+            self.assertIn("version directory", state.notice)
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin immutable flag contract")
+    def test_console_controller_darwin_immutable_flag_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "controller"
+            path.write_bytes(b"controller")
+            path.chmod(0o500)
+            self.assertFalse(self._immutable_path_check(path.lstat()))
+            os.chflags(path, stat.UF_IMMUTABLE)
+            try:
+                self.assertTrue(self._immutable_path_check(path.lstat()))
+                with self.assertRaises(PermissionError):
+                    path.write_bytes(b"replacement")
+            finally:
+                os.chflags(path, 0)
+
+    def test_legacy_start_still_uses_python_worker_popen(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self._write_config(root)
+            state = web_panel_state.ControlState(repo_root=root)
+            state._find_worker_pids = mock.Mock(return_value=[])
+            state._set_poll_boost = mock.Mock()
+            proc = mock.Mock()
+            proc.poll.return_value = None
+
+            with mock.patch.object(web_panel_state, "package_env", return_value={"TEST_ENV": "1"}):
+                with mock.patch.object(
+                    web_panel_state.subprocess,
+                    "Popen",
+                    return_value=proc,
+                ) as popen_mock:
+                    state.start()
+
+            popen_mock.assert_called_once()
+            self.assertIn("lecture_stt.stt.main", " ".join(popen_mock.call_args.args[0]))
+            self.assertIn("실행중", state.notice)
 
     def test_restart_worker_for_notification_restarts_and_clears_flag(self) -> None:
         state = object.__new__(web_panel_state.ControlState)
