@@ -23,6 +23,8 @@ from lecture_stt.downstream.worker import (  # noqa: E402
     load_worker_config,
 )
 
+CANONICAL_TEMP_ROOT = "/private/tmp" if sys.platform == "darwin" else tempfile.gettempdir()
+
 
 class DownstreamWorkerReportingTests(unittest.TestCase):
     def _config(self, root: Path, *, log_routine_scan_events: bool) -> DownstreamConfig:
@@ -79,7 +81,7 @@ class DownstreamWorkerReportingTests(unittest.TestCase):
             def close(self) -> None:
                 pass
 
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as tmp:
+        with tempfile.TemporaryDirectory(dir=CANONICAL_TEMP_ROOT) as tmp:
             config = self._config(Path(tmp), log_routine_scan_events=False)
             logger = mock.Mock()
             with (
@@ -102,7 +104,7 @@ class DownstreamWorkerReportingTests(unittest.TestCase):
             def close(self) -> None:
                 pass
 
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as tmp:
+        with tempfile.TemporaryDirectory(dir=CANONICAL_TEMP_ROOT) as tmp:
             config = self._config(Path(tmp), log_routine_scan_events=True)
             logger = mock.Mock()
             with (
@@ -134,21 +136,21 @@ class DownstreamWorkerConfigTests(unittest.TestCase):
         return config_path
 
     def test_numeric_zero_stats_heartbeat_scans_is_rejected(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as tmp:
+        with tempfile.TemporaryDirectory(dir=CANONICAL_TEMP_ROOT) as tmp:
             config_path = self._write_config(Path(tmp), override_line="stats_heartbeat_scans: 0")
 
             with self.assertRaisesRegex(ValueError, "downstream.stats_heartbeat_scans"):
                 load_worker_config(str(config_path))
 
     def test_numeric_zero_log_suppression_max_keys_is_rejected(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as tmp:
+        with tempfile.TemporaryDirectory(dir=CANONICAL_TEMP_ROOT) as tmp:
             config_path = self._write_config(Path(tmp), override_line="log_suppression_max_keys: 0")
 
             with self.assertRaisesRegex(ValueError, "downstream.log_suppression_max_keys"):
                 load_worker_config(str(config_path))
 
     def test_log_routine_scan_events_accepts_boolean_string_false(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as tmp:
+        with tempfile.TemporaryDirectory(dir=CANONICAL_TEMP_ROOT) as tmp:
             config_path = self._write_config(Path(tmp), override_line='log_routine_scan_events: "false"')
 
             config = load_worker_config(str(config_path))
@@ -156,14 +158,14 @@ class DownstreamWorkerConfigTests(unittest.TestCase):
         self.assertFalse(config.log_routine_scan_events)
 
     def test_log_routine_scan_events_rejects_invalid_boolean_string(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as tmp:
+        with tempfile.TemporaryDirectory(dir=CANONICAL_TEMP_ROOT) as tmp:
             config_path = self._write_config(Path(tmp), override_line="log_routine_scan_events: maybe")
 
             with self.assertRaisesRegex(ValueError, "downstream.log_routine_scan_events"):
                 load_worker_config(str(config_path))
 
     def test_default_downstream_jsonl_rotation_matches_retention_policy(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as tmp:
+        with tempfile.TemporaryDirectory(dir=CANONICAL_TEMP_ROOT) as tmp:
             config_path = self._write_config(Path(tmp), override_line="log_routine_scan_events: false")
 
             config = load_worker_config(str(config_path))
@@ -258,7 +260,7 @@ class TranscriptWorkerConfigTests(unittest.TestCase):
         return config_path
 
     def test_enabled_false_does_not_require_active_snapshot(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as tmp:
+        with tempfile.TemporaryDirectory(dir=CANONICAL_TEMP_ROOT) as tmp:
             root = Path(tmp)
             config_path = self._write_transcript_config(
                 root,
@@ -271,7 +273,7 @@ class TranscriptWorkerConfigTests(unittest.TestCase):
         self.assertFalse(config.enabled)
 
     def test_enabled_true_rejects_missing_active_snapshot(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as tmp:
+        with tempfile.TemporaryDirectory(dir=CANONICAL_TEMP_ROOT) as tmp:
             root = Path(tmp)
             config_path = self._write_transcript_config(
                 root,
@@ -286,7 +288,7 @@ class TranscriptWorkerConfigTests(unittest.TestCase):
                 load_transcript_worker_config(str(config_path))
 
     def test_enabled_true_requires_positive_integer_interval_and_batch(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as tmp:
+        with tempfile.TemporaryDirectory(dir=CANONICAL_TEMP_ROOT) as tmp:
             root = Path(tmp)
             active_path = self._active_snapshot(root)
             config_path = self._write_transcript_config(
@@ -316,7 +318,7 @@ class TranscriptWorkerConfigTests(unittest.TestCase):
                 load_transcript_worker_config(str(config_path))
 
     def test_dry_run_plans_reconciliation_without_mutating_db_or_files(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as tmp:
+        with tempfile.TemporaryDirectory(dir=CANONICAL_TEMP_ROOT) as tmp:
             root = Path(tmp)
             active_path = self._active_snapshot(root)
             source_txt = root / "source.txt"

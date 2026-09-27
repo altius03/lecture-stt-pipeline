@@ -36,11 +36,13 @@ from lecture_stt.storage_v2.timetable import (  # noqa: E402
     plan_timetable_import,
 )
 
+CANONICAL_TEMP_ROOT = "/private/tmp" if sys.platform == "darwin" else tempfile.gettempdir()
+
 
 class TranscriptPostprocessTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(
-            tempfile.mkdtemp(prefix="transcript-postprocess-", dir="/private/tmp")
+            tempfile.mkdtemp(prefix="transcript-postprocess-", dir=CANONICAL_TEMP_ROOT)
         )
         self.addCleanup(shutil.rmtree, self.root, True)
         self.db_path = self.root / "jobs.sqlite3"
@@ -867,6 +869,8 @@ class TranscriptPostprocessTests(unittest.TestCase):
             )
 
     def test_descendant_path_accepts_equivalent_macos_root_alias(self) -> None:
+        if sys.platform != "darwin":
+            self.skipTest("macOS /tmp alias is unavailable")
         canonical_root = self.root / "alias-root"
         (canonical_root / "2026-1" / "cs201").mkdir(parents=True)
         alias_root = Path(str(canonical_root).replace("/private/tmp/", "/tmp/", 1))

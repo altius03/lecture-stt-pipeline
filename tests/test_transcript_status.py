@@ -18,10 +18,12 @@ if str(SRC_ROOT) not in sys.path:
 from lecture_stt.downstream import transcript_status
 from lecture_stt.shared import db as shared_db
 
+CANONICAL_TEMP_ROOT = "/private/tmp" if sys.platform == "darwin" else tempfile.gettempdir()
+
 
 class TranscriptStatusCliTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.tmpdir = tempfile.TemporaryDirectory(dir="/private/tmp")
+        self.tmpdir = tempfile.TemporaryDirectory(dir=CANONICAL_TEMP_ROOT)
         self.root = Path(self.tmpdir.name)
 
         self.db_path = self.root / "jobs.sqlite3"

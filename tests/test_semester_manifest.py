@@ -24,10 +24,14 @@ from lecture_stt.downstream.semester import (  # noqa: E402
 from lecture_stt.storage_v2.timetable import apply_timetable_import, plan_timetable_import  # noqa: E402
 from lecture_stt.shared import db as shared_db  # noqa: E402
 
+CANONICAL_TEMP_ROOT = "/private/tmp" if sys.platform == "darwin" else tempfile.gettempdir()
+
 
 class SemesterManifestTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.root = Path(tempfile.mkdtemp(prefix="semester-manifest-", dir="/private/tmp"))
+        self.root = Path(
+            tempfile.mkdtemp(prefix="semester-manifest-", dir=CANONICAL_TEMP_ROOT)
+        )
         self.vault_root = self.root / "vault"
         (self.vault_root / ".obsidian").mkdir(parents=True)
         self.semester_root = self.vault_root / "01_current"

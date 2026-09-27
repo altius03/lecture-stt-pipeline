@@ -23,6 +23,8 @@ from lecture_stt.storage_v2.timetable import (  # noqa: E402
     plan_timetable_import,
 )
 
+CANONICAL_TEMP_ROOT = "/private/tmp" if sys.platform == "darwin" else tempfile.gettempdir()
+
 
 class SttMainControlCommandTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -87,7 +89,7 @@ class SttMainControlCommandTests(unittest.TestCase):
 
 class SttConfigValidationTests(unittest.TestCase):
     def test_enabled_delivery_rejects_active_manifest_under_symlinked_parent(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as tmp:
+        with tempfile.TemporaryDirectory(dir=CANONICAL_TEMP_ROOT) as tmp:
             root = Path(tmp)
             watch = root / "watch"
             watch.mkdir()
@@ -254,7 +256,7 @@ class SttPipelineBehaviorTests(unittest.TestCase):
     def setUp(self) -> None:
         # Use the canonical macOS temp root so path-safety tests do not pass
         # through the system /var -> /private/var alias.
-        self.tmpdir = tempfile.TemporaryDirectory(dir="/private/tmp")
+        self.tmpdir = tempfile.TemporaryDirectory(dir=CANONICAL_TEMP_ROOT)
         self.root = Path(self.tmpdir.name)
         self.watch_dir = self.root / "watch"
         self.audio_dir = self.root / "audio"

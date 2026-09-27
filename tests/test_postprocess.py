@@ -24,10 +24,14 @@ from lecture_stt.downstream.postprocess import (  # noqa: E402
     generate_summary,
 )
 
+CANONICAL_TEMP_ROOT = "/private/tmp" if sys.platform == "darwin" else tempfile.gettempdir()
+
 
 class CodexPostprocessTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.root = Path(tempfile.mkdtemp(prefix="codex-postprocess-", dir="/private/tmp"))
+        self.root = Path(
+            tempfile.mkdtemp(prefix="codex-postprocess-", dir=CANONICAL_TEMP_ROOT)
+        )
         self.addCleanup(shutil.rmtree, self.root, True)
         self.settings = GeneratorSettings(
             backend=GENERATOR_BACKEND_CODEX,

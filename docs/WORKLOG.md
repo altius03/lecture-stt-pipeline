@@ -12,6 +12,7 @@
 - reconciliation batch limit을 성공 처리 건수에 적용해 영구 실패 row가 뒤의 정상 DONE job을 반복해서 가리지 않도록 했다.
 - 학기 manifest와 active snapshot 모두에서 course code/name/alias를 하나의 정규화 routing-token namespace로 검증해 cross-kind 충돌을 거부한다.
 - 기존 transcript 원장 테이블의 partial schema는 안전한 nullable/default 컬럼만 additive migration한다. `source_job_id`의 단일 PK/non-partial UNIQUE 제약도 검사해, 비어 있는 비호환 테이블은 canonical schema로 재생성하고 데이터가 있는 비호환 테이블은 변경 전에 명시적인 호환성 오류로 중단한다.
+- Path-safety 회귀 테스트의 임시 root는 macOS에서 `/tmp` symlink를 피하기 위해 `/private/tmp`을 사용하고, 다른 OS에서는 platform 기본 temp directory를 사용한다. macOS alias 전용 테스트는 Darwin에서만 실행해 Ubuntu CI에서도 같은 test suite를 재현할 수 있게 했다.
 - manifest 13개, transcript delivery 28개, STT main 65개, schema migration 7개 집중 unittest를 포함한 전체 Python unittest 779개와 `compileall`, `git diff --check`를 통과했다.
 
 ## 2026-09-02
