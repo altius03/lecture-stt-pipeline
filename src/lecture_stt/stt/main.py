@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import json
 import logging
 from logging.handlers import RotatingFileHandler
@@ -17,6 +18,19 @@ from typing import Any, Callable, Dict, Mapping, cast
 from dotenv import load_dotenv
 import yaml
 
+from lecture_stt.downstream.course_storage import (
+    ROUTE_KIND_ROUTED,
+    CourseRoutingSource,
+    CourseStorageError,
+    descendant_relative_path,
+    ensure_course_storage_parent,
+    resolve_course_route,
+)
+from lecture_stt.downstream.semester import load_active_semester
+from lecture_stt.downstream.transcript_delivery import (
+    enqueue_completed_job,
+    load_postprocess_settings,
+)
 from lecture_stt.shared import db, utils
 from lecture_stt.shared.db import (
     STATUS_DONE,
@@ -214,6 +228,11 @@ def validate_config(
     notification = config.get("notification") or {}
     if notification and not isinstance(notification, dict):
         raise ValueError(f"Config error in {config_path_obj}: invalid section 'notification'")
+    transcript_delivery = config.get("transcript_delivery") or {}
+    if transcript_delivery and not isinstance(transcript_delivery, dict):
+        raise ValueError(
+            f"Config error in {config_path_obj}: invalid section 'transcript_delivery'"
+        )
 
     required_app = ["polling_interval_sec", "stable_for_sec", "stale_processing_hours"]
     for key in required_app:
@@ -390,6 +409,27 @@ def validate_config(
         notification["provider"] = provider
         notification["dual_send_providers"] = normalized_dual
 
+    if transcript_delivery:
+        enabled = parse_bool(
+            "transcript_delivery.enabled",
+            transcript_delivery.get("enabled", False),
+        )
+        transcript_delivery["enabled"] = enabled
+        if enabled:
+            active_raw = transcript_delivery.get("active_semester_manifest")
+            if not isinstance(active_raw, str) or not active_raw.strip():
+                raise ValueError(
+                    "Config error: transcript_delivery.active_semester_manifest "
+                    "must be a non-empty path"
+                )
+            try:
+                # The STT process validates only what raw course routing needs.
+                # The separate distribute worker owns Codex/staging validation;
+                # a downstream outage must not prevent raw transcription.
+                load_active_semester(Path(active_raw))
+            except Exception as exc:
+                raise ValueError(f"Config error: {exc}") from exc
+
     # 모든 definition을 시작 시 검증한다. profiles가 없으면 기존 동작을
     # 유지하는 추적용 legacy profile로 해석한다.
     resolve_profile(config)
@@ -480,6 +520,28 @@ def _normalize_config_paths(config: dict) -> dict:
     log_file = logging_cfg.get("file")
     if isinstance(log_file, str) and log_file.strip():
         logging_cfg["file"] = str(resolve_config_path(log_file, base_dir=root, env=os.environ))
+
+    delivery_cfg = normalized.get("transcript_delivery")
+    if isinstance(delivery_cfg, dict):
+        for key in [
+            "active_semester_manifest",
+            "log_jsonl_path",
+            "lock_path",
+            "correction_staging_dir",
+            "summary_staging_dir",
+        ]:
+            value = delivery_cfg.get(key)
+            if isinstance(value, str) and value.strip():
+                delivery_cfg[key] = str(
+                    resolve_config_path(value, base_dir=root, env=os.environ)
+                )
+        generator_cfg = delivery_cfg.get("generator")
+        if isinstance(generator_cfg, dict):
+            temp_root = generator_cfg.get("temp_root")
+            if isinstance(temp_root, str) and temp_root.strip():
+                generator_cfg["temp_root"] = str(
+                    resolve_config_path(temp_root, base_dir=root, env=os.environ)
+                )
 
     return normalized
 
@@ -636,6 +698,38 @@ class STTPipeline:
         except Exception:
             return {"PENDING": 0, "PROCESSING": 0, "DONE": 0, "NEEDS_REVIEW": 0, "ERROR": 0}
 
+    def _enqueue_transcript_delivery(self, job_id: int, canonical_base: str) -> None:
+        delivery_cfg = self.config.get("transcript_delivery")
+        if not isinstance(delivery_cfg, dict) or delivery_cfg.get("enabled") is not True:
+            return
+        try:
+            settings = load_postprocess_settings(
+                delivery_cfg,
+                base_dir=repo_root(),
+                env=os.environ,
+                default_tmp_root=Path(str(self.config["paths"]["tmp_dir"])),
+            )
+            status = enqueue_completed_job(
+                self.conn,
+                source_job_id=job_id,
+                settings=settings,
+            )
+            self._log(
+                logging.INFO,
+                "Transcript delivery queue status=%s",
+                {"job_id": str(job_id), "canonical_base": canonical_base},
+                status,
+            )
+        except Exception as exc:
+            # DONE is the source-of-truth outcome. The delivery worker reconciles
+            # this narrow crash/error window without changing STT success.
+            self._log(
+                logging.ERROR,
+                "Transcript delivery enqueue failed: %s",
+                {"job_id": str(job_id), "canonical_base": canonical_base},
+                exc,
+            )
+
     def _update_progress(
         self,
         job_id: int,
@@ -721,24 +815,95 @@ class STTPipeline:
 
     # 소스 파일 기준으로 유일한 base와 경로들을 생성한다.
     # 원본 파일명이 앞에 와서 전사물에서 원본을 쉽게 식별할 수 있다.
-    def _job_paths(self, source_path: Path) -> Dict[str, Any]:
+    def _job_paths(
+        self,
+        source_path: Path,
+        *,
+        recorded_at: str | None = None,
+    ) -> Dict[str, Any]:
         safe_stem = utils.sanitize_stem(source_path.stem)
-
-        # 기본: 원본 파일명(sanitize만 적용) 그대로 사용
         base_candidate = safe_stem
+        if recorded_at is None:
+            recorded_at = self._recorded_at_for_source(source_path)
 
-        # 충돌 검사: audio 또는 transcript 폴더에 동명 파일이 이미 있으면 suffix 부착
-        audio_target = self.audio_dir / f"{base_candidate}{source_path.suffix.lower()}"
-        txt_target = self.transcript_dir / f"{base_candidate}.txt"
-        if audio_target.exists() or txt_target.exists():
+        while True:
+            route = self._course_storage_route(
+                canonical_base=base_candidate,
+                orig_name=source_path.name,
+                recorded_at=recorded_at,
+            )
+            audio_target = self.audio_dir / f"{base_candidate}{source_path.suffix.lower()}"
+            transcript_parent = self.transcript_dir
+            if route is not None:
+                transcript_parent = ensure_course_storage_parent(
+                    self.transcript_dir,
+                    semester=route["semester"],
+                    course_dir=route["course_dir"],
+                    field="transcript_folder",
+                    create=False,
+                )
+            txt_target = transcript_parent / f"{base_candidate}.txt"
+            if not (audio_target.exists() or txt_target.exists()):
+                break
             base_candidate = f"{safe_stem}__{utils.local_timestamp()}__{utils.short_id(6)}"
 
+        json_target = txt_target.with_suffix(".json")
         return {
             "canonical_base": base_candidate,
-            "canonical_audio_path": self.audio_dir / f"{base_candidate}{source_path.suffix.lower()}",
-            "transcript_txt_path": self.transcript_dir / f"{base_candidate}.txt",
-            "transcript_json_path": self.transcript_dir / f"{base_candidate}.json",
+            "canonical_audio_path": audio_target,
+            "transcript_txt_path": txt_target,
+            "transcript_json_path": json_target,
         }
+
+    def _recorded_at_for_source(self, source_path: Path) -> str | None:
+        try:
+            return datetime.fromtimestamp(source_path.stat().st_mtime).astimezone().isoformat()
+        except OSError:
+            return None
+
+    def _course_storage_route(
+        self,
+        *,
+        canonical_base: str,
+        orig_name: str,
+        recorded_at: str | None,
+    ) -> dict[str, str] | None:
+        delivery_cfg = self.config.get("transcript_delivery")
+        if not isinstance(delivery_cfg, dict) or delivery_cfg.get("enabled") is not True:
+            return None
+        try:
+            active_path_raw = delivery_cfg.get("active_semester_manifest")
+            if not isinstance(active_path_raw, str) or not active_path_raw.strip():
+                raise ValueError(
+                    "transcript_delivery.active_semester_manifest must be a non-empty path"
+                )
+            # Raw placement depends only on the validated semester snapshot.
+            # Codex availability and correction/summary roots are downstream
+            # concerns and must not silently force a valid raw route flat.
+            active = load_active_semester(Path(active_path_raw))
+            decision = resolve_course_route(
+                active,
+                CourseRoutingSource(
+                    canonical_base=canonical_base,
+                    orig_name=orig_name,
+                    profile_key=self.active_profile.key,
+                    recorded_at=recorded_at,
+                ),
+            )
+            if decision.kind != ROUTE_KIND_ROUTED or decision.course is None:
+                return None
+            return {
+                "semester": active.semester,
+                "course_dir": decision.course.course_dir,
+            }
+        except (CourseStorageError, OSError, RuntimeError, ValueError) as exc:
+            self._log(
+                logging.WARNING,
+                "course-scoped transcript routing unavailable; using flat transcript path: %s",
+                {"job_id": "-", "canonical_base": canonical_base},
+                exc,
+            )
+            return None
 
     def _staging_path(self, source_path: Path) -> Path:
         target = self.staging_dir / source_path.name
@@ -902,16 +1067,69 @@ class STTPipeline:
             "deduped": deduped,
             "canonical_base": canonical_base,
         }
+        try:
+            payload["recorded_at"] = datetime.fromtimestamp(
+                Path(canonical_audio_path).stat().st_mtime
+            ).astimezone().isoformat()
+        except OSError:
+            # 녹음 시각은 route 보조 증거다. 읽지 못해도 전사 산출물 자체는 보존한다.
+            payload["recorded_at"] = None
         if deduped_from_job_id is not None:
             payload["deduped_from_job_id"] = deduped_from_job_id
         if source_sha256 is not None:
             payload["source_sha256"] = source_sha256
         return payload
 
+    def _ensure_transcript_artifact_parent(
+        self,
+        txt_path: Path,
+        json_path: Path,
+    ) -> None:
+        txt_relative = Path(
+            descendant_relative_path(
+                self.transcript_dir,
+                txt_path,
+                field="transcript_txt_path",
+                expected_filename=txt_path.name,
+            )
+        )
+        json_relative = Path(
+            descendant_relative_path(
+                self.transcript_dir,
+                json_path,
+                field="transcript_json_path",
+                expected_filename=json_path.name,
+            )
+        )
+        if (
+            txt_relative.parent != json_relative.parent
+            or txt_relative.stem != json_relative.stem
+        ):
+            raise CourseStorageError("transcript TXT/JSON paths must share a parent and stem")
+        parent_parts = txt_relative.parent.parts
+        if not parent_parts:
+            return
+        if len(parent_parts) < 2:
+            raise CourseStorageError(
+                "nested transcript paths must use <semester>/<course_dir>"
+            )
+        expected_parent = ensure_course_storage_parent(
+            self.transcript_dir,
+            semester=parent_parts[0],
+            course_dir=os.fspath(Path(*parent_parts[1:])),
+            field="transcript_folder",
+            create=True,
+        )
+        if txt_path.parent != expected_parent or json_path.parent != expected_parent:
+            raise CourseStorageError(
+                "transcript paths do not match the validated course-scoped parent"
+            )
+
     def _write_output(self, txt_path: Path, json_path: Path, segments: list, text: str,
                       metadata: Dict[str, Any]) -> None:
         # 텍스트와 JSON 결과를 원자적 쓰기로 저장한다.
         self.transcript_dir.mkdir(parents=True, exist_ok=True)
+        self._ensure_transcript_artifact_parent(txt_path, json_path)
         utils.atomic_write(txt_path, text)
         utils.atomic_write(json_path, {"segments": segments, "metadata": metadata})
         if isinstance(metadata.get("quality"), dict):
@@ -1046,6 +1264,7 @@ class STTPipeline:
                 progress_pct=100,
                 eta_sec=0,
             )
+            self._enqueue_transcript_delivery(job_id, canonical_base)
             queue = self._queue_status()
             self.notifier.notify_transcript_generated({
                 "job_id": job_id,
@@ -1281,7 +1500,8 @@ class STTPipeline:
         single_job_plan: Mapping[str, Any] | None = None,
         kill_switch_path: Path | None = None,
     ) -> dict[str, Any]:
-        paths = self._job_paths(source_path)
+        recorded_at = self._recorded_at_for_source(source_path)
+        paths = self._job_paths(source_path, recorded_at=recorded_at)
         canonical_base = paths["canonical_base"]
         canonical_audio = paths["canonical_audio_path"]
         txt_path = paths["transcript_txt_path"]
@@ -1342,6 +1562,20 @@ class STTPipeline:
                     job_id=None,
                 )
             source_claim_path = staging_source
+
+            # Semester apply uses the same BEGIN IMMEDIATE fence.  Recompute
+            # all active-semester-dependent paths only after acquiring it: if
+            # a switch committed while the source was moving to staging, this
+            # admission uses the new snapshot; if admission wins, the PENDING
+            # row is committed before apply performs its idle check.
+            fail_step = "작업 입장"
+            self.conn.execute("BEGIN IMMEDIATE")
+            paths = self._job_paths(source_path, recorded_at=recorded_at)
+            canonical_base = paths["canonical_base"]
+            canonical_audio = paths["canonical_audio_path"]
+            txt_path = paths["transcript_txt_path"]
+            json_path = paths["transcript_json_path"]
+            job_ctx["canonical_base"] = canonical_base
 
             job_id = db.create_job(
                 self.conn,
@@ -1575,6 +1809,7 @@ class STTPipeline:
                 progress_pct=100,
                 eta_sec=0,
             )
+            self._enqueue_transcript_delivery(job_id, canonical_base)
             # 최종 산출물 생성이 완료되면 성공 알림을 전송한다.
             fail_step = "알림 전송"
             queue = self._queue_status()
@@ -1609,6 +1844,8 @@ class STTPipeline:
             )
 
         except Exception as exc:
+            if self.conn.in_transaction:
+                self.conn.rollback()
             self._handle_job_failure(
                 exc=exc,
                 fail_step=fail_step,
@@ -1929,6 +2166,7 @@ class STTPipeline:
                 progress_pct=100,
                 eta_sec=0,
             )
+            self._enqueue_transcript_delivery(job_id, canonical_base)
 
             fail_step = "알림 전송"
             queue = self._queue_status()

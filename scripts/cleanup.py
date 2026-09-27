@@ -131,12 +131,20 @@ def _cleanup_transcripts(
     if not transcript_dir.is_dir():
         raise ValueError(f"Transcript path is not a directory: {transcript_dir}")
 
-    grouped: dict[str, list[Path]] = {}
-    for entry in transcript_dir.iterdir():
+    # New lecture outputs are stored below
+    # <semester>/<course_dir>/ while historical artifacts may still be direct
+    # children.  Keep the relative parent in the grouping key so identical
+    # stems in different courses never share one cleanup decision.
+    grouped: dict[tuple[Path, str], list[Path]] = {}
+    for entry in transcript_dir.rglob("*"):
+        if entry.is_symlink():
+            raise ValueError(f"Refusing to inspect symlinked transcript path: {entry}")
         if not entry.is_file():
             continue
         _assert_under_base(entry, transcript_dir)
-        grouped.setdefault(_transcript_artifact_stem(entry), []).append(entry)
+        relative_parent = entry.parent.relative_to(transcript_dir)
+        key = (relative_parent, _transcript_artifact_stem(entry))
+        grouped.setdefault(key, []).append(entry)
 
     groups = sorted(
         grouped.values(),

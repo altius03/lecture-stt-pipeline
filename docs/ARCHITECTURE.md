@@ -1,11 +1,11 @@
 # Lecture STT Architecture
 
-기준일: 2026-07-28
+기준일: 2026-09-02
 
 ## 목적
 - iCloud inbox에 들어오는 강의·회의·대화·개인 메모 음성 파일을 자동으로 전사한다.
 - 전사 결과를 TXT/JSON과 metadata-only quality sidecar로 저장한다.
-- 후단 correction/summary 산출물을 별도 배포하고, Hermes operator가 교정/요약 자동화를 앱 외부 계층에서 수행할 수 있게 한다.
+- 품질 검사를 통과한 전사 원본을 보존하면서 Codex CLI로 교정·요약하고 학기·과목별 Obsidian 경로로 안전하게 자동 전달한다.
 - 현재 운영 호환성을 유지하면서 향후 시간표 기반 분류·자동 제목·모바일 대시보드·온디맨드 워커 구조로 이행한다.
 
 ## 시스템 경계
@@ -31,10 +31,17 @@ flowchart LR
     PIPELINE --> PROFILE["버전 전사 프로필"]
     PROFILE --> ENGINE["faster-whisper"]
     ENGINE --> POST["후처리 + 품질 점검"]
-    POST --> V1["현행 v1 원본·전사 보관소"]
+    POST --> V1["현행 v1 원본·전사 보관소 / 학기·과목 scoped"]
     POST --> DB["현행 jobs.sqlite3"]
-    V1 --> HERMES["격리 Hermes operator"]
-    HERMES --> OUTPUT["교정본·요약본"]
+    SEMCFG["학기별 course-route manifest"] -. "plan" .-> SEMACTIVE["검증된 active semester snapshot"]
+    V2DB -. "선택된 timetable 검증" .-> SEMACTIVE
+    DB --> TQUEUE["transcript_postprocess_jobs"]
+    SEMACTIVE --> TQUEUE
+    V1 --> TDWORKER["Codex postprocess worker"]
+    TQUEUE --> TDWORKER
+    TDWORKER --> CODEX["Codex CLI / saved ChatGPT auth / read-only sandbox"]
+    CODEX --> STAGINGOUT["학기·과목별 03_correction TXT/JSON + 04_summarize Markdown"]
+    STAGINGOUT --> ARCHIVE
     DB --> PANEL["React 웹 패널"]
     PANEL -. "launchctl + kill switch" .-> GOOWNER
 
@@ -73,7 +80,8 @@ flowchart LR
     ANALYTICS -. "day/week/month on-demand" .-> PANEL
     ANALYTICS -. "Prometheus text scrape" .-> METRICS["Prometheus/Grafana-compatible metrics"]
     V2DB -. "bounded recording/job/artifact/review metadata" .-> LIBRARYAPI["Read-only recording library API"]
-    LIBRARYAPI -. "list/detail on-demand" .-> PANEL
+    V2 -. "verified current DONE transcript TXT" .-> LIBRARYAPI
+    LIBRARYAPI -. "list/detail + opt-in click preview" .-> PANEL
     V2DB -. "single read transaction" .-> UNIFIEDAPI["Read-only unified review feed API"]
     UNIFIEDAPI -. "exact totals + canonical pagination" .-> UNIFIEDREVIEW["React unified review queue"]
     UNIFIEDREVIEW -. "exact hash deep link" .-> PANEL
@@ -87,25 +95,24 @@ flowchart LR
 - `frontend/`: React 웹 패널 소스(Vite 기반)
 - `controller/`: Python 정본 watcher/plan 계약을 대조하고 guarded single/retry apply를 한정 dispatch하는 Go controller와 독립 read-only shadow
 - `scripts/`: 수동 실행, 설치, 운영 보조 스크립트
-- `scripts/hermes_postprocess/`: Hermes cron/operator용 repo-local 후보 discovery, prompt loading, validator, review-only misrecognition queue, staging manifest, explicit promote helper
 - `launchd/`: macOS launchd 서비스 정의 템플릿
-- `config/`: YAML 설정 템플릿. 운영 `config.yaml`은 gitignore 대상이다.
+- `config/`: YAML 설정 템플릿과 학기별 manifest. 운영 `config.yaml`은 gitignore 대상이다.
 - `tests/`: Python unittest suite
 - `docs/`: 운영 runbook, architecture, worklog, model/operator 문서
 - `migrations/v2/`: 운영 DB와 분리해 검증하는 additive storage/DB v2 SQL migration
 - `.github/workflows/`: GitHub Actions CI
 - `.codex/agents/`: project-local Codex subagent 설정
-- `.hermes/plans/`: 승인/작업 계획 기록
-- `state/`: gitignored repo-local SQLite DB, operator staging, reports, lock/pause files
+- `state/`: gitignored repo-local SQLite DB, active semester snapshot, reports, lock/pause files
 - `tmp/`: gitignored legacy/local fallback tmp. 현재 운영 STT tmp/cache 기본값은 `~/Library/Caches/lecture_stt/tmp`다.
 
 ## 현재 소스 구조
 - 실제 구현 코드는 `src/lecture_stt/` 패키지 아래에 정리되어 있다.
 - `src/lecture_stt/stt/`: 메인 STT 파이프라인
 - `src/lecture_stt/shared/`: 공용 DB, 유틸
-- `src/lecture_stt/storage_v2/`: immutable legacy snapshot discovery, record manifest, preserve-first importer, timetable classification/materialization, transcript-content title suggestion/materialization, library snapshot/verifier, bounded recording library/analytics adapter
+- `src/lecture_stt/storage_v2/`: immutable legacy snapshot discovery, record manifest, preserve-first importer, timetable classification/materialization, transcript-content title suggestion/materialization, library snapshot/verifier, bounded recording library/transcript-preview/analytics adapter
 - `src/lecture_stt/correction/`: 수동/provider-neutral correction 대기 상태 조회와 correction prompt helper
-- `src/lecture_stt/downstream/`: correction/summary 배포 파이프라인
+- `src/lecture_stt/downstream/`: 학기 activation, Codex CLI 교정·요약, 단계별 큐와 과목별 전달 파이프라인. 과거 `deliveries` 원장은 archive 호환 전용이다.
+- `src/lecture_stt/downstream/course_storage.py`: STT와 downstream이 공유하는 단일 과목 route 결정과 안전한 `<semester>/<course_dir>` 하위 경로 생성 계약
 - `src/lecture_stt/ui/`: 웹 제어판
 - 운영 스크립트는 `PYTHONPATH=<repo>/src python -m lecture_stt...` 방식으로 패키지를 직접 실행한다.
 - `src/lecture_stt/stt/profiles.py`가 버전이 있는 전사 프로필과 설정 hash를 관리한다.
@@ -123,7 +130,7 @@ flowchart LR
 - 중복이 아니면 `STTWorker`가 ffmpeg로 WAV 전처리 후 faster-whisper 전사를 수행한다.
 - 전사 결과는 `postprocess()`로 세그먼트와 전체 텍스트의 반복/노이즈/오인식 용어를 정리한다. 프로필의 `corrections: {}`는 범용 녹음에서 기존 강의 용어 교정을 끈다.
 - `quality_gate.evaluate()`가 반복도와, 길이를 알 수 있는 오디오의 전사 밀도·시간 커버리지를 계산해 메타데이터에 포함한다.
-- 최종 산출물은 `02_transcripts` 아래 `{base}.txt`, `{base}.json`으로 저장되고, 품질 메타데이터가 있으면 `{base}.quality.json` scorecard sidecar도 함께 저장된다. Scorecard는 transcript 본문과 segment 배열을 제외한 metadata-only artifact이며 profile `key/version/config_sha256` snapshot을 포함할 수 있다.
+- active semester에서 과목 route가 확정된 최종 산출물은 `02_transcripts/<semester>/<course_dir>/{base}.txt`, `{base}.json`으로 저장되고, 품질 메타데이터가 있으면 같은 폴더에 `{base}.quality.json` scorecard sidecar도 함께 저장된다. 과목 미확정·비강의 결과와 기존 평면 artifact는 `02_transcripts` 루트 호환 경계를 유지한다. Scorecard는 transcript 본문과 segment 배열을 제외한 metadata-only artifact이며 profile `key/version/config_sha256` snapshot을 포함할 수 있다.
 - 품질 `bad` 결과는 산출물을 보존하되 정상 성공으로 알리지 않고 DB 상태를 `NEEDS_REVIEW`로 기록하며 별도 review 알림을 보낸다.
 - STT 실행 실패는 기본 2회까지 retryable 상태(`전사 재시도 대기 n/2`)로 DB에 남기고, 다음 scan에서 즉시 재시도한다.
 - retry 한도 초과 후 terminal failure가 되면 오디오는 `99_errors`로 이동하고 DB 상태는 `ERROR`로 기록된다.
@@ -402,6 +409,8 @@ flowchart LR
   worker 제어 경로가 없다.
 - scheduled cleanup은 `tmp/`를 정리하되 `tmp/inbox_staging`은 보존해 복구 대기 중인 claimed input을 삭제하지 않는다.
 - scheduled cleanup은 DB의 미해결 `NEEDS_REVIEW` canonical stem을 먼저 읽어 해당 원본·전사·quality 세트를 보존한다. 이 보호 목록을 읽을 수 없으면 apply를 거부한다.
+- 설치된 scheduled cleanup은 인자 없는 기본 dry-run으로만 실행된다. 보존 기간 경과만으로는 “미사용”을 증명하지 못하므로 운영 apply 근거로 사용하지 않는다. Legacy 파일을 정리하려면 Storage v2와 archive-evidence verifier issue 0, active/problem/postprocess row 0, 각 파일의 single-link regular metadata와 SHA-256 보존 사본을 함께 확인해야 한다.
+- 2026-08-09에는 위 별도 검증으로 Storage v2에 exact copy가 있고 운영 파일 참조가 없는 과거 audio 41개, summary 97개와 disposable metadata 5개, 합계 143개만 iCloud 휴지통으로 이동했다. `DONE`/`NEEDS_REVIEW` job의 legacy transcript TXT/JSON 경로는 같은 SHA 입력의 dedupe replay가 직접 읽으므로 Storage v2 사본이 있어도 활성 의존성이다. 이 경로가 Storage v2 read로 전환되기 전에는 transcript와 같은 stem의 quality sidecar를 cleanup하지 않는다. 같은 bytes여도 실패 원위치나 historical filename provenance가 다른 자료도 중복으로 취급하지 않는다. Active v1 디렉터리는 새 입력·전사·Codex staging을 위해 그대로 유지하며, 검증 사본이 없는 transcript/correction/prompt/recovery/manual-review 자료는 보존한다.
 
 ## 상태 저장
 - `src/lecture_stt/shared/db.py`가 SQLite 스키마와 접근 로직을 담당한다.
@@ -431,7 +440,7 @@ flowchart LR
 - `/api/events`의 bare 요청은 기존처럼 state+logs를 함께 제공한다. 화면별 절전 경계에서는 `?streams=state`를 사용하며, 이 연결은 서버에서 `_log_stream_delta()`를 호출하지 않는다. `streams`는 `state`, `logs` 또는 둘의 쉼표 조합만 허용하고 빈 값·중복·알 수 없는 값은 400으로 거부한다.
 - React 패널은 hash 기반 `홈`, `처리 현황`, `녹음 보관함`, `검토 큐`, `시간표`, `설정` 화면 경계를 가진다. `처리 현황`에서만 Activity 로그 훅과 combined SSE를 활성화하고, 다른 화면은 state-only SSE를 사용한다. 처리 화면으로 전환할 때는 화면 상태에서 combined endpoint를 동기적으로 계산한 뒤 state/log 훅이 같은 singleton에 합류해 state-only와 combined `EventSource`가 중복 생성되지 않게 한다. Storage v2 패널은 해당 화면에서만 mount하며 analytics, recording library, archive review, timetable, title review와 unified feed query를 SSE snapshot에 합치지 않는다.
 - command rail은 60rem 이상에서 workbench 왼쪽에 sticky하게 유지하고 그 아래에서는 상단 grid로 풀린다. 40rem 미만에서는 설명을 접은 2열 route grid로 바뀌며, clickable label은 한 줄을 유지한다. 문서 root는 `overflow-x: clip`을 사용하고 긴 storage path와 표 overflow는 각 evidence surface 안에 가둔다.
-- 화면이 바뀌어도 패널 state query와 기존 worker action 계약은 유지한다. 녹음 보관함은 legacy 운영 job count·folder 경계가 아니라 별도 Storage v2 list/detail API만 on-demand로 읽고, 추정 데이터나 웹 업로드 UI를 만들지 않는다.
+- 화면이 바뀌어도 패널 state query와 기존 worker action 계약은 유지한다. 녹음 보관함은 legacy 운영 job count·folder 경계가 아니라 별도 Storage v2 list/detail API를 on-demand로 읽는다. List의 additive `capabilities.transcript_preview`는 구 응답·기본 비활성에서 false로 닫히고 explicit opt-in일 때만 true가 되어 미리보기 affordance를 노출한다. 전사 본문은 목록·상세에 포함하지 않고, 완료된 current job의 latest raw transcript에만 `미리보기 열기`로 요청한다. 추정 데이터나 웹 업로드 UI는 만들지 않는다.
 - 최근 작업과 로그는 분리 카드 대신 하나의 Activity 패널로 묶어, 최근 작업 행 선택과 해당 작업 중심의 한국어 운영 로그 확인을 한 흐름으로 제공한다.
 - 현재 패널은 `NEEDS_REVIEW`를 `확인 필요`로 집계·표시하며 `ERROR`와 분리한다. 구형 schema v2 payload에 해당 count가 없으면 0으로 해석한다.
 - Activity 패널의 로그 영역은 raw log를 그대로 유지하되, `logParser.ts`가 반복 패턴을 파싱해 과목/날짜/요일/교시를 포함한 한국어 운영 로그 뷰와 오류 전용 뷰를 함께 제공한다.
@@ -469,51 +478,36 @@ flowchart LR
 - 점수가 없는 artifact와 malformed/unsafe scorecard는 각각 `quality_missing`, `quality_invalid`로 분리하고 평균 점수 분모에서 숨기지 않는다. 분류는 `recording_contexts.is_selected=1`만 확정 분류로 계산하며, suggested classification은 합치지 않고 `미분류` bucket과 coverage로 남긴다.
 - React 홈은 Grafana식 기간·분포·추이 요약과 Falcon식 attention triage를 결합한 관제 화면으로 구성한다. 전사량·완료율·검토/오류·평균 품질 KPI, 처리량 추이, 품질 histogram, 상태/확정 분류 분포, 데이터 coverage/freshness, 최근 확인 항목을 표시한다. Attention 행은 같은 `storage_key`의 recording library detail로 명시적으로 연결하고, detail이 목록 첫 페이지 밖에 있어도 별도 read-only query로 유지한다. 새 chart/runtime 의존성이나 웹 업로드 UI는 추가하지 않고 기존 React+TypeScript, TanStack Query, semantic table/CSS bar 경계를 유지한다.
 
-## Hermes postprocess operator package
-- `scripts/hermes_postprocess/`는 앱 내부 LLM provider를 되살리지 않고 Hermes cron/operator 계층에서 쓸 결정적 보조 기능만 제공한다.
-- `dry-run` CLI는 `02_transcripts`의 txt/json pair 중 final correction/summary가 완성되지 않은 stem 하나를 metadata-only JSON으로 반환한다. raw transcript body와 segment 배열은 stdout/report에 싣지 않는다.
-- 후보에 quality scorecard가 있고 `health=bad`이면 자동 교정/요약 대상으로 선택하지 않는다. scorecard가 malformed이거나 health 계약이 잘못된 stem도 해당 후보만 fail-closed로 건너뛰며, scorecard가 없는 과거 산출물은 기존 동작을 유지한다.
-- `paths.py`는 `02_transcripts`, `03_correction`, `04_summarize`, `05_prompt`, repo-local `state/hermes_postprocess/{staging,claims}` 경로를 계산하고 subject code를 longest-match로 추출한다.
-- `prompts.py`는 existing iCloud `05_prompt/00_base_prompt.txt`, `01_common_glossary.txt`, 선택 subject glossary를 source of truth로 로드한다.
-- `validators.py`는 correction JSON의 segment count, `id/start/end`, 전체 JSON key/order/array 구조, non-`text` metadata 보존, final overwrite 금지, summary required headings 및 `summary_too_short` guardrail을 검증한다.
-- `misrecognitions.py`는 교정 중 발견한 짧은 오인식 후보 phrase를 repo-local `state/hermes_postprocess/misrecognitions/pending.jsonl`에 dedupe append한다. raw transcript excerpt/context와 `05_prompt` 자동 변경은 금지한다.
-- `staging.py`는 metadata-only `manifest.json`과 explicit promote 인터페이스를 제공한다. Promote는 기본적으로 `promote_disabled`를 반환하며, `--allow-promote`가 없으면 final 경로에 쓰지 않는다. 허용된 promote도 candidate destination path를 재계산해 검증하고 validator를 재실행한 뒤 exclusive no-overwrite copy와 hash-checked rollback을 사용한다.
-- child Hermes는 terminal/MCP 없이 `file,no_mcp` toolset으로 실행한다. 부모 환경 전체나 repo `.env`를 전달하지 않고 활성 provider에 필요한 환경 변수만 allowlist하며, 격리된 `HERMES_HOME`에는 활성 provider와 일치하는 OAuth credential entry만 담은 권한 `0600`의 최소 `auth.json` snapshot을 생성한다. 파일 도구는 repo `.env`와 child `auth.json`/`.env` 읽기를 명시적으로 거부한다.
-- 이 패키지는 Gate A/B 개발·dry-run 검증 범위에서 시작했으며, 이후 승인된 Gate C+ promote canary와 Hermes cron 등록까지 반영됐다. 현재 활성화 범위와 금지사항은 `docs/operators/hermes-postprocess/README.md`와 `docs/OPERATIONS.md`를 우선한다.
-- 2026-05-20 후속 승인으로 live stem `260504DS_1` 1건의 content staging, validation, Gate C+ promote canary를 수행했고, script-only Hermes cron job `lecture_stt_postprocess_operator`를 등록했다. Cron은 `state/hermes_postprocess/cron-baseline.json`의 activation-time backlog skip list를 사용해 기존 backlog를 건너뛰며, no-candidate일 때 stdout/delivery 없이 조용히 종료한다.
-- `--lecture-root`는 iCloud가 아니어도 된다. 같은 폴더 구조의 local canary root를 넘기면 postprocess helper는 완전히 로컬에서 동작한다. iCloud는 현재 실제 transcript/prompt 정본 위치라 Gate B에서 read-only inventory 대상으로만 사용한다.
+## 학기 manifest와 전사 자동 후처리
+- Hermes, Hermes cron과 과거 외부 operator는 영구 폐기했다. 사용자 영역의 `ai.hermes.*` LaunchAgent, `~/.hermes`, Web UI clone, 실행 wrapper와 앱 상태도 활성 경로에서 제거했으며 shell startup에는 Hermes 전용 PATH 설정이 없다. 과거 worklog·감사 report와 비활성 `hermes-lab`은 역사 자료일 뿐 runtime dependency가 아니다. 현재 generator는 저장된 ChatGPT 로그인 세션의 `codex exec`만 사용하며 별도 LLM API 키나 직접 HTTP API 경로가 없다. 다만 교정·요약 입력인 전사 내용은 Codex 서비스로 전송된다.
+- STT가 생성한 `02_transcripts/<semester>/<course_dir>/{stem}.txt`, `{stem}.json`, `{stem}.quality.json` 중 job 상태가 `DONE`인 TXT/JSON pair만 후보가 된다. 기존 root 직속 경로도 DB에 pin된 절대경로로 계속 읽는다. `NEEDS_REVIEW`와 `ERROR`는 자동 후처리하지 않는다.
+- `config/semesters/<semester>.yaml`은 semester, vault/current-semester root, Storage v2 timetable DB, 교정·요약 목적 subdirectory, 과목 코드·이름·폴더·파일명 alias를 선언한다. `state/active-semester.json`은 plan/apply로 검증·활성화한 `@2` machine-local snapshot이다.
+- activation plan은 vault의 `.obsidian`, vault→semester root containment, 모든 경로 component의 symlink 부재, 각 course의 `06_lecture_notes/02_origin`과 `06_lecture_notes/01_summarize` 선존재, course dir 중복 부재, 선택된 Storage v2 timetable의 학기·과목 집합 일치를 확인한다. Course code·course name·alias는 정규화된 전역 routing token namespace 하나에서 충돌을 검사하므로 서로 다른 종류의 token이 겹쳐도 활성화를 거부한다. 폴더는 자동 생성하지 않는다.
+- apply는 동일 candidate를 다시 plan하고 exact course count와 plan SHA-256, `--allow-write`를 요구한다. jobs DB에서 `BEGIN IMMEDIATE`로 controller/downstream write와 직렬화한 뒤 STT `PENDING`/`PROCESSING`, postprocess `PENDING`, 현재 cutoff 이후 `DONE`이지만 아직 queue row가 없는 작업이 모두 0일 때만 active snapshot을 같은 directory temporary file과 `fsync`/`os.replace`로 원자 교체한다. STT 입장도 source를 staging으로 옮긴 뒤 같은 `BEGIN IMMEDIATE` fence 안에서 active snapshot과 목적 경로를 다시 읽고 `PENDING`을 등록하므로, 학기 전환과 신규 작업 등록 사이에 구 학기 경로가 끼어들 수 없다. DONE commit과 enqueue 사이의 좁은 구간은 unqueued DONE 검사로 닫고, queue가 없고 완료 시각도 해석 불가능한 DONE은 `invalid_unqueued_done_jobs`로 분리해 전환을 차단한다.
+- 이전 학기 backlog cutoff는 별도 config에 중복하지 않고 active snapshot의 timezone-aware `activated_at`을 단일 기준으로 사용한다. STT raw route, 실시간 enqueue와 reconciliation이 같은 snapshot을 다시 읽으므로 학기 전환 뒤 수동 cutoff 동기화가 필요 없다. Queue에 들어간 작업은 당시 cutoff와 snapshot hash를 계속 pin한다.
+- STT와 downstream은 `course_storage.resolve_course_route()` 하나를 공유한다. route는 `YYMMDDAlias[_N]` 형태의 explicit alias를 우선하고, alias가 없을 때는 profile key가 `lecture`인 녹음만 recorded timestamp와 시간표의 유일 후보를 ±manifest margin 안에서 비교한다. 일반/회의/메모 profile은 시간표와 겹쳐도 추측하지 않는다. 원본 이름과 시간표는 분류 신호로만 사용하고, 최종 transcript·교정·요약 stem은 충돌 회피가 끝난 canonical base를 유지한다. route가 확정되지 않으면 과목 폴더를 만들지 않고 raw를 평면 경로에 보존하며, 강의는 `UNROUTED`, 비강의는 `SKIPPED`로 기록한다.
+- STT 완료 hook은 운영 `jobs.status=DONE`을 보존한 뒤 같은 DB의 `transcript_postprocess_jobs`에 source hash, active snapshot hash, cutoff, semester/course/root, staging·final 경로와 generator provenance를 고정한다. 학기 전환과 설정 변경이 이미 큐잉된 작업의 목적지나 generator를 바꾸지 못한다.
+- `src/lecture_stt/downstream/postprocess.py`는 한 강의당 교정 호출 1회와 검증된 교정본 기반 요약 호출 1회를 수행한다. Codex는 격리 temporary directory에서 `--ephemeral --sandbox read-only --ignore-user-config --ignore-rules --output-schema`로 실행되고 shell/unified-exec/apps/plugins/browser/computer/multi-agent feature를 끈다. Allowlist 환경에는 API key를 전달하지 않는다. Codex는 구조화 결과만 반환하며 실제 파일 생성·이동은 Python 부모가 담당한다.
+- 교정 결과는 source segment의 정수 ID·개수·순서를 유지해야 한다. Python이 segment text만 교체해 source JSON의 timing/language/metadata를 보존하고 TXT를 재구성한다. 요약은 고정 JSON 계약을 검증한 뒤 7개 heading의 Markdown으로 렌더링한다. transcript 본문이나 생성 본문은 DB, JSONL, error message에 기록하지 않는다.
+- 단계는 과목별 `02_transcripts/<semester>/<course_dir>` 정본 보존 → `03_correction/<semester>/<course_dir>/{stem}.txt/.json` → `04_summarize/<semester>/<course_dir>/{stem}.md` → 같은 과목의 `02_origin` 교정 pair와 `01_summarize` 요약이다. 기존 평면 source와 이미 pin된 평면 staging row는 그대로 호환한다. 생성 hash intent를 DB에 먼저 commit하고 correction JSON을 먼저 쓰므로 stage file 생성 뒤 `READY` 전 crash도 pinned bytes를 재검증해 이어간다. Transcript·staging·final 산출물은 최초 생성부터 `0600`으로 제한한다. Course-scoped parent는 설정 root 아래에서만 필요 시 생성하며 traversal, symlink, 비-directory component를 거부한다. 같은 hash는 멱등 성공, 다른 bytes는 `CONFLICT`이며 overwrite하지 않는다.
+- Worker는 launchd 별도 프로세스로 큐를 polling한다. 실행·파일시스템 오류는 기본 3회까지 해당 단계에서 재시도하고, 구조 계약 위반은 `NEEDS_REVIEW`, 반복 실행 오류는 `ERROR`로 닫는다. Queue가 없는 DONE의 완료 시각이 손상됐으면 `INVALID_COMPLETION_TIMESTAMP` reconciliation error로 행 단위 격리한다. Reconciliation batch limit은 스캔한 행 수가 아니라 실제 enqueue 성공 수에 적용하므로 앞선 불량 행이 뒤의 정상 작업을 기아 상태로 만들지 않는다. Destination 장애가 STT 성공을 되돌리지는 않는다. Dry-run은 SQLite `mode=ro/query_only`에서 route만 계산하고 lock, table/row, JSONL, staging/final 파일을 만들지 않는다.
 
-## Downstream 배포 파이프라인
-- API-backed 자동 correction provider는 현재 비활성화되어 있으며, `src/lecture_stt/correction/worker.py`는 `02_transcripts`의 pending pair를 manual correction 대기 상태로만 보고한다.
-- `CorrectionConfig`에는 API key/model/max token 필드가 없고, `correction.mode: manual`을 기본 운영 모드로 둔다.
-- `src/lecture_stt/correction/corrector.py`는 외부 API 호출 구현을 갖지 않는 compatibility/helper 모듈이며, 자동 correction 시도는 명시적으로 실패한다.
-- 진입점은 `src/lecture_stt/downstream/worker.py`다.
-- correction 입력은 `03_correction` 폴더의 `{stem}.txt + {stem}.json` pair다.
-- summary 입력은 `04_summarize` 폴더의 `{stem}.md`다.
-- `src/lecture_stt/downstream/lib.py`가 stem 해석, 과목 라우팅, 무손실 복사, conflict 처리, cleanup, deliveries 상태 갱신을 담당한다.
-- correction은 GH archive의 `06_lecture_notes/02_origin`으로 배포된다.
-- summary는 GH archive의 `01_summarize`와 Obsidian 노트 경로 둘 다로 배포된다.
-- summary는 correction 전달 완료가 확인된 경우에만 배포된다.
-- 동일 내용은 hash 비교로 idempotent하게 처리하고, 다른 내용이 있으면 overwrite하지 않고 conflict로 남긴다.
-- 반복되는 invalid/incomplete/blocked/conflict/error 이벤트는 같은 worker 프로세스 안에서 bounded suppression cache의 동일 key 기준 1회만 stdout/JSONL에 남겨 로그 폭주를 줄인다.
-- scan 통계 로그는 최초, 통계 변화, 설정된 heartbeat 주기 때만 JSONL에 남기고 routine stdout은 기본적으로 끈다.
-- `downstream.log_jsonl_max_bytes`를 0보다 크게 설정하면 `state/logs/downstream.jsonl`에 size guard/rotation을 적용한다. `downstream.log_suppression_max_keys`는 장기 실행 중 suppression cache 상한을 정한다. `downstream.log_routine_scan_events: false`이면 routine `scan_started`는 stdout/JSONL 모두 생략하고, routine `scan_completed`는 최초/변경/heartbeat만 JSONL에 남긴다. 기존 `downstream.out.log` truncate/delete나 launchd 재시작은 운영 승인 후 별도 절차로 처리한다.
-
-## Downstream 상태 저장
-- downstream 상태는 `deliveries` 테이블에 기록된다.
-- correction/summary 각각의 상태, 대상 경로, hash, last error, 완료 플래그를 저장한다.
-- `src/lecture_stt/downstream/status.py`가 요약 조회, 목록 조회, 상세 조회, row 삭제 CLI를 제공한다.
+## 전달 상태 저장
+- 새 runtime 원장은 `transcript_postprocess_jobs`다. `source_job_id`를 유일 key로 사용하고 전체 상태와 correction/summary/delivery 단계 상태, 단계별 attempt, source/staging/final hash, bounded error code, generator provenance와 completion timestamp를 기록한다. 전체 상태는 `PENDING`, `DELIVERED`, `SKIPPED`, `UNROUTED`, `CONFLICT`, `NEEDS_REVIEW`, `ERROR`다.
+- 기존 DB에 transcript 원장 테이블이 일부만 존재하면 nullable 또는 default가 있는 컬럼만 additive migration한다. `source_job_id`는 단일 primary key 또는 non-partial unique key인지까지 검증한다. 비어 있는 비호환 partial table은 canonical schema로 다시 만들고, 행이 있는 상태에서 충돌 key 제약이 없거나 primary key·default 없는 `NOT NULL` 컬럼이 빠졌다면 데이터를 추측해 바꾸지 않고 명시적인 compatibility error로 중단한다.
+- 과거 `transcript_deliveries` 직접 전달 원장과 `deliveries` correction/summary 원장은 감사·Storage v2 archive evidence를 위해 보존하지만 active worker는 읽거나 갱신하지 않는다.
+- status CLI는 `transcript_postprocess_jobs`를 기본 조회하며 `--only-problems`에는 `UNROUTED`, `CONFLICT`, `NEEDS_REVIEW`, `ERROR`가 포함된다. 기본 summary는 active semester/effective cutoff, STT active/problem, cutoff 이후 queue 미적재 DONE, postprocess pending/problem count를 함께 읽기 전용 집계하고 `HEALTHY`/`BUSY`/`ATTENTION`으로 표시한다.
 
 ## 운영 스크립트와 서비스
 - `scripts/run_worker.sh`: 메인 워커 상시 실행
 - `scripts/run_once.sh`: 메인 워커 1회 실행
 - `scripts/run_gui.sh`: 웹 제어판 실행
 - `scripts/run_distribute.sh`: downstream 워커 실행
-- `scripts/distribute_status.sh`: deliveries 상태 CLI 래퍼
+- `scripts/distribute_status.sh`: postprocess 상태 CLI 래퍼
 - `scripts/benchmark_models.py`: baseline/current model과 승인된 후보 STT 모델을 비교하는 benchmark CLI 초안
 - `scripts/setup_launchd.sh`: venv, 의존성, 모델, 폴더, launchd를 한 번에 설정
-- `scripts/cleanup.py`: 오래된 audio/transcript/tmp 정리
-- `scripts/hermes_postprocess/`: Hermes postprocess operator CLI. `python3 -m scripts.hermes_postprocess dry-run`으로 metadata-only 후보 discovery를 수행하고, `validate-correction`, `validate-summary`, `record-misrecognitions`, `promote` subcommand를 제공한다. Promote는 `--allow-promote` 없이는 final write를 하지 않는다.
+- `scripts/cleanup.py`: 오래된 audio/transcript/tmp 정리. 중첩 transcript는 상대 parent+stem 단위로 묶어 서로 다른 과목의 동명 stem을 합치지 않는다.
+- `python -m lecture_stt.downstream.semester`: 학기 manifest plan/apply activation CLI
 - `launchd/com.geonha.lecture-stt.plist`: 메인 워커 상시 실행
 - `launchd/com.geonha.lecture-stt-webpanel.plist`: 웹 제어판 상시 실행
 - `launchd/com.geonha.lecture-stt-distribute.plist`: downstream 워커 상시 실행
@@ -521,9 +515,9 @@ flowchart LR
 
 ## 경로/설정 규칙
 - 프로젝트 내부 리소스(`config/`, `state/`, `tmp/`, `frontend/web-panel/dist`)는 `repo_root()` 기준 상대경로로 해석한다.
-- 사용자 데이터 경로(iCloud inbox, correction/summary, GH archive, Obsidian vault)는 코드 기본값으로 두지 않고 로컬 `config/config.yaml`에서 지정한다.
+- iCloud 입력 경로는 로컬 `config/config.yaml`, Obsidian/GH archive의 활성 학기 경로는 검증된 active semester snapshot에서 지정한다.
 - `config/config.yaml`의 경로 값은 `~`와 `${VAR}` 환경변수 치환을 지원하고, 상대경로는 저장소 루트 기준으로 해석한다.
-- `.env`는 secret뿐 아니라 운영 환경별 경로 override에도 사용할 수 있지만, 실제 외부 저장소 위치의 정본은 `config/config.yaml`이다.
+- `.env`는 secret과 iCloud root override에 사용한다. 학기 archive 위치의 정본은 active semester snapshot 하나다.
 - launchd plist는 저장소에 절대경로를 고정하지 않고 `scripts/setup_launchd.sh`가 현재 repo 위치로 템플릿을 렌더링해 등록한다.
 - 현재 단계의 NFC 처리는 한국어 파일명·시간표 metadata·제안 제목 깨짐을 막는다. 내부 immutable storage key와 사용자 표시 이름은 분리되어 있다. 시간표+녹음 시각 기반 수업 분류와 검증된 transcript 내용 기반 제목은 서로 다른 proposal로만 제안되며 자동으로 정본이 되지 않는다. 두 confirmation 자체는 audit-only이고, confirmed proposal을 실제 정본에 반영하려면 각각의 기본 비활성 CLI materialization을 별도로 실행해야 한다.
 
@@ -565,9 +559,9 @@ flowchart LR
 - 제목 plan 응답과 snapshot에는 제안 제목·NFC storage key·revision·상태·confidence만 남고 transcript 원문/발췌, artifact path, content digest, artifact/job/recording numeric id는 나오지 않는다. Apply plan digest에는 반환하지 않는 artifact identity/path/hash/bytes뿐 아니라 recorded timestamp, current title, selected context, active classification metadata를 포함해 결과 제목이 우연히 같아도 inference 입력 변경을 stale plan으로 거부한다. Apply는 독립 enable, allow-write, expected count, exact digest를 요구하고 read-only preflight 뒤 `BEGIN IMMEDIATE` 안에서 plan을 다시 만들며 commit 직전 파일/DB를 한 번 더 읽는다. Confirmation도 records root를 필수로 받고 현재 metadata와 transcript로 원래 제목 제안을 다시 계산해 proposal과 대조한다. 이 재계산 digest와 linked review/artifact/classification evidence는 lifecycle 전이 뒤에도 재구성 가능하게 구성해 read-only/exclusive/pre-commit 및 confirmed 멱등 replay에서 모두 검증한다. 생성·confirm·reject는 proposal/review만 바꾸고 canonical title/context/manifest는 바꾸지 않는다.
 - `recording_classification_materializations`는 confirmation과 별개의 canonical-write journal이다. 이전/새 title·context row, confirmation/materialization plan digest, old/new manifest digest, 닫힌 metadata-only plan JSON과 `prepared`/`applied` 상태를 기록한다. Proposal touch trigger는 recursive trigger에서도 재귀하지 않으며 materialization은 plan의 target을 현재 proposal에서 다시 계산해 같은 시각의 stale mutation도 쓰기 전에 차단한다. 후속 materialization으로 대체된 applied journal의 재실행은 successor chain 전체와 최신 manifest를 검증한 뒤 `skipped`로 끝난다. Storage v2 read-only 연결도 main DB의 symlink·hardlink·비정규 파일과 unsafe sidecar를 거부하고 SQLite가 연 inode를 재확인한다.
 - `recording_title_materializations`는 confirmed content-title에 대한 별도 canonical-write journal이다. 이전 title row는 비-current 이력으로 그대로 두고 새 `system` title row만 current로 전환하며, closed private plan에는 confirmation digest, proposal/review identity와 resolved 시각, transcript artifact locator/hash/bytes/revision, old/new manifest digest를 보존한다. Replay는 이 증거와 현재 recorded time/context/classification으로 inference를 다시 계산한다. Public plan은 제목·storage key·count·digest만 내보낸다. `prepared`는 old/new manifest 중 하나만 허용하고 `applied`는 새 manifest와 새 current title만 허용한다. 일반 confirmed replay는 materialization 뒤 current-title drift로 거부되지만 journal 기반 materialized replay는 원래 current-title evidence를 재구성한 뒤 실제 target title/manifest를 별도로 검증해 `skipped`로 끝난다.
-- 현재 React web panel은 runtime SSE `PanelState` 계약과 Storage v2 on-demand query를 분리한다. 기존 `/api/state`·`/api/events` 흐름은 그대로 유지하고, analytics, recording library, archive evidence review, 시간표·분류와 content-title 검토는 각각의 별도 API를 직접 조회한다. Timetable/title review UI는 suggested proposal 상세, guarded reject, confirmation plan/apply를 연결하고 archive evidence UI도 bounded case/revision metadata와 guarded status/promotion 흐름을 연결한다. 검토 index만 server-canonical unified feed를 한 번 조회하며 exact deep link 뒤의 상세와 mutation은 기존 source workbench를 다시 사용한다.
+- 현재 React web panel은 runtime SSE `PanelState` 계약과 Storage v2 on-demand query를 분리한다. 기존 `/api/state`·`/api/events` 흐름은 그대로 유지하고, analytics, recording library, archive evidence review, 시간표·분류와 content-title 검토는 각각의 별도 API를 직접 조회한다. Timetable/title review UI는 suggested proposal 상세, guarded reject, confirmation plan/apply를 연결하고 archive evidence UI도 bounded case/revision metadata와 guarded status/promotion 흐름을 연결한다. 검토 index만 server-canonical unified feed를 한 번 조회하며 exact deep link 뒤의 상세와 mutation은 기존 source workbench를 다시 사용한다. Transcript preview는 별도 query로만 읽고 녹음 선택 변경·닫기·unmount에서 요청과 캐시를 제거하며, Clipboard API가 제한되는 Tailscale HTTP 접속에서는 브라우저의 legacy copy fallback을 사용한다.
 - 실제 원본이 이미 정리된 과거 recording은 `source_state=missing`과 metadata marker로 파생 이력을 보존한다. Plan과 manifest는 transcript/content 계열 key를 어느 깊이에서도 허용하지 않는다. CLI apply는 write/count/plan SHA-256/missing-source 확인 플래그를 요구하며 현재 운영 데이터에는 실행하지 않았다.
-- `verify_library()`는 exclusive records-root lock과 단일 SQLite read transaction 안에서 canonical schema/checksum, `quick_check`, foreign key, manifest↔recording/title/context/all-active-jobs/selected-engine/artifact/review/import-map을 비교한다. Materialization journal의 closed plan/digest/proposal/revision chain/selection 상태와 latest manifest digest도 교차 검증하며 `prepared`는 복구가 필요한 비정상 완료 상태로 보고한다. Recording-level source와 ingest hash/size/MIME, job artifact ownership과 `jobs/<job_key>/` namespace도 직접 확인한다. 파일은 record-root dirfd 기준 `openat` + `O_NOFOLLOW`로 열어 같은 descriptor에서 inode/link/size/hash를 확인하며, root identity 교체와 DB에 없는 file/directory/symlink/special entry, orphan record, stale staging, 예상하지 않은 lock을 오류로 보고한다. 재귀 검사는 깊이·entry 상한을 둔다. `read_library_snapshot()`은 verifier/CLI용 요약 projection으로 유지하고, 웹 패널은 본문·경로를 더 좁게 닫은 `library.py`의 bounded list/detail adapter를 사용한다.
+- `verify_library()`는 exclusive records-root lock과 단일 SQLite read transaction 안에서 canonical schema/checksum, `quick_check`, foreign key, manifest↔recording/title/context/all-active-jobs/selected-engine/artifact/review/import-map을 비교한다. Materialization journal의 closed plan/digest/proposal/revision chain/selection 상태와 latest manifest digest도 교차 검증하며 `prepared`는 복구가 필요한 비정상 완료 상태로 보고한다. Recording-level source와 ingest hash/size/MIME, job artifact ownership과 `jobs/<job_key>/` namespace도 직접 확인한다. 파일은 record-root dirfd 기준 `openat` + `O_NOFOLLOW`로 열어 같은 descriptor에서 inode/link/size/hash를 확인하며, root identity 교체와 DB에 없는 file/directory/symlink/special entry, orphan record, stale staging, 예상하지 않은 lock을 오류로 보고한다. 재귀 검사는 깊이·entry 상한을 둔다. `read_library_snapshot()`은 verifier/CLI용 요약 projection으로 유지하고, 웹 패널의 `library.py`는 metadata-only list/detail과 별도 gated transcript preview를 제공한다. Preview는 DB가 records root 안에 있으면 거부하고 shared root lock과 SQLite read snapshot을 함께 유지한 채 canonical `jobs/<job_key>/transcript.txt`와 `text/plain` MIME essence를 요구한다. 모든 path component를 `O_NOFOLLOW`로 열어 single-link regular file, stable stat, configured size 상한, DB bytes/SHA-256, strict UTF-8과 NUL 부재를 확인하며 historical recovery의 charset/provenance MIME parameter는 허용한다. 응답에는 artifact path/hash와 내부 numeric id를 포함하지 않는다.
 - manifest 기반 단일 작업 Python worker 계약과 작업을 소유하지 않는 Go
   controller shadow를 추가했다. 격리 churn fixture는 create/append/reset/
   delete-before-stable/temp ignore/rename/Unicode 흐름을 lockstep으로 재현하고,
@@ -591,10 +585,10 @@ flowchart LR
 - iCloud 이벤트는 controller가 소유하는 bounded polling + Python canonical
   안정화 창 + 기존 로컬 staging 흐름이 정본이다. 향후 파일 이벤트는 즉시
   깨우는 힌트로만 사용하고 주기적 reconcile을 유지한다.
-- 현재 웹 패널 API는 localhost 신뢰 경계다. Tailscale Serve로 노출하기 전에 identity 검증, Origin/Host/CSRF 방어, mutating API audit가 선행되어야 한다.
+- 웹 패널 백엔드는 localhost bind를 유지하고 현재 Tailscale Serve가 tailnet 안에서만 중계한다. 애플리케이션 자체에는 사용자별 인증이나 Origin/Host/CSRF 검증이 없으므로 tailnet 접속자는 preview opt-in이 켜진 동안 전사 본문을 읽을 수 있다. 공개 인터넷으로의 노출은 허용하지 않으며, 범위를 넓히기 전 identity 검증과 mutating API audit가 선행되어야 한다.
 
 ## 테스트 범위
-- 현재 자동 테스트는 STT pipeline, downstream, web panel state/backend, script entrypoints, cleanup/log retention, Hermes postprocess operator를 함께 검증한다.
+- 현재 자동 테스트는 STT pipeline, 학기 activation/direct transcript delivery, legacy archive compatibility, web panel state/backend, script entrypoints, cleanup/log retention을 함께 검증한다.
 - `tests/test_stt_main.py`, `tests/test_single_job_contract.py`, `tests/test_retry_job_contract.py`, `tests/test_retry_job_cli_canary.py`: pause/resume/status control command, STT retry/failure, dedupe/replay, quality scorecard sidecar, closed single-job/retry manifest, exact claim fence, stale evidence, kill switch, crash recovery와 명시적 결과 회귀 테스트
 - `tests/test_controller_topology.py`: real-repo/TemporaryDirectory static topology, candidate read-only args/schedule/log/placeholder, setup auto-install 분리, label/log collision, full-template digest와 symlink/hardlink/unstable/oversize/duplicate-plist fail-closed 검증
 - `tests/test_controller_bundle.py`: TemporaryDirectory-only exact plan/prepare guard, exclusive durable artifact, completed replay, partial/extra/tampered bundle recovery-required, source/config/template/kill-switch drift와 metadata-only CLI 회귀 테스트
@@ -615,7 +609,6 @@ flowchart LR
 - `tests/test_correction_manual.py`: 자동 correction provider 제거, API key 불필요, manual mode pending skip 회귀 테스트
 - `tests/test_distribute_status.py`: deliveries CLI 출력과 삭제 동작
 - `tests/test_web_panel.py`, `tests/test_web_panel_state.py`: 웹 제어판 종료 동작, React 친화형 snapshot 계약, 로그 stream reset 회귀 테스트
-- `tests/test_hermes_postprocess.py`: Hermes postprocess candidate discovery, action plan, path resolution, raw-body leak prevention, prompt loader, staging manifest, review-only misrecognition queue, promote safety/rollback/path validation, correction/summary validators
 - `tests/test_script_entrypoints.py`, `tests/test_rotate_logs_script.py`, `tests/test_log_retention.py`, `tests/test_paths.py`, `tests/test_runtime_migration_config.py`, `tests/test_notifier.py`, `tests/test_benchmark_models.py`: entrypoint portability, log cleanup, path/default config, notification, benchmark safety 회귀 테스트
 
 ## 유지 규칙

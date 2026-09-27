@@ -173,6 +173,37 @@ class ScriptEntrypointTests(unittest.TestCase):
             self.assertTrue((transcript_dir / "real_lecture.quality.json").exists())
             self.assertFalse((transcript_dir / "orphan.quality.json").exists())
 
+    def test_cleanup_transcripts_groups_nested_course_sets_independently(self) -> None:
+        module = _load_module("cleanup_script", REPO_ROOT / "scripts" / "cleanup.py")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            transcript_dir = Path(temp_dir)
+            first = transcript_dir / "2026-2" / "01_computer_architecture"
+            second = transcript_dir / "2026-2" / "02_computer_network"
+            first.mkdir(parents=True)
+            second.mkdir(parents=True)
+            now = time.time()
+
+            for directory in (first, second):
+                for suffix in (".txt", ".json", ".quality.json"):
+                    path = directory / f"same_stem{suffix}"
+                    path.write_text("{}", encoding="utf-8")
+                    os.utime(path, (now - 600, now - 600))
+
+            deleted, kept = module._cleanup_transcripts(
+                transcript_dir,
+                cutoff_ts=now + 1,
+                dry_run=False,
+                min_keep=1,
+            )
+
+            self.assertEqual(deleted, 3)
+            self.assertEqual(kept, 3)
+            remaining_parents = {
+                path.parent.relative_to(transcript_dir)
+                for path in transcript_dir.rglob("same_stem.txt")
+            }
+            self.assertEqual(len(remaining_parents), 1)
+
     def test_cleanup_preserves_unresolved_needs_review_artifacts(self) -> None:
         module = _load_module("cleanup_script", REPO_ROOT / "scripts" / "cleanup.py")
         with tempfile.TemporaryDirectory() as temp_dir:

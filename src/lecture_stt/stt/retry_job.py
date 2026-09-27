@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import quote
 
+from lecture_stt.downstream.course_storage import CourseStorageError, descendant_relative_path
 from lecture_stt.stt.single_job import worker_identity
 
 
@@ -195,6 +196,26 @@ def _validate_direct_child_relative_path(value: Any, *, label: str) -> str:
         raise RetryJobContractError(f"{label} must name exactly one direct child")
     if candidate.name in {"", ".", ".."} or candidate.name != relative_path:
         raise RetryJobContractError(f"{label} must name exactly one direct child")
+    return relative_path
+
+
+def _validate_transcript_relative_path(
+    value: Any,
+    *,
+    label: str,
+    canonical_base: str,
+    suffix: str,
+) -> str:
+    relative_path = _require_string(value, label)
+    if "\x00" in relative_path:
+        raise RetryJobContractError(f"{label} contains NUL")
+    candidate = Path(relative_path)
+    if candidate.is_absolute() or not candidate.parts:
+        raise RetryJobContractError(f"{label} must stay under the transcript root")
+    if any(part in {"", ".", ".."} for part in candidate.parts):
+        raise RetryJobContractError(f"{label} must stay under the transcript root")
+    if candidate.name != f"{canonical_base}{suffix}":
+        raise RetryJobContractError(f"{label} must match canonical_base")
     return relative_path
 
 
@@ -457,20 +478,23 @@ def _transcript_relative_path(
     label: str,
 ) -> str:
     try:
-        relative_path = transcript_path.relative_to(transcript_root)
-    except ValueError as exc:
-        raise RetryJobConflictError(
-            f"{label} is outside the configured transcript root"
-        ) from exc
-    relative_name = _validate_direct_child_relative_path(
-        os.fspath(relative_path),
-        label=label,
-    )
-    if relative_name != f"{canonical_base}{suffix}":
-        raise RetryJobConflictError(
-            f"{label} does not match the retry job canonical base"
+        return descendant_relative_path(
+            transcript_root,
+            transcript_path,
+            field=label,
+            expected_filename=f"{canonical_base}{suffix}",
         )
-    return relative_name
+    except CourseStorageError as exc:
+        message = str(exc)
+        if "outside the configured root" in message:
+            raise RetryJobConflictError(
+                f"{label} is outside the configured transcript root"
+            ) from exc
+        if "expected filename" in message:
+            raise RetryJobConflictError(
+                f"{label} does not match the retry job canonical base"
+            ) from exc
+        raise RetryJobConflictError(message) from exc
 
 
 def build_retry_job_plan(
@@ -644,22 +668,18 @@ def validate_retry_job_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
         retry_job.get("canonical_base"),
         "retry_job.canonical_base",
     )
-    transcript_txt_relative_path = _validate_direct_child_relative_path(
+    transcript_txt_relative_path = _validate_transcript_relative_path(
         retry_job.get("transcript_txt_relative_path"),
         label="retry_job.transcript_txt_relative_path",
+        canonical_base=canonical_base,
+        suffix=".txt",
     )
-    transcript_json_relative_path = _validate_direct_child_relative_path(
+    transcript_json_relative_path = _validate_transcript_relative_path(
         retry_job.get("transcript_json_relative_path"),
         label="retry_job.transcript_json_relative_path",
+        canonical_base=canonical_base,
+        suffix=".json",
     )
-    if transcript_txt_relative_path != f"{canonical_base}.txt":
-        raise RetryJobContractError(
-            "retry_job.transcript_txt_relative_path must match canonical_base"
-        )
-    if transcript_json_relative_path != f"{canonical_base}.json":
-        raise RetryJobContractError(
-            "retry_job.transcript_json_relative_path must match canonical_base"
-        )
 
     audio = _require_mapping(plan.get("audio"), "audio")
     _require_exact_keys(audio, _AUDIO_KEYS, "audio")

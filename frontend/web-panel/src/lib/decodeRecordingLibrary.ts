@@ -10,11 +10,13 @@ import type {
   RecordingDetailRecording,
   RecordingDetailReview,
   RecordingLibraryJobStatus,
+  RecordingLibraryCapabilities,
   RecordingLibraryListPayload,
   RecordingLibrarySummary,
   RecordingReviewSeverity,
   RecordingSourceMetadata,
   RecordingTitleMetadata,
+  TranscriptPreviewPayload,
 } from "../types"
 
 const STORAGE_KEY_PATTERN = /^[0-9A-Za-z_-]+$/
@@ -84,6 +86,7 @@ const DETAIL_LIMITS = {
   artifacts: 500,
   reviews: 100,
 } as const
+const TRANSCRIPT_PREVIEW_MAX_BYTES = 16_777_216
 const ARTIFACT_STAGE_BY_KIND: Record<RecordingArtifactKind, RecordingArtifactStage> = {
   source_copy: "source",
   transcript_raw_text: "transcript",
@@ -164,6 +167,21 @@ function readBoolean(
     throw new Error(`${label}.${key} 값이 불리언이 아닙니다.`)
   }
   return value
+}
+
+function decodeRecordingLibraryCapabilities(
+  input: unknown,
+  label: string,
+): RecordingLibraryCapabilities {
+  if (input === undefined || input === null) {
+    return {
+      transcript_preview: false,
+    }
+  }
+  const record = asRecord(input, label)
+  return {
+    transcript_preview: readBoolean(record, "transcript_preview", label),
+  }
 }
 
 function readNonNegativeInteger(
@@ -323,6 +341,19 @@ function readNfcString(
   const value = readString(record, key, label, maxLength)
   if (value !== value.normalize("NFC")) {
     throw new Error(`${label}.${key} 값이 NFC 정규화와 일치하지 않습니다.`)
+  }
+  return value
+}
+
+function readText(
+  record: Record<string, unknown>,
+  key: string,
+  label: string,
+  maxLength: number,
+): string {
+  const value = record[key]
+  if (typeof value !== "string" || value.length > maxLength) {
+    throw new Error(`${label}.${key} 값이 올바른 문자열이 아닙니다.`)
   }
   return value
 }
@@ -598,6 +629,10 @@ export function decodeRecordingLibraryList(
     summaries: readArray(record, "summaries", "recordingLibrary").map((item, index) =>
       decodeListSummary(item, `recordingLibrary.summaries[${index}]`),
     ),
+    capabilities: decodeRecordingLibraryCapabilities(
+      record.capabilities,
+      "recordingLibrary.capabilities",
+    ),
   }
 
   const statusSum = payload.counts.queued
@@ -753,4 +788,85 @@ export function decodeRecordingDetail(input: unknown): RecordingDetailPayload {
   }
 
   return payload
+}
+
+export function decodeTranscriptPreview(input: unknown): TranscriptPreviewPayload {
+  const record = asRecord(input, "transcriptPreview")
+  const available = readBoolean(record, "available", "transcriptPreview")
+  if (!available) {
+    throw new Error("transcriptPreview.available 값은 true여야 합니다.")
+  }
+
+  const recording = asRecord(record.recording, "transcriptPreview.recording")
+  const transcript = asRecord(record.transcript, "transcriptPreview.transcript")
+  const text = readText(
+    transcript,
+    "text",
+    "transcriptPreview.transcript",
+    TRANSCRIPT_PREVIEW_MAX_BYTES,
+  )
+  const characters = readNonNegativeInteger(
+    transcript,
+    "characters",
+    "transcriptPreview.transcript",
+  )
+  if (characters > TRANSCRIPT_PREVIEW_MAX_BYTES) {
+    throw new Error("transcriptPreview.transcript.characters 값이 허용 상한을 초과합니다.")
+  }
+  if (Array.from(text).length !== characters) {
+    throw new Error("transcriptPreview.transcript.characters 값이 본문 문자 수와 일치하지 않습니다.")
+  }
+  const bytes = readNonNegativeInteger(
+    transcript,
+    "bytes",
+    "transcriptPreview.transcript",
+  )
+  if (bytes > TRANSCRIPT_PREVIEW_MAX_BYTES) {
+    throw new Error("transcriptPreview.transcript.bytes 값이 허용 상한을 초과합니다.")
+  }
+  if (characters > bytes) {
+    throw new Error("transcriptPreview.transcript.characters 값이 bytes를 초과합니다.")
+  }
+  if (new TextEncoder().encode(text).length !== bytes) {
+    throw new Error("transcriptPreview.transcript.bytes 값이 UTF-8 바이트 수와 일치하지 않습니다.")
+  }
+
+  return {
+    schema_version: readLiteral(
+      record,
+      "schema_version",
+      ["storage-v2/transcript-preview@1"],
+      "transcriptPreview",
+    ),
+    available: true,
+    recording: {
+      storage_key: readStorageKey(
+        recording,
+        "storage_key",
+        "transcriptPreview.recording",
+      ),
+      display_name: readNfcString(
+        recording,
+        "display_name",
+        "transcriptPreview.recording",
+        1024,
+      ),
+    },
+    transcript: {
+      job_key: readString(transcript, "job_key", "transcriptPreview.transcript", 255),
+      revision: readPositiveInteger(
+        transcript,
+        "revision",
+        "transcriptPreview.transcript",
+      ),
+      bytes,
+      characters,
+      created_at: readTimestamp(
+        transcript,
+        "created_at",
+        "transcriptPreview.transcript",
+      ),
+      text,
+    },
+  }
 }

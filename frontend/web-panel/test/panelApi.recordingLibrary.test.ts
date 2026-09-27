@@ -3,10 +3,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import {
   fetchRecordingDetail,
   fetchRecordingLibraryList,
+  fetchTranscriptPreview,
 } from "../src/lib/panelApi"
 import {
   buildRecordingDetailPayload,
   buildRecordingLibraryListPayload,
+  buildTranscriptPreviewPayload,
 } from "./recordingLibraryFixtures"
 
 let fetchSpy: ReturnType<typeof vi.spyOn>
@@ -99,5 +101,76 @@ describe("panelApi recording library endpoints", () => {
     ).rejects.toThrow(/must not include surrounding whitespace/)
 
     expect(fetchSpy).not.toHaveBeenCalled()
+  })
+
+  it("fetches transcript preview with the canonical path and request match", async () => {
+    const controller = new AbortController()
+    const payload = buildTranscriptPreviewPayload("rec_meeting_2026_07_22")
+    fetchSpy.mockResolvedValueOnce(buildJsonResponse(200, payload))
+
+    await expect(
+      fetchTranscriptPreview("rec_meeting_2026_07_22", controller.signal),
+    ).resolves.toEqual(payload)
+
+    expect(fetchSpy).toHaveBeenCalledWith(
+      "/api/storage-v2/library/recordings/rec_meeting_2026_07_22/transcript-preview",
+      {
+        cache: "no-store",
+        signal: controller.signal,
+      },
+    )
+  })
+
+  it("rejects transcript preview responses for another storage_key", async () => {
+    fetchSpy.mockResolvedValueOnce(
+      buildJsonResponse(200, buildTranscriptPreviewPayload("rec_2026_07_23_ds_05")),
+    )
+
+    await expect(
+      fetchTranscriptPreview("rec_meeting_2026_07_22"),
+    ).rejects.toThrow(/storage_key does not match/)
+  })
+
+  it("rejects transcript preview responses when the current job identity changed", async () => {
+    fetchSpy.mockResolvedValueOnce(
+      buildJsonResponse(200, buildTranscriptPreviewPayload("rec_meeting_2026_07_22")),
+    )
+
+    await expect(
+      fetchTranscriptPreview(
+        "rec_meeting_2026_07_22",
+        undefined,
+        { jobKey: "job_meeting_02", revision: 2 },
+      ),
+    ).rejects.toThrow(/job_key does not match/)
+
+    fetchSpy.mockResolvedValueOnce(
+      buildJsonResponse(200, buildTranscriptPreviewPayload("rec_meeting_2026_07_22")),
+    )
+
+    await expect(
+      fetchTranscriptPreview(
+        "rec_meeting_2026_07_22",
+        undefined,
+        { jobKey: "job_meeting_01", revision: 9 },
+      ),
+    ).rejects.toThrow(/revision does not match/)
+  })
+
+  it("maps transcript preview status failures to clear fallback messages", async () => {
+    fetchSpy
+      .mockResolvedValueOnce(buildJsonResponse(404, {}))
+      .mockResolvedValueOnce(buildJsonResponse(403, {}))
+      .mockResolvedValueOnce(buildJsonResponse(409, {}))
+
+    await expect(fetchTranscriptPreview("rec_meeting_2026_07_22")).rejects.toThrow(
+      "전사 미리보기를 찾지 못했습니다.",
+    )
+    await expect(fetchTranscriptPreview("rec_meeting_2026_07_22")).rejects.toThrow(
+      "전사 미리보기 접근이 허용되지 않았습니다.",
+    )
+    await expect(fetchTranscriptPreview("rec_meeting_2026_07_22")).rejects.toThrow(
+      "전사 미리보기를 아직 열 수 없습니다.",
+    )
   })
 })

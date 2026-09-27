@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import logging
 import os
 import sqlite3
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -15,8 +17,17 @@ from lecture_stt.downstream.lib import (
     DEFAULT_OBSIDIAN_NOTE_DIR,
     DownstreamConfig,
     DownstreamDistributor,
+    JsonlLogger,
     SubjectRoute,
     default_subject_routes,
+)
+from lecture_stt.downstream.semester import load_active_semester
+from lecture_stt.downstream.transcript_delivery import (
+    TranscriptPostprocessSettings,
+    TranscriptDeliveryDistributor,
+    load_postprocess_settings,
+    open_delivery_db,
+    reconcile_completed_jobs,
 )
 from lecture_stt.shared.log_retention import DEFAULT_DOWNSTREAM_BACKUP_COUNT, DEFAULT_LOG_MAX_BYTES
 from lecture_stt.shared.paths import (
@@ -36,6 +47,20 @@ except ImportError:  # pragma: no cover - macOS worker path uses fcntl.
 
 
 logger = logging.getLogger("lecture_stt.downstream")
+
+
+@dataclass(frozen=True)
+class TranscriptWorkerConfig:
+    enabled: bool
+    db_path: Path
+    scan_interval_sec: int
+    batch_size: int
+    log_jsonl_path: Path
+    log_jsonl_max_bytes: int
+    log_jsonl_backup_count: int
+    lock_path: Path
+    active_semester_path: Path
+    postprocess_settings: TranscriptPostprocessSettings | None = None
 
 
 class SingleInstanceLock:
@@ -87,6 +112,28 @@ def _default_config() -> dict[str, Any]:
         "paths": {
             "db_path": str(default_db_path()),
         },
+        "transcript_delivery": {
+            "enabled": False,
+            "active_semester_manifest": str(state_root / "active-semester.json"),
+            "correction_staging_dir": "${LECTURE_RECORDINGS_ROOT}/03_correction",
+            "summary_staging_dir": "${LECTURE_RECORDINGS_ROOT}/04_summarize",
+            "generator": {
+                "backend": "codex_cli",
+                "codex_binary": "codex",
+                "model": "gpt-5.6-terra",
+                "reasoning_effort": "low",
+                "timeout_sec": 1200,
+                "max_attempts": 3,
+                "max_correction_chars": 100000,
+                "max_summary_chars": 100000,
+            },
+            "scan_interval_sec": 30,
+            "batch_size": 20,
+            "log_jsonl_path": str(default_log_dir() / "transcript-delivery.jsonl"),
+            "log_jsonl_max_bytes": DEFAULT_LOG_MAX_BYTES,
+            "log_jsonl_backup_count": DEFAULT_DOWNSTREAM_BACKUP_COUNT,
+            "lock_path": str(state_root / "transcript-delivery.lock"),
+        },
         "downstream": {
             "scan_interval_sec": 30,
             "stable_for_sec": 60,
@@ -108,6 +155,92 @@ def _default_config() -> dict[str, Any]:
             },
         },
     }
+
+
+def _load_config_mapping(config_path: str) -> tuple[dict[str, Any], dict[str, str]]:
+    root = repo_root()
+    path = Path(config_path)
+    if not path.is_absolute():
+        path = root / path
+    if not path.exists():
+        raise FileNotFoundError(f"Missing required config file: {path}")
+    with path.open("r", encoding="utf-8") as handle:
+        loaded = yaml.safe_load(handle) or {}
+    if not isinstance(loaded, dict):
+        raise ValueError(f"Config must be a YAML mapping in {path}")
+    return _deep_merge(_default_config(), loaded), runtime_env(dotenv_path=env_file())
+
+
+def load_transcript_worker_config(
+    config_path: str = "config/config.yaml",
+) -> TranscriptWorkerConfig:
+    merged, env = _load_config_mapping(config_path)
+    paths_cfg = merged.get("paths") or {}
+    delivery_cfg = merged.get("transcript_delivery") or {}
+    if not isinstance(delivery_cfg, dict):
+        raise ValueError("transcript_delivery must be a mapping")
+
+    try:
+        enabled = _parse_bool(delivery_cfg.get("enabled", False), name="enabled")
+    except ValueError as exc:
+        raise ValueError("transcript_delivery.enabled must be a boolean") from exc
+
+    def parse_positive_int(name: str) -> int:
+        try:
+            value = int(delivery_cfg[name])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"transcript_delivery.{name} must be an integer") from exc
+        if value <= 0:
+            raise ValueError(f"transcript_delivery.{name} must be greater than 0")
+        return value
+
+    def parse_non_negative_int(name: str) -> int:
+        try:
+            value = int(delivery_cfg[name])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"transcript_delivery.{name} must be an integer") from exc
+        if value < 0:
+            raise ValueError(
+                f"transcript_delivery.{name} must be greater than or equal to 0"
+            )
+        return value
+
+    def resolve_delivery_path(name: str) -> Path:
+        raw = delivery_cfg.get(name)
+        if not isinstance(raw, str) or not raw.strip():
+            raise ValueError(f"transcript_delivery.{name} must be a non-empty path string")
+        return resolve_config_path(raw, base_dir=repo_root(), env=env)
+
+    active_semester_path = resolve_delivery_path("active_semester_manifest")
+    postprocess_settings: TranscriptPostprocessSettings | None = None
+    if enabled:
+        postprocess_settings = load_postprocess_settings(
+            delivery_cfg,
+            base_dir=repo_root(),
+            env=env,
+            default_tmp_root=resolve_config_path(
+                str(paths_cfg.get("tmp_dir", str(state_dir()))),
+                base_dir=repo_root(),
+                env=env,
+            ),
+        )
+        load_active_semester(active_semester_path)
+    return TranscriptWorkerConfig(
+        enabled=enabled,
+        db_path=resolve_config_path(
+            str(paths_cfg.get("db_path", str(default_db_path()))),
+            base_dir=repo_root(),
+            env=env,
+        ),
+        active_semester_path=active_semester_path,
+        scan_interval_sec=parse_positive_int("scan_interval_sec"),
+        batch_size=parse_positive_int("batch_size"),
+        log_jsonl_path=resolve_delivery_path("log_jsonl_path"),
+        log_jsonl_max_bytes=parse_non_negative_int("log_jsonl_max_bytes"),
+        log_jsonl_backup_count=parse_non_negative_int("log_jsonl_backup_count"),
+        lock_path=resolve_delivery_path("lock_path"),
+        postprocess_settings=postprocess_settings,
+    )
 
 
 def load_worker_config(config_path: str = "config/config.yaml") -> DownstreamConfig:
@@ -215,7 +348,7 @@ def load_worker_config(config_path: str = "config/config.yaml") -> DownstreamCon
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Lecture downstream distribution worker")
+    parser = argparse.ArgumentParser(description="Codex transcript postprocess worker")
     parser.add_argument("--once", action="store_true", help="Run one scan and exit")
     parser.add_argument("--dry-run", action="store_true", help="Plan actions without mutating files or DB")
     parser.add_argument("--config", default="config/config.yaml", help="Path to config.yaml")
@@ -283,6 +416,7 @@ class ScanStatsReporter:
 
 
 def run_worker(config: DownstreamConfig, *, dry_run: bool, run_once: bool) -> None:
+    """Run the retired correction/summary distributor for archive compatibility only."""
     with SingleInstanceLock(config.lock_path):
         distributor = DownstreamDistributor(config, dry_run=dry_run)
         reporter = ScanStatsReporter(
@@ -301,12 +435,109 @@ def run_worker(config: DownstreamConfig, *, dry_run: bool, run_once: bool) -> No
             distributor.close()
 
 
+def _safe_delivery_results(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    results = payload.get("results")
+    if not isinstance(results, list):
+        return []
+    safe: list[dict[str, Any]] = []
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        safe.append(
+            {
+                key: item[key]
+                for key in ("source_job_id", "status", "error_code", "dry_run")
+                if key in item
+            }
+        )
+    return safe
+
+
+def run_transcript_worker(
+    config: TranscriptWorkerConfig,
+    *,
+    dry_run: bool,
+    run_once: bool,
+) -> None:
+    if not config.enabled:
+        logger.info("Transcript postprocess delivery is disabled")
+        return
+    if config.postprocess_settings is None:
+        raise ValueError("Transcript postprocess settings are missing")
+
+    lock = nullcontext() if dry_run else SingleInstanceLock(config.lock_path)
+    with lock:
+        conn = open_delivery_db(config.db_path, readonly=dry_run)
+        jsonl = JsonlLogger(
+            config.log_jsonl_path,
+            enabled=not dry_run,
+            max_bytes=config.log_jsonl_max_bytes,
+            backup_count=config.log_jsonl_backup_count,
+        )
+        distributor = TranscriptDeliveryDistributor(
+            conn,
+            config.postprocess_settings,
+            dry_run=dry_run,
+        )
+        try:
+            while True:
+                reconciliation = reconcile_completed_jobs(
+                    conn,
+                    settings=config.postprocess_settings,
+                    limit=config.batch_size,
+                    dry_run=dry_run,
+                )
+                delivery = distributor.process_pending(limit=config.batch_size)
+                event = {
+                    "event": "transcript_postprocess_scan",
+                    "dry_run": dry_run,
+                    "reconciled": int(reconciliation.get("queued", 0)),
+                    "reconciliation_errors": int(reconciliation.get("errors", 0)),
+                    "processed": int(delivery.get("processed", 0)),
+                    "delivered": int(delivery.get("delivered", 0)),
+                    "conflict": int(delivery.get("conflict", 0)),
+                    "needs_review": int(delivery.get("needs_review", 0)),
+                    "error": int(delivery.get("error", 0)),
+                    "reconciliation_results": _safe_delivery_results(reconciliation),
+                    "delivery_results": _safe_delivery_results(delivery),
+                }
+                jsonl.write(**event)
+                if any(
+                    event[key]
+                    for key in (
+                        "reconciled",
+                        "reconciliation_errors",
+                        "processed",
+                        "conflict",
+                        "needs_review",
+                        "error",
+                    )
+                ):
+                    logger.info(
+                        "transcript postprocess scan reconciled=%s processed=%s delivered=%s "
+                        "conflict=%s needs_review=%s error=%s reconciliation_errors=%s dry_run=%s",
+                        event["reconciled"],
+                        event["processed"],
+                        event["delivered"],
+                        event["conflict"],
+                        event["needs_review"],
+                        event["error"],
+                        event["reconciliation_errors"],
+                        dry_run,
+                    )
+                if run_once:
+                    return
+                time.sleep(config.scan_interval_sec)
+        finally:
+            conn.close()
+
+
 def main() -> None:
     args = parse_args()
     setup_logging()
-    config = load_worker_config(args.config)
+    config = load_transcript_worker_config(args.config)
     try:
-        run_worker(config, dry_run=args.dry_run, run_once=args.once)
+        run_transcript_worker(config, dry_run=args.dry_run, run_once=args.once)
     except BlockingIOError:
         logger.error("Another downstream worker is already running")
         raise SystemExit(1)

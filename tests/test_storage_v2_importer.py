@@ -378,6 +378,45 @@ class StorageV2ImporterTests(unittest.TestCase):
                     records_root=records_root,
                 )
 
+    def test_discover_finds_quality_sidecar_next_to_nested_transcript_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fixture = self._fixture(root)
+            canonical_base = str(fixture["canonical_base"])
+            nested = (
+                Path(fixture["legacy_root"])
+                / "02_transcripts"
+                / "2026-2"
+                / "03_database"
+            )
+            nested.mkdir(parents=True)
+            nested_txt = nested / f"{canonical_base}.txt"
+            nested_json = nested / f"{canonical_base}.json"
+            nested_quality = nested / f"{canonical_base}.quality.json"
+            Path(fixture["transcript_txt"]).rename(nested_txt)
+            Path(fixture["transcript_json"]).rename(nested_json)
+            Path(fixture["quality_json"]).rename(nested_quality)
+            with sqlite3.connect(fixture["legacy_db"]) as conn:
+                conn.execute(
+                    "UPDATE jobs SET transcript_txt_path = ?, transcript_json_path = ? WHERE id = ?",
+                    (str(nested_txt), str(nested_json), int(fixture["job_id"])),
+                )
+                conn.commit()
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+            plan = discover_candidates(
+                fixture["legacy_db"],
+                fixture["legacy_root"],
+                job_ids=[int(fixture["job_id"])],
+            )[0]
+
+            quality = next(
+                artifact
+                for artifact in plan.candidate.artifacts
+                if artifact.kind == "quality_scorecard"
+            )
+            self.assertEqual(quality.source_path, nested_quality.resolve())
+
     def test_missing_source_uses_explicit_marker_and_review_item(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

@@ -33,10 +33,13 @@ from lecture_stt.storage_v2.archive_review import (
     update_archive_review_status,
 )
 from lecture_stt.storage_v2.library import (
+    DEFAULT_TRANSCRIPT_PREVIEW_MAX_BYTES,
+    MAX_TRANSCRIPT_PREVIEW_MAX_BYTES,
     RecordingLibraryDisabledError,
     disabled_recording_library_list,
     list_recordings,
     read_recording_detail,
+    read_recording_transcript_preview,
 )
 from lecture_stt.storage_v2.title_suggestions import (
     TitleSuggestionWriteDisabledError,
@@ -697,11 +700,24 @@ class ControlState:
                 limit=limit,
                 offset=offset,
             )
-        return list_recordings(
+        payload = list_recordings(
             settings["db_path"],
             limit=limit,
             offset=offset,
         )
+        storage_config = self.config_data.get("storage_v2")
+        if not isinstance(storage_config, dict):
+            storage_config = {}
+        library_config = storage_config.get("library")
+        if not isinstance(library_config, dict):
+            library_config = {}
+        payload["capabilities"] = {
+            "transcript_preview": (
+                library_config.get("transcript_preview_enabled")
+                is True
+            ),
+        }
+        return payload
 
     def recording_library_detail(
         self,
@@ -715,6 +731,78 @@ class ControlState:
         return read_recording_detail(
             settings["db_path"],
             storage_key,
+        )
+
+    def _recording_library_preview_settings(self) -> dict[str, Any]:
+        settings = self._recording_library_settings()
+        storage_config = self.config_data.get("storage_v2")
+        if not isinstance(storage_config, dict):
+            storage_config = {}
+        library_config = storage_config.get("library")
+        if not isinstance(library_config, dict):
+            library_config = {}
+        preview_enabled = (
+            library_config.get("transcript_preview_enabled") is True
+        )
+        if not settings["enabled"] or not preview_enabled:
+            return {
+                "enabled": False,
+                "db_path": settings["db_path"],
+            }
+
+        configured_records_root = storage_config.get("records_root")
+        if (
+            not isinstance(configured_records_root, str)
+            or not configured_records_root.strip()
+        ):
+            raise RuntimeError(
+                "storage_v2.records_root must be configured when recording transcript preview is enabled"
+            )
+        configured_max_bytes = library_config.get(
+            "transcript_preview_max_bytes",
+            DEFAULT_TRANSCRIPT_PREVIEW_MAX_BYTES,
+        )
+        if (
+            isinstance(configured_max_bytes, bool)
+            or not isinstance(configured_max_bytes, int)
+            or not 1
+            <= configured_max_bytes
+            <= MAX_TRANSCRIPT_PREVIEW_MAX_BYTES
+        ):
+            raise RuntimeError(
+                "storage_v2.library.transcript_preview_max_bytes must be an integer "
+                f"between 1 and {MAX_TRANSCRIPT_PREVIEW_MAX_BYTES}"
+            )
+        return {
+            "enabled": True,
+            "db_path": settings["db_path"],
+            "records_root": resolve_config_path(
+                configured_records_root,
+                base_dir=self.repo_root,
+                env=self._runtime_env(),
+            ),
+            "max_bytes": int(configured_max_bytes),
+        }
+
+    def recording_library_transcript_preview(
+        self,
+        storage_key: str,
+    ) -> dict[str, Any]:
+        settings = self._recording_library_settings()
+        if not settings["enabled"]:
+            raise RecordingLibraryDisabledError(
+                "Recording library API is disabled"
+            )
+        preview_settings = self._recording_library_preview_settings()
+        if not preview_settings["enabled"]:
+            raise RecordingLibraryDisabledError(
+                "Recording transcript preview API is disabled"
+            )
+        return read_recording_transcript_preview(
+            preview_settings["db_path"],
+            preview_settings["records_root"],
+            storage_key,
+            max_bytes=preview_settings["max_bytes"],
         )
 
     def unified_review_feed(
@@ -2394,18 +2482,20 @@ class ControlState:
         if not path.exists() or not path.is_dir():
             return "missing"
         try:
-            stems = set()
-            for item in path.iterdir():
+            sets: set[tuple[str, str]] = set()
+            for item in path.rglob("*"):
                 if (
                     not item.is_file()
+                    or item.is_symlink()
                     or item.name.startswith(".")
                     or item.name.startswith("~")
                     or item.name.endswith(".quality.json")
                     or item.suffix not in {".txt", ".json"}
                 ):
                     continue
-                stems.add(item.stem)
-            return str(len(stems))
+                relative_parent = str(item.parent.relative_to(path))
+                sets.add((relative_parent, item.stem))
+            return str(len(sets))
         except Exception:
             return "오류"
 

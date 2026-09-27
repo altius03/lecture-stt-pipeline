@@ -3,14 +3,17 @@ import { describe, expect, it } from "vitest"
 import {
   decodeRecordingDetail,
   decodeRecordingLibraryList,
+  decodeTranscriptPreview,
 } from "../src/lib/decodeRecordingLibrary"
 import type {
   RecordingDetailPayload,
   RecordingLibraryListPayload,
+  TranscriptPreviewPayload,
 } from "../src/types"
 import {
   buildRecordingDetailPayload,
   buildRecordingLibraryListPayload,
+  buildTranscriptPreviewPayload,
 } from "./recordingLibraryFixtures"
 
 function mutateList(
@@ -29,15 +32,38 @@ function mutateDetail(
   return payload
 }
 
+function mutatePreview(
+  mutate: (payload: TranscriptPreviewPayload) => void,
+): TranscriptPreviewPayload {
+  const payload = structuredClone(buildTranscriptPreviewPayload())
+  mutate(payload)
+  return payload
+}
+
 describe("decodeRecordingLibrary", () => {
   it("accepts a valid list payload", () => {
     const payload = buildRecordingLibraryListPayload()
     expect(decodeRecordingLibraryList(payload)).toEqual(payload)
   })
 
+  it("defaults missing recording library capabilities to transcript preview off", () => {
+    const payload = mutateList((candidate) => {
+      delete (candidate as Partial<RecordingLibraryListPayload>).capabilities
+    })
+
+    expect(decodeRecordingLibraryList(payload).capabilities).toEqual({
+      transcript_preview: false,
+    })
+  })
+
   it("accepts a valid detail payload", () => {
     const payload = buildRecordingDetailPayload()
     expect(decodeRecordingDetail(payload)).toEqual(payload)
+  })
+
+  it("accepts a valid transcript preview payload", () => {
+    const payload = buildTranscriptPreviewPayload()
+    expect(decodeTranscriptPreview(payload)).toEqual(payload)
   })
 
   it("accepts backend optional text fields when they are blank strings", () => {
@@ -73,6 +99,14 @@ describe("decodeRecordingLibrary", () => {
     expect(() => decodeRecordingLibraryList(payload)).toThrow(
       /recording_library_disabled/,
     )
+  })
+
+  it("rejects non-boolean transcript preview capabilities", () => {
+    const payload = mutateList((candidate) => {
+      ;(candidate.capabilities as unknown as { transcript_preview: string }).transcript_preview = "yes"
+    })
+
+    expect(() => decodeRecordingLibraryList(payload)).toThrow(/불리언/)
   })
 
   it("rejects disabled_reason when available", () => {
@@ -180,5 +214,29 @@ describe("decodeRecordingLibrary", () => {
     })
 
     expect(() => decodeRecordingDetail(payload)).toThrow(/고정 상한/)
+  })
+
+  it("rejects transcript preview byte drift and oversized character counts", () => {
+    const byteDriftPayload = mutatePreview((candidate) => {
+      candidate.transcript.bytes += 1
+    })
+    const oversizedCharactersPayload = mutatePreview((candidate) => {
+      candidate.transcript.characters = 16_777_217
+      candidate.transcript.bytes = 16_777_216
+      candidate.transcript.text = "a".repeat(16_777_216)
+    })
+
+    expect(() => decodeTranscriptPreview(byteDriftPayload)).toThrow(/UTF-8 바이트 수/)
+    expect(() => decodeTranscriptPreview(oversizedCharactersPayload)).toThrow(/허용 상한/)
+  })
+
+  it("preserves decomposed unicode transcript preview text", () => {
+    const payload = mutatePreview((candidate) => {
+      candidate.transcript.text = "e\u0301"
+      candidate.transcript.bytes = new TextEncoder().encode(candidate.transcript.text).length
+      candidate.transcript.characters = Array.from(candidate.transcript.text).length
+    })
+
+    expect(decodeTranscriptPreview(payload).transcript.text).toBe("e\u0301")
   })
 })

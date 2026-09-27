@@ -17,6 +17,7 @@ from lecture_stt.storage_v2.archive_review import (
     ArchiveReviewWriteDisabledError,
 )
 from lecture_stt.storage_v2.library import (
+    RecordingLibraryConflictError,
     RecordingLibraryDisabledError,
     RecordingLibraryNotFoundError,
 )
@@ -365,6 +366,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if isinstance(exc, RecordingLibraryDisabledError):
             self._api_error(403, str(exc))
+            return
+        if isinstance(exc, RecordingLibraryConflictError):
+            self._api_error(409, str(exc))
             return
         if isinstance(exc, ValueError):
             self._api_error(400, str(exc))
@@ -931,6 +935,20 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         self._write_json(200, payload)
 
+    def _serve_recording_library_transcript_preview(
+        self,
+        storage_key: str,
+    ) -> None:
+        assert STATE is not None
+        try:
+            payload = STATE.recording_library_transcript_preview(
+                storage_key
+            )
+        except Exception as exc:
+            self._recording_library_api_error(exc)
+            return
+        self._write_json(200, payload)
+
     def _serve_timetable_classification_detail(
         self,
         proposal_id: int,
@@ -1152,6 +1170,11 @@ class RequestHandler(BaseHTTPRequestHandler):
                 return
             if not action_parts:
                 self._serve_recording_library_detail(storage_key)
+                return
+            if action_parts == ("transcript-preview",):
+                self._serve_recording_library_transcript_preview(
+                    storage_key
+                )
                 return
             self._api_error(404, "Not Found")
             return

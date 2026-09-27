@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import tempfile
 import unicodedata
 import unittest
@@ -13,10 +14,13 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from lecture_stt.storage_v2.library import (
+    RecordingLibraryConflictError,
     RecordingLibraryNotFoundError,
+    RecordingLibraryUnavailableError,
     disabled_recording_library_list,
     list_recordings,
     read_recording_detail,
+    read_recording_transcript_preview,
 )
 from lecture_stt.storage_v2.repository import apply_migration
 
@@ -204,6 +208,8 @@ class StorageV2LibraryTests(unittest.TestCase):
         artifact_kind: str,
         revision: int,
         *,
+        path_rel: str | None = None,
+        content_sha256: str = "a" * 64,
         bytes_count: int | None = 512,
         mime_type: str | None = "text/plain",
         is_latest: bool = True,
@@ -230,8 +236,9 @@ class StorageV2LibraryTests(unittest.TestCase):
                 job_id,
                 artifact_kind,
                 revision,
-                f"artifacts/{job_id}/{artifact_kind}-{revision}.txt",
-                "a" * 64,
+                path_rel
+                or f"artifacts/{job_id}/{artifact_kind}-{revision}.txt",
+                content_sha256,
                 bytes_count,
                 mime_type,
                 int(is_latest),
@@ -239,6 +246,30 @@ class StorageV2LibraryTests(unittest.TestCase):
             ),
         )
         return int(cursor.lastrowid)
+
+    def _write_record_file(
+        self,
+        storage_key: str,
+        relative_path: str,
+        payload: str,
+    ) -> tuple[Path, int, str]:
+        return self._write_record_bytes(
+            storage_key,
+            relative_path,
+            payload.encode("utf-8"),
+        )
+
+    def _write_record_bytes(
+        self,
+        storage_key: str,
+        relative_path: str,
+        payload: bytes,
+    ) -> tuple[Path, int, str]:
+        records_root = self.root / "records"
+        target = records_root / storage_key / relative_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(payload)
+        return records_root, len(payload), hashlib.sha256(payload).hexdigest()
 
     def _insert_review(
         self,
@@ -275,6 +306,10 @@ class StorageV2LibraryTests(unittest.TestCase):
         )
         self.assertEqual(payload["disabled_reason"], "recording_library_disabled")
         self.assertEqual(payload["filters"], {"limit": 50, "offset": 0})
+        self.assertEqual(
+            payload["capabilities"],
+            {"transcript_preview": False},
+        )
         self.assertEqual(payload["counts"]["recordings"], 0)
         self.assertEqual(payload["summaries"], [])
 
@@ -319,6 +354,10 @@ class StorageV2LibraryTests(unittest.TestCase):
         self.assertEqual(payload["counts"]["done"], 1)
         self.assertEqual(payload["counts"]["open_reviews"], 1)
         self.assertEqual(payload["total"], 1)
+        self.assertEqual(
+            payload["capabilities"],
+            {"transcript_preview": False},
+        )
         summary = payload["summaries"][0]
         self.assertEqual(summary["storage_key"], "lecture_recording")
         self.assertEqual(summary["display_name"], "알고리즘 3교시")
@@ -507,6 +546,438 @@ class StorageV2LibraryTests(unittest.TestCase):
             read_recording_detail(self.db_path, "bad/key")
         with self.assertRaises(RecordingLibraryNotFoundError):
             read_recording_detail(self.db_path, "missing_recording")
+
+    def test_transcript_preview_returns_public_text_payload(self) -> None:
+        recording_id = self._insert_recording(
+            "preview_recording",
+            original_name_nfc="미리보기.m4a",
+        )
+        self._insert_title(recording_id, "자료구조 1강")
+        job_id = self._insert_job(
+            recording_id,
+            "job_preview",
+            status="done",
+            progress=100,
+        )
+        transcript_text = unicodedata.normalize(
+            "NFD",
+            "첫 줄입니다.\n강의 노트",
+        )
+        path_rel = "jobs/job_preview/transcript.txt"
+        records_root, bytes_count, digest = self._write_record_file(
+            "preview_recording",
+            path_rel,
+            transcript_text,
+        )
+        self._insert_artifact(
+            recording_id,
+            job_id,
+            "transcript_raw_text",
+            1,
+            path_rel=path_rel,
+            content_sha256=digest,
+            bytes_count=bytes_count,
+            mime_type=(
+                "text/plain; charset=utf-8; "
+                "provenance=historical-transcript-recovery"
+            ),
+        )
+        self.conn.commit()
+
+        payload = read_recording_transcript_preview(
+            self.db_path,
+            records_root,
+            "preview_recording",
+        )
+
+        self.assertEqual(
+            payload["schema_version"],
+            "storage-v2/transcript-preview@1",
+        )
+        self.assertTrue(payload["available"])
+        self.assertEqual(
+            payload["recording"],
+            {
+                "storage_key": "preview_recording",
+                "display_name": "자료구조 1강",
+            },
+        )
+        self.assertEqual(payload["transcript"]["job_key"], "job_preview")
+        self.assertEqual(payload["transcript"]["revision"], 1)
+        self.assertEqual(payload["transcript"]["bytes"], bytes_count)
+        self.assertEqual(
+            payload["transcript"]["characters"],
+            len(transcript_text),
+        )
+        self.assertEqual(payload["transcript"]["text"], transcript_text)
+        self.assertEqual(
+            payload["transcript"]["text"].encode("utf-8"),
+            transcript_text.encode("utf-8"),
+        )
+        encoded = str(payload)
+        self.assertNotIn("path_rel", encoded)
+        self.assertNotIn("content_sha256", encoded)
+        self.assertNotIn("recording_id", encoded)
+
+    def test_transcript_preview_rejects_ineligible_or_mismatched_transcript(self) -> None:
+        recording_id = self._insert_recording("preview_missing")
+        job_id = self._insert_job(
+            recording_id,
+            "job_processing",
+            status="processing",
+            progress=42,
+        )
+        self._insert_artifact(
+            recording_id,
+            job_id,
+            "transcript_raw_text",
+            1,
+        )
+        self.conn.commit()
+        (self.root / "records").mkdir(parents=True, exist_ok=True)
+
+        with self.assertRaises(RecordingLibraryNotFoundError):
+            read_recording_transcript_preview(
+                self.db_path,
+                self.root / "records",
+                "preview_missing",
+            )
+
+        recording_ok_id = self._insert_recording("preview_conflict")
+        job_ok_id = self._insert_job(recording_ok_id, "job_done")
+        path_rel = "jobs/job_done/transcript.txt"
+        records_root, bytes_count, _digest = self._write_record_file(
+            "preview_conflict",
+            path_rel,
+            "본문은 바뀌었습니다.",
+        )
+        self._insert_artifact(
+            recording_ok_id,
+            job_ok_id,
+            "transcript_raw_text",
+            1,
+            path_rel=path_rel,
+            content_sha256="b" * 64,
+            bytes_count=bytes_count,
+        )
+        self.conn.commit()
+
+        with self.assertRaises(RecordingLibraryConflictError):
+            read_recording_transcript_preview(
+                self.db_path,
+                records_root,
+                "preview_conflict",
+            )
+
+    def test_transcript_preview_fails_closed_when_db_is_inside_records_root(self) -> None:
+        nested_root = self.root / "nested-records"
+        nested_root.mkdir(parents=True, exist_ok=True)
+        nested_db_path = nested_root / "storage-v2.sqlite3"
+        nested_conn = apply_migration(nested_db_path)
+        try:
+            recording_id = int(
+                nested_conn.execute(
+                    """
+                    INSERT INTO recordings(
+                        storage_key,
+                        original_name_raw,
+                        original_name_nfc,
+                        source_relpath,
+                        source_state,
+                        ingest_bytes,
+                        source_mime,
+                        recorded_at,
+                        received_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "preview_nested",
+                        "preview_nested.m4a",
+                        "preview_nested.m4a",
+                        "source/preview_nested.m4a",
+                        "available",
+                        1,
+                        "audio/mp4",
+                        "2026-07-23T09:00:00+09:00",
+                        "2026-07-23T09:01:00+09:00",
+                    ),
+                ).lastrowid
+            )
+            job_id = int(
+                nested_conn.execute(
+                    """
+                    INSERT INTO transcription_jobs(
+                        recording_id,
+                        job_key,
+                        job_relpath,
+                        requested_profile,
+                        requested_profile_version,
+                        status,
+                        progress,
+                        is_current,
+                        queued_at,
+                        started_at,
+                        finished_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        recording_id,
+                        "job_nested",
+                        "jobs/job_nested",
+                        "lecture",
+                        "2026-07-23.1",
+                        "done",
+                        100,
+                        1,
+                        "2026-07-23T09:02:00+09:00",
+                        "2026-07-23T09:03:00+09:00",
+                        "2026-07-23T09:04:00+09:00",
+                    ),
+                ).lastrowid
+            )
+            transcript_text = "안전 경계 확인"
+            path_rel = "jobs/job_nested/transcript.txt"
+            target = nested_root / "preview_nested" / path_rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            encoded = transcript_text.encode("utf-8")
+            target.write_bytes(encoded)
+            nested_conn.execute(
+                """
+                INSERT INTO artifacts(
+                    recording_id,
+                    job_id,
+                    artifact_kind,
+                    revision,
+                    path_rel,
+                    content_sha256,
+                    bytes,
+                    mime_type,
+                    is_latest
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    recording_id,
+                    job_id,
+                    "transcript_raw_text",
+                    1,
+                    path_rel,
+                    hashlib.sha256(encoded).hexdigest(),
+                    len(encoded),
+                    "text/plain",
+                    1,
+                ),
+            )
+            nested_conn.commit()
+
+            with self.assertRaises(RecordingLibraryUnavailableError):
+                read_recording_transcript_preview(
+                    nested_db_path,
+                    nested_root,
+                    "preview_nested",
+                )
+        finally:
+            nested_conn.close()
+
+    def test_transcript_preview_rejects_oversize_payload(self) -> None:
+        recording_id = self._insert_recording("preview_oversize")
+        job_id = self._insert_job(recording_id, "job_oversize")
+        path_rel = "jobs/job_oversize/transcript.txt"
+        records_root, bytes_count, digest = self._write_record_file(
+            "preview_oversize",
+            path_rel,
+            "1234567890",
+        )
+        self._insert_artifact(
+            recording_id,
+            job_id,
+            "transcript_raw_text",
+            1,
+            path_rel=path_rel,
+            content_sha256=digest,
+            bytes_count=bytes_count,
+        )
+        self.conn.commit()
+
+        with self.assertRaises(RecordingLibraryConflictError):
+            read_recording_transcript_preview(
+                self.db_path,
+                records_root,
+                "preview_oversize",
+                max_bytes=4,
+            )
+
+    def test_transcript_preview_rejects_symlink_and_hardlink_artifacts(self) -> None:
+        symlink_recording_id = self._insert_recording("preview_symlink")
+        symlink_job_id = self._insert_job(symlink_recording_id, "job_symlink")
+        source_rel = "jobs/job_symlink/transcript-source.txt"
+        records_root, bytes_count, digest = self._write_record_file(
+            "preview_symlink",
+            source_rel,
+            "symlink target",
+        )
+        symlink_target = records_root / "preview_symlink" / source_rel
+        path_rel = "jobs/job_symlink/transcript.txt"
+        symlink_path = records_root / "preview_symlink" / path_rel
+        symlink_path.symlink_to(symlink_target)
+        self._insert_artifact(
+            symlink_recording_id,
+            symlink_job_id,
+            "transcript_raw_text",
+            1,
+            path_rel=path_rel,
+            content_sha256=digest,
+            bytes_count=bytes_count,
+        )
+        self.conn.commit()
+
+        with self.assertRaises(RecordingLibraryUnavailableError):
+            read_recording_transcript_preview(
+                self.db_path,
+                records_root,
+                "preview_symlink",
+            )
+
+        hardlink_recording_id = self._insert_recording("preview_hardlink")
+        hardlink_job_id = self._insert_job(hardlink_recording_id, "job_hardlink")
+        source_rel = "jobs/job_hardlink/transcript-source.txt"
+        records_root, bytes_count, digest = self._write_record_file(
+            "preview_hardlink",
+            source_rel,
+            "hardlink target",
+        )
+        source_path = records_root / "preview_hardlink" / source_rel
+        hardlink_rel = "jobs/job_hardlink/transcript.txt"
+        hardlink_path = records_root / "preview_hardlink" / hardlink_rel
+        hardlink_path.parent.mkdir(parents=True, exist_ok=True)
+        hardlink_path.hardlink_to(source_path)
+        self._insert_artifact(
+            hardlink_recording_id,
+            hardlink_job_id,
+            "transcript_raw_text",
+            1,
+            path_rel=hardlink_rel,
+            content_sha256=digest,
+            bytes_count=bytes_count,
+        )
+        self.conn.commit()
+
+        with self.assertRaises(RecordingLibraryUnavailableError):
+            read_recording_transcript_preview(
+                self.db_path,
+                records_root,
+                "preview_hardlink",
+            )
+
+    def test_transcript_preview_rejects_invalid_utf8_and_nul(self) -> None:
+        invalid_recording_id = self._insert_recording("preview_invalid_utf8")
+        invalid_job_id = self._insert_job(invalid_recording_id, "job_invalid_utf8")
+        invalid_rel = "jobs/job_invalid_utf8/transcript.txt"
+        records_root, bytes_count, digest = self._write_record_bytes(
+            "preview_invalid_utf8",
+            invalid_rel,
+            b"\xff\xfe\xfd",
+        )
+        self._insert_artifact(
+            invalid_recording_id,
+            invalid_job_id,
+            "transcript_raw_text",
+            1,
+            path_rel=invalid_rel,
+            content_sha256=digest,
+            bytes_count=bytes_count,
+        )
+        self.conn.commit()
+
+        with self.assertRaises(RecordingLibraryConflictError):
+            read_recording_transcript_preview(
+                self.db_path,
+                records_root,
+                "preview_invalid_utf8",
+            )
+
+        nul_recording_id = self._insert_recording("preview_nul")
+        nul_job_id = self._insert_job(nul_recording_id, "job_nul")
+        nul_rel = "jobs/job_nul/transcript.txt"
+        records_root, bytes_count, digest = self._write_record_bytes(
+            "preview_nul",
+            nul_rel,
+            b"line1\x00line2",
+        )
+        self._insert_artifact(
+            nul_recording_id,
+            nul_job_id,
+            "transcript_raw_text",
+            1,
+            path_rel=nul_rel,
+            content_sha256=digest,
+            bytes_count=bytes_count,
+        )
+        self.conn.commit()
+
+        with self.assertRaises(RecordingLibraryConflictError):
+            read_recording_transcript_preview(
+                self.db_path,
+                records_root,
+                "preview_nul",
+            )
+
+    def test_transcript_preview_rejects_noncanonical_path_and_mime(self) -> None:
+        path_recording_id = self._insert_recording("preview_path_shape")
+        path_job_id = self._insert_job(path_recording_id, "job_path_shape")
+        path_rel = "jobs/job_path_shape/transcript-copy.txt"
+        records_root, bytes_count, digest = self._write_record_file(
+            "preview_path_shape",
+            path_rel,
+            "canonical path required",
+        )
+        self._insert_artifact(
+            path_recording_id,
+            path_job_id,
+            "transcript_raw_text",
+            1,
+            path_rel=path_rel,
+            content_sha256=digest,
+            bytes_count=bytes_count,
+            mime_type="text/plain",
+        )
+        self.conn.commit()
+
+        with self.assertRaises(RecordingLibraryConflictError):
+            read_recording_transcript_preview(
+                self.db_path,
+                records_root,
+                "preview_path_shape",
+            )
+
+        mime_recording_id = self._insert_recording("preview_mime_shape")
+        mime_job_id = self._insert_job(mime_recording_id, "job_mime_shape")
+        mime_rel = "jobs/job_mime_shape/transcript.txt"
+        records_root, bytes_count, digest = self._write_record_file(
+            "preview_mime_shape",
+            mime_rel,
+            "canonical mime required",
+        )
+        self._insert_artifact(
+            mime_recording_id,
+            mime_job_id,
+            "transcript_raw_text",
+            1,
+            path_rel=mime_rel,
+            content_sha256=digest,
+            bytes_count=bytes_count,
+            mime_type="application/json",
+        )
+        self.conn.commit()
+
+        with self.assertRaises(RecordingLibraryConflictError):
+            read_recording_transcript_preview(
+                self.db_path,
+                records_root,
+                "preview_mime_shape",
+            )
 
     def test_detail_does_not_claim_artifact_truncation_for_empty_omitted_jobs(
         self,

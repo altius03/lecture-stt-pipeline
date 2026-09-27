@@ -886,7 +886,12 @@ def _candidate_from_rows(
         code_prefix="transcript_json",
         expected=transcript_expected,
     )
-    quality_fallback = legacy_root / "02_transcripts" / f"{canonical_base}.quality.json"
+    transcript_json_value = str(job.get("transcript_json_path") or "").strip()
+    quality_fallback = (
+        Path(transcript_json_value).with_name(f"{canonical_base}.quality.json")
+        if transcript_json_value
+        else legacy_root / "02_transcripts" / f"{canonical_base}.quality.json"
+    )
     add_optional(
         raw_value=quality_fallback,
         fallback=None,

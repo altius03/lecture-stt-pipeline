@@ -27,6 +27,8 @@ app:
 paths:
   watch_folder: "${LECTURE_RECORDINGS_ROOT}/00_inbox"
   stable_audio_folder: "${LECTURE_RECORDINGS_ROOT}/01_audio"
+  # Routed lectures are written below <semester>/<course_dir>; existing flat
+  # artifacts and unrouted/non-lecture results remain readable at this root.
   transcript_folder: "${LECTURE_RECORDINGS_ROOT}/02_transcripts"
   error_folder: "${LECTURE_RECORDINGS_ROOT}/99_errors"
   tmp_dir: ~/Library/Caches/lecture_stt/tmp
@@ -42,6 +44,11 @@ storage_v2:
     enabled: false
   library:
     enabled: false
+    # Transcript body access is a separate opt-in because it crosses the
+    # metadata-only dashboard boundary. Every dashboard reader can use it while
+    # enabled; only verified current DONE TXT is read.
+    transcript_preview_enabled: false
+    transcript_preview_max_bytes: 2097152
   archive_review:
     enabled: false
     status_writes_enabled: false
@@ -126,6 +133,32 @@ cleanup:
   retain_days: 7
   retain_min_transcripts: 5
 
+# STT DONE 후처리는 opt-in이다. 과거 backlog 차단 시각은 별도 설정하지 않고
+# active semester snapshot의 activated_at을 단일 기준으로 사용한다.
+transcript_delivery:
+  enabled: false
+  active_semester_manifest: state/active-semester.json
+  # Routed staging paths are derived as root/<semester>/<course_dir>/<stem>.*.
+  correction_staging_dir: "${LECTURE_RECORDINGS_ROOT}/03_correction"
+  summary_staging_dir: "${LECTURE_RECORDINGS_ROOT}/04_summarize"
+  generator:
+    backend: codex_cli
+    # 저장된 ChatGPT 로그인 세션을 사용하는 Codex CLI 실행 파일.
+    # launchd 환경에서 PATH 탐색이 불확실하면 절대 경로를 지정한다.
+    codex_binary: codex
+    model: gpt-5.6-terra
+    reasoning_effort: low
+    timeout_sec: 1200
+    max_attempts: 3
+    max_correction_chars: 100000
+    max_summary_chars: 100000
+  scan_interval_sec: 30
+  batch_size: 20
+  log_jsonl_path: ~/Library/Logs/lecture_stt/transcript-delivery.jsonl
+  log_jsonl_max_bytes: 10485760
+  log_jsonl_backup_count: 5
+  lock_path: state/transcript-delivery.lock
+
 correction:
   prompt_folder: "${LECTURE_RECORDINGS_ROOT}/05_prompt"
   mode: manual  # API-backed automatic correction is disabled; use manual/provider-neutral correction.
@@ -141,6 +174,8 @@ notification:
   send_failure: true
   dual_send_providers: []
 
+# Legacy correction/summary archive-evidence compatibility only. The active
+# distributor does not scan these folders.
 downstream:
   scan_interval_sec: 30
   stable_for_sec: 60

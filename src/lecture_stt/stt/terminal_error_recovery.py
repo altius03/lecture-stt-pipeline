@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import quote
 
+from lecture_stt.downstream.course_storage import CourseStorageError, descendant_relative_path
 from lecture_stt.shared import db, utils
 from lecture_stt.stt.controller_gate import controller_kill_switch_is_active
 
@@ -214,6 +215,26 @@ def _validate_direct_child_relative_path(value: Any, *, label: str) -> str:
     return relative_path
 
 
+def _validate_transcript_relative_path(
+    value: Any,
+    *,
+    label: str,
+    canonical_base: str,
+    suffix: str,
+) -> str:
+    relative_path = _require_string(value, label)
+    if "\x00" in relative_path:
+        raise TerminalErrorRecoveryContractError(f"{label} contains NUL")
+    candidate = Path(relative_path)
+    if candidate.is_absolute() or not candidate.parts:
+        raise TerminalErrorRecoveryContractError(f"{label} must stay under the transcript root")
+    if any(part in {"", ".", ".."} for part in candidate.parts):
+        raise TerminalErrorRecoveryContractError(f"{label} must stay under the transcript root")
+    if candidate.name != f"{canonical_base}{suffix}":
+        raise TerminalErrorRecoveryContractError(f"{label} must match canonical_base")
+    return relative_path
+
+
 def _safe_canonical_base(value: Any, label: str) -> str:
     canonical_base = _require_string(value, label)
     if "\x00" in canonical_base or "/" in canonical_base or "\\" in canonical_base:
@@ -388,15 +409,41 @@ def _select_job_row(conn: sqlite3.Connection, job_id: int) -> sqlite3.Row:
     return row
 
 
-def _row_path_relative(root: Path, value: Any, *, label: str) -> str:
+def _row_path_relative(
+    root: Path,
+    value: Any,
+    *,
+    label: str,
+    expected_filename: str | None = None,
+    direct_child: bool = True,
+) -> str:
     path = Path(_require_string(value, label))
+    if direct_child:
+        try:
+            relative = path.relative_to(root)
+        except ValueError as exc:
+            raise TerminalErrorRecoveryConflictError(
+                f"{label} is outside the configured root"
+            ) from exc
+        return _validate_direct_child_relative_path(os.fspath(relative), label=label)
     try:
-        relative = path.relative_to(root)
-    except ValueError as exc:
-        raise TerminalErrorRecoveryConflictError(
-            f"{label} is outside the configured root"
-        ) from exc
-    return _validate_direct_child_relative_path(os.fspath(relative), label=label)
+        return descendant_relative_path(
+            root,
+            path,
+            field=label,
+            expected_filename=expected_filename,
+        )
+    except CourseStorageError as exc:
+        message = str(exc)
+        if "outside the configured root" in message:
+            raise TerminalErrorRecoveryConflictError(
+                f"{label} is outside the configured root"
+            ) from exc
+        if "expected filename" in message:
+            raise TerminalErrorRecoveryConflictError(
+                f"{label} does not match canonical_base"
+            ) from exc
+        raise TerminalErrorRecoveryConflictError(message) from exc
 
 
 def _target_relative_path(canonical_base: str, orig_name: str, error_relative_path: str) -> str:
@@ -433,20 +480,16 @@ def _error_job_payload(
         transcript_root,
         row["transcript_txt_path"],
         label="jobs.transcript_txt_path",
+        expected_filename=f"{canonical_base}.txt",
+        direct_child=False,
     )
     transcript_json_relative_path = _row_path_relative(
         transcript_root,
         row["transcript_json_path"],
         label="jobs.transcript_json_path",
+        expected_filename=f"{canonical_base}.json",
+        direct_child=False,
     )
-    if transcript_txt_relative_path != f"{canonical_base}.txt":
-        raise TerminalErrorRecoveryConflictError(
-            "jobs.transcript_txt_path does not match canonical_base"
-        )
-    if transcript_json_relative_path != f"{canonical_base}.json":
-        raise TerminalErrorRecoveryConflictError(
-            "jobs.transcript_json_path does not match canonical_base"
-        )
     sha256 = _require_sha256(row["sha256"], "jobs.sha256")
     return {
         "job_id": _require_positive_int(row["id"], "jobs.id"),
@@ -577,18 +620,25 @@ def validate_terminal_error_recovery_plan(plan: Mapping[str, Any]) -> dict[str, 
         )
     _require_string(error_job.get("updated_at"), "error_job.updated_at")
     _require_string(error_job.get("orig_name"), "error_job.orig_name")
-    _safe_canonical_base(error_job.get("canonical_base"), "error_job.canonical_base")
+    canonical_base = _safe_canonical_base(
+        error_job.get("canonical_base"),
+        "error_job.canonical_base",
+    )
     _validate_direct_child_relative_path(
         error_job.get("error_audio_relative_path"),
         label="error_job.error_audio_relative_path",
     )
-    _validate_direct_child_relative_path(
+    _validate_transcript_relative_path(
         error_job.get("transcript_txt_relative_path"),
         label="error_job.transcript_txt_relative_path",
+        canonical_base=canonical_base,
+        suffix=".txt",
     )
-    _validate_direct_child_relative_path(
+    _validate_transcript_relative_path(
         error_job.get("transcript_json_relative_path"),
         label="error_job.transcript_json_relative_path",
+        canonical_base=canonical_base,
+        suffix=".json",
     )
     _require_sha256(error_job.get("sha256"), "error_job.sha256")
     _require_sha256(error_job.get("engine_params_sha256"), "error_job.engine_params_sha256")
@@ -821,11 +871,23 @@ def _row_matches_recovered_state(
         )
         if _row_path_relative(audio_root, row["canonical_audio_path"], label="jobs.canonical_audio_path") != target_relative_path:
             return False
-        if _row_path_relative(transcript_root, row["transcript_txt_path"], label="jobs.transcript_txt_path") != str(
+        if _row_path_relative(
+            transcript_root,
+            row["transcript_txt_path"],
+            label="jobs.transcript_txt_path",
+            expected_filename=f"{plan['error_job']['canonical_base']}.txt",
+            direct_child=False,
+        ) != str(
             plan["error_job"]["transcript_txt_relative_path"]
         ):
             return False
-        if _row_path_relative(transcript_root, row["transcript_json_path"], label="jobs.transcript_json_path") != str(
+        if _row_path_relative(
+            transcript_root,
+            row["transcript_json_path"],
+            label="jobs.transcript_json_path",
+            expected_filename=f"{plan['error_job']['canonical_base']}.json",
+            direct_child=False,
+        ) != str(
             plan["error_job"]["transcript_json_relative_path"]
         ):
             return False

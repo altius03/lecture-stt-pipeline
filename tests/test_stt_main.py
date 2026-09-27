@@ -18,6 +18,10 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from lecture_stt.stt import main as stt_main  # noqa: E402
+from lecture_stt.storage_v2.timetable import (  # noqa: E402
+    apply_timetable_import,
+    plan_timetable_import,
+)
 
 
 class SttMainControlCommandTests(unittest.TestCase):
@@ -79,6 +83,75 @@ class SttMainControlCommandTests(unittest.TestCase):
             output = self._run_main("--status", "--config", str(self.config_path))
 
         self.assertIn(f"Pause flag: {env_db_path.parent / 'paused'}", output)
+
+
+class SttConfigValidationTests(unittest.TestCase):
+    def test_enabled_delivery_rejects_active_manifest_under_symlinked_parent(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as tmp:
+            root = Path(tmp)
+            watch = root / "watch"
+            watch.mkdir()
+            real_parent = root / "real-state"
+            real_parent.mkdir()
+            (real_parent / "active-semester.json").write_text("{}", encoding="utf-8")
+            linked_parent = root / "linked-state"
+            linked_parent.symlink_to(real_parent, target_is_directory=True)
+            correction_staging = root / "03_correction"
+            summary_staging = root / "04_summarize"
+            correction_staging.mkdir()
+            summary_staging.mkdir()
+            config = {
+                "app": {
+                    "polling_interval_sec": 10,
+                    "stable_for_sec": 1,
+                    "stale_processing_hours": 6,
+                },
+                "paths": {
+                    "watch_folder": str(watch),
+                    "stable_audio_folder": str(root / "audio"),
+                    "transcript_folder": str(root / "transcripts"),
+                    "error_folder": str(root / "errors"),
+                    "tmp_dir": str(root / "tmp"),
+                    "db_path": str(root / "state" / "jobs.sqlite3"),
+                },
+                "ffmpeg": {"binary_path": "/usr/bin/true"},
+                "transcribe": {
+                    "model_size": "tiny",
+                    "device": "cpu",
+                    "compute_type": "int8",
+                    "language": "ko",
+                    "task": "transcribe",
+                    "beam_size": 1,
+                    "vad_filter": False,
+                    "word_timestamps": False,
+                },
+                "transcript_delivery": {
+                    "enabled": True,
+                    "active_semester_manifest": str(
+                        linked_parent / "active-semester.json"
+                    ),
+                    "activation_cutoff": "2026-01-01T00:00:00+09:00",
+                    "correction_staging_dir": str(correction_staging),
+                    "summary_staging_dir": str(summary_staging),
+                    "generator": {
+                        "backend": "codex_cli",
+                        "codex_binary": "/usr/bin/true",
+                        "model": "test-model",
+                        "reasoning_effort": "low",
+                        "timeout_sec": 30,
+                        "max_attempts": 3,
+                        "max_correction_chars": 100000,
+                        "max_summary_chars": 100000,
+                    },
+                },
+            }
+
+            with self.assertRaisesRegex(ValueError, "must not contain symlink components"):
+                stt_main.validate_config(
+                    str(root / "config.yaml"),
+                    config,
+                    check_writable=False,
+                )
 
 
 class _FakeNotifier:
@@ -179,7 +252,9 @@ class _BadQualityReport:
 
 class SttPipelineBehaviorTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.tmpdir = tempfile.TemporaryDirectory()
+        # Use the canonical macOS temp root so path-safety tests do not pass
+        # through the system /var -> /private/var alias.
+        self.tmpdir = tempfile.TemporaryDirectory(dir="/private/tmp")
         self.root = Path(self.tmpdir.name)
         self.watch_dir = self.root / "watch"
         self.audio_dir = self.root / "audio"
@@ -274,6 +349,98 @@ class SttPipelineBehaviorTests(unittest.TestCase):
             },
         }
 
+    def _enable_course_scoped_delivery(self, *, profile_key: str) -> None:
+        correction_root = self.root / "03_correction"
+        summary_root = self.root / "04_summarize"
+        correction_root.mkdir(parents=True, exist_ok=True)
+        summary_root.mkdir(parents=True, exist_ok=True)
+
+        timetable_db_path = self.root / "state" / "storage-v2.sqlite3"
+        timetable_source = self.root / "timetable.csv"
+        timetable_source.write_text(
+            "학기,과목명,과목코드,요일,시작시간,종료시간,교시,강의실\n"
+            "2026-1,Data Structures,CS201,목,10:00,11:15,2교시,E101\n",
+            encoding="utf-8",
+        )
+        timetable_plan = plan_timetable_import(timetable_source)
+        apply_timetable_import(
+            timetable_source,
+            timetable_db_path,
+            expected_count=timetable_plan["expected_count"],
+            expected_plan_sha256=timetable_plan["plan_sha256"],
+            allow_write=True,
+        )
+
+        vault_root = self.root / "vault"
+        semester_root = vault_root / "01_current"
+        (vault_root / ".obsidian").mkdir(parents=True)
+        (semester_root / "cs201" / "06_lecture_notes" / "02_origin").mkdir(
+            parents=True
+        )
+        (semester_root / "cs201" / "06_lecture_notes" / "01_summarize").mkdir(
+            parents=True
+        )
+
+        active_path = self.root / "active-semester.json"
+        active_payload = {
+            "schema_version": "lecture-stt/active-semester@2",
+            "activated_at": "2026-01-01T10:00:00+09:00",
+            "activation_plan_sha256": "1" * 64,
+            "manifest_source_path": str(self.root / "semester.yaml"),
+            "manifest_source_sha256": "2" * 64,
+            "expected_course_count": 1,
+            "semester": "2026-1",
+            "vault_root": str(vault_root),
+            "semester_root": str(semester_root),
+            "timetable_db_path": str(timetable_db_path),
+            "origin_subdir": "06_lecture_notes/02_origin",
+            "summary_subdir": "06_lecture_notes/01_summarize",
+            "match_margin_minutes": 30,
+            "courses": [
+                {
+                    "course_code": "CS201",
+                    "course_name": "Data Structures",
+                    "course_dir": "cs201",
+                    "aliases": ["CA_2"],
+                }
+            ],
+            "selected_timetable_courses": [
+                {"course_code": "CS201", "course_name": "Data Structures"}
+            ],
+            "timetable_selection_plan_sha256": timetable_plan["plan_sha256"],
+        }
+        active_path.write_text(json.dumps(active_payload), encoding="utf-8")
+
+        self.config["profiles"] = {
+            "active": profile_key,
+            "definitions": {
+                profile_key: {
+                    "version": "test.1",
+                    "transcribe": {"initial_prompt": ""},
+                    "quality": {"warn_threshold": 0.55, "bad_threshold": 0.70},
+                }
+            },
+        }
+        self.config["transcript_delivery"] = {
+            "enabled": True,
+            "active_semester_manifest": str(active_path),
+            "activation_cutoff": "2026-01-01T00:00:00+09:00",
+            "correction_staging_dir": str(correction_root),
+            "summary_staging_dir": str(summary_root),
+            "generator": {
+                "backend": "codex_cli",
+                "codex_binary": "/usr/bin/true",
+                "model": "test-model",
+                "reasoning_effort": "low",
+                "timeout_sec": 30,
+                "max_attempts": 3,
+                "max_correction_chars": 100000,
+                "max_summary_chars": 100000,
+            },
+        }
+        self.pipeline.conn.close()
+        self.pipeline = stt_main.STTPipeline(config=self.config, logger=self.logger)
+
     def _controller_kill_switch(self) -> Path:
         return self.root / "controller.stop"
 
@@ -296,6 +463,135 @@ class SttPipelineBehaviorTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["status"], stt_main.STATUS_DONE)
         self.assertEqual(rows[0]["current_step"], "전체 완료")
+
+    def test_process_job_routes_lecture_raw_outputs_under_course_directory(self) -> None:
+        self._enable_course_scoped_delivery(profile_key="lecture")
+        source_path = self._write_stable_source("260101CA_2.m4a", b"lecture-audio")
+
+        planned = self.pipeline._job_paths(source_path)
+        self.assertEqual(
+            planned["transcript_txt_path"],
+            self.transcript_dir / "2026-1" / "cs201" / "260101CA_2.txt",
+        )
+        self.assertFalse((self.transcript_dir / "2026-1").exists())
+
+        self.pipeline.process_job(source_path)
+
+        course_transcript_dir = self.transcript_dir / "2026-1" / "cs201"
+        txt_path = course_transcript_dir / "260101CA_2.txt"
+        json_path = course_transcript_dir / "260101CA_2.json"
+        quality_path = course_transcript_dir / "260101CA_2.quality.json"
+        self.assertTrue(txt_path.exists())
+        self.assertTrue(json_path.exists())
+        self.assertTrue(quality_path.exists())
+
+        row = self.pipeline.conn.execute(
+            "SELECT transcript_txt_path, transcript_json_path FROM jobs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        assert row is not None
+        self.assertEqual(row["transcript_txt_path"], str(txt_path))
+        self.assertEqual(row["transcript_json_path"], str(json_path))
+
+        queue_row = self.pipeline.conn.execute(
+            "SELECT correction_stage_txt_path, summary_stage_md_path FROM transcript_postprocess_jobs "
+            "ORDER BY source_job_id DESC LIMIT 1"
+        ).fetchone()
+        assert queue_row is not None
+        self.assertEqual(
+            queue_row["correction_stage_txt_path"],
+            str(self.root / "03_correction" / "2026-1" / "cs201" / "260101CA_2.txt"),
+        )
+        self.assertEqual(
+            queue_row["summary_stage_md_path"],
+            str(self.root / "04_summarize" / "2026-1" / "cs201" / "260101CA_2.md"),
+        )
+
+    def test_job_admission_revalidates_active_semester_after_staging(self) -> None:
+        self._enable_course_scoped_delivery(profile_key="lecture")
+        source_path = self._write_stable_source("260101CA_2.m4a", b"lecture-audio")
+        active_path = Path(
+            self.pipeline.config["transcript_delivery"]["active_semester_manifest"]
+        )
+        next_semester_root = self.root / "vault" / "02_next"
+        next_notes = next_semester_root / "cs201-next" / "06_lecture_notes"
+        (next_notes / "02_origin").mkdir(parents=True)
+        (next_notes / "01_summarize").mkdir(parents=True)
+
+        original_move = stt_main.utils.safe_move_file
+        move_count = 0
+
+        def move_and_switch(src: Path, dst: Path) -> None:
+            nonlocal move_count
+            original_move(src, dst)
+            move_count += 1
+            if move_count != 1:
+                return
+            payload = json.loads(active_path.read_text(encoding="utf-8"))
+            payload["activated_at"] = "2026-01-01T10:01:00+09:00"
+            payload["semester"] = "2026-2"
+            payload["semester_root"] = str(next_semester_root)
+            payload["courses"][0]["course_dir"] = "cs201-next"
+            active_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        statements: list[str] = []
+        self.pipeline.conn.set_trace_callback(statements.append)
+        try:
+            with mock.patch.object(
+                stt_main.utils,
+                "safe_move_file",
+                side_effect=move_and_switch,
+            ):
+                self.pipeline.process_job(source_path)
+        finally:
+            self.pipeline.conn.set_trace_callback(None)
+
+        row = self.pipeline.conn.execute(
+            "SELECT status, transcript_txt_path FROM jobs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        assert row is not None
+        self.assertEqual(row["status"], stt_main.STATUS_DONE)
+        self.assertEqual(
+            row["transcript_txt_path"],
+            str(self.transcript_dir / "2026-2" / "cs201-next" / "260101CA_2.txt"),
+        )
+        self.assertIn("BEGIN IMMEDIATE", statements)
+
+    def test_raw_course_route_does_not_depend_on_codex_or_stage_roots(self) -> None:
+        self._enable_course_scoped_delivery(profile_key="lecture")
+        delivery = self.pipeline.config["transcript_delivery"]
+        delivery["generator"]["codex_binary"] = str(self.root / "missing-codex")
+        Path(delivery["correction_staging_dir"]).rmdir()
+        Path(delivery["summary_staging_dir"]).rmdir()
+        validated = stt_main.validate_config(
+            str(self.root / "config.yaml"),
+            self.pipeline.config,
+            check_writable=False,
+        )
+        source_path = self._write_stable_source("260101CA_2.m4a", b"lecture-audio")
+
+        self.pipeline.process_job(source_path)
+
+        self.assertTrue(validated["transcript_delivery"]["enabled"])
+        course_transcript_dir = self.transcript_dir / "2026-1" / "cs201"
+        self.assertTrue((course_transcript_dir / "260101CA_2.txt").is_file())
+        self.assertTrue((course_transcript_dir / "260101CA_2.json").is_file())
+        self.assertEqual(
+            self.pipeline.conn.execute(
+                "SELECT COUNT(*) FROM transcript_postprocess_jobs"
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_process_job_keeps_nonlecture_raw_outputs_flat_when_delivery_is_enabled(self) -> None:
+        self._enable_course_scoped_delivery(profile_key="general")
+        source_path = self._write_stable_source("plain-general.m4a", b"general-audio")
+
+        self.pipeline.process_job(source_path)
+
+        self.assertTrue((self.transcript_dir / "plain-general.txt").exists())
+        self.assertTrue((self.transcript_dir / "plain-general.json").exists())
+        self.assertTrue((self.transcript_dir / "plain-general.quality.json").exists())
+        self.assertFalse((self.transcript_dir / "2026-1").exists())
 
     def test_single_job_plan_executes_exactly_one_source_with_explicit_result(self) -> None:
         source_path = self._write_stable_source("manifest-job.m4a", b"manifest-audio")

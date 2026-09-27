@@ -99,11 +99,16 @@ class TerminalErrorRecoveryContractTests(unittest.TestCase):
         *,
         name: str = "job-201.m4a",
         payload: bytes = b"error-audio",
+        transcript_relative_dir: str | None = None,
     ) -> tuple[int, Path]:
         source = self.error_root / name
         source.write_bytes(payload)
         sha256 = utils.compute_sha256(source)
         canonical_base = Path(name).stem
+        transcript_parent = self.transcript_root
+        if transcript_relative_dir:
+            transcript_parent = transcript_parent / transcript_relative_dir
+            transcript_parent.mkdir(parents=True, exist_ok=True)
         job_id = db.create_job(
             self.conn,
             status=db.STATUS_ERROR,
@@ -111,8 +116,8 @@ class TerminalErrorRecoveryContractTests(unittest.TestCase):
             orig_name=name,
             canonical_base=canonical_base,
             canonical_audio_path=str(source),
-            transcript_txt_path=str(self.transcript_root / f"{canonical_base}.txt"),
-            transcript_json_path=str(self.transcript_root / f"{canonical_base}.json"),
+            transcript_txt_path=str(transcript_parent / f"{canonical_base}.txt"),
+            transcript_json_path=str(transcript_parent / f"{canonical_base}.json"),
             engine_params={
                 "transcription_failures": 3,
                 "transcription_max_retries": 3,
@@ -175,6 +180,61 @@ class TerminalErrorRecoveryContractTests(unittest.TestCase):
             metadata["terminal_error_recovery"]["source_error_relative_path"],
             source.name,
         )
+
+    def test_nested_transcript_descendants_are_allowed(self) -> None:
+        job_id, source = self._create_terminal_error_job(
+            transcript_relative_dir="2026-2/cs201",
+        )
+        plan = build_terminal_error_recovery_plan(self.config, job_id=job_id)
+
+        self.assertEqual(
+            plan["error_job"]["transcript_txt_relative_path"],
+            "2026-2/cs201/job-201.txt",
+        )
+        self.assertEqual(
+            plan["error_job"]["transcript_json_relative_path"],
+            "2026-2/cs201/job-201.json",
+        )
+
+        result = apply_terminal_error_recovery_plan(self.config, self.conn, plan)
+        self.assertEqual(result["status"], "applied")
+        row = db.get_job(self.conn, job_id)
+        assert row is not None
+        self.assertEqual(row["canonical_audio_path"], str(self.audio_root / source.name))
+        self.assertEqual(
+            row["transcript_txt_path"],
+            str(self.transcript_root / "2026-2" / "cs201" / "job-201.txt"),
+        )
+
+    def test_descendant_transcript_symlink_is_rejected(self) -> None:
+        job_id, source = self._create_terminal_error_job()
+        symlink_parent = self.transcript_root / "2026-2"
+        real_parent = self.root / "real-transcripts" / "2026-2"
+        (real_parent / "cs201").mkdir(parents=True)
+        (real_parent / "cs201" / "job-201.txt").write_text(
+            "transcript",
+            encoding="utf-8",
+        )
+        (real_parent / "cs201" / "job-201.json").write_text(
+            "{}",
+            encoding="utf-8",
+        )
+        symlink_parent.symlink_to(real_parent, target_is_directory=True)
+        self.conn.execute(
+            "UPDATE jobs SET transcript_txt_path = ?, transcript_json_path = ? WHERE id = ?",
+            (
+                str(symlink_parent / "cs201" / "job-201.txt"),
+                str(symlink_parent / "cs201" / "job-201.json"),
+                job_id,
+            ),
+        )
+        self.conn.commit()
+
+        with self.assertRaisesRegex(
+            TerminalErrorRecoveryConflictError,
+            "symlink components",
+        ):
+            build_terminal_error_recovery_plan(self.config, job_id=job_id)
 
     def test_apply_guards_require_enable_write_count_and_exact_digest(self) -> None:
         job_id, _ = self._create_terminal_error_job()

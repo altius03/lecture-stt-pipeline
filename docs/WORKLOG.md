@@ -3,6 +3,256 @@
 이 파일은 저장소에 반영된 변경을 날짜순으로 누적 기록한다.
 최신 항목을 위에 추가한다.
 
+## 2026-09-27
+
+### 학기 전환·전사 후처리 게시 차단 이슈 보강
+- 원본 파일명으로 과목을 찾거나 시간표 fallback을 사용하는 경우에도 후처리 `logical_stem`은 충돌 방지된 `canonical_base`를 유지하도록 통일했다.
+- 활성 학기 apply와 STT job admission이 같은 jobs DB의 `BEGIN IMMEDIATE` fence를 사용하게 하고, admission은 fence 획득 뒤 활성 학기 기반 출력 경로를 다시 계산하도록 했다.
+- no-overwrite 출력의 임시 파일과 최종 hard-link 파일을 `0600`으로 생성해 일반적인 `022` umask에서도 전사물이 group/world-readable해지지 않게 했다.
+- reconciliation batch limit을 성공 처리 건수에 적용해 영구 실패 row가 뒤의 정상 DONE job을 반복해서 가리지 않도록 했다.
+- 학기 manifest와 active snapshot 모두에서 course code/name/alias를 하나의 정규화 routing-token namespace로 검증해 cross-kind 충돌을 거부한다.
+- 기존 transcript 원장 테이블의 partial schema는 안전한 nullable/default 컬럼만 additive migration한다. `source_job_id`의 단일 PK/non-partial UNIQUE 제약도 검사해, 비어 있는 비호환 테이블은 canonical schema로 재생성하고 데이터가 있는 비호환 테이블은 변경 전에 명시적인 호환성 오류로 중단한다.
+- manifest 13개, transcript delivery 28개, STT main 65개, schema migration 7개 집중 unittest를 포함한 전체 Python unittest 779개와 `compileall`, `git diff --check`를 통과했다.
+
+## 2026-09-02
+
+### 완료 전사 미리보기와 전체 복사
+- Storage v2 녹음 보관함에 별도 opt-in인 transcript preview를 추가했다. List/detail은 계속 metadata-only이고, list의 additive capability가 명시적으로 true인 경우에만 완료된 current job의 latest `transcript_raw_text`에 `미리보기 열기`를 노출한다. 구 응답·기본 비활성은 capability false로 닫히며 preview endpoint의 독립 403 gate도 유지한다.
+- Preview는 canonical `jobs/<job_key>/transcript.txt`와 `text/plain` MIME essence만 허용한다. Historical recovery의 charset/provenance parameter는 호환하고, DB가 records root 안에 있거나 path/MIME가 어긋나면 거부한다. Shared root lock과 SQLite read snapshot 안에서 no-follow path traversal, single-link regular file, stable stat, 설정 크기 상한, DB bytes/SHA-256, strict UTF-8과 NUL 부재를 검증한다. 응답에는 path/hash/internal numeric id를 포함하지 않는다.
+- React 패널은 버튼을 누르기 전 본문을 요청하지 않는다. Query identity를 storage key·current job key·latest revision에 묶고 선택 변경·닫기·unmount에서 요청과 캐시를 제거한다. 본문은 줄바꿈을 유지한 읽기 전용 textarea로 선택할 수 있고, `전체 복사`는 Clipboard API 뒤 HTTP/Tailscale용 `execCommand` fallback을 사용한다. 성공은 2.5초 동안 `복사됨`으로 표시하고 실패는 inline error와 `aria-live`로 알린다.
+- 운영 `config.yaml`에는 preview opt-in과 2 MiB 상한을 켰고, production frontend를 다시 빌드한 뒤 web panel LaunchAgent만 재기동했다. STT worker와 transcript distribute worker PID는 바뀌지 않았다. Localhost와 tailnet endpoint가 같은 verified preview payload를 반환하고 `no-store` header, body bytes/characters, request job/revision, public key 폐쇄 계약을 만족했다. 애플리케이션 자체 인증은 없으므로 tailnet dashboard 접속자는 opt-in이 켜진 동안 전사 본문을 읽을 수 있고 공개 인터넷 노출은 허용하지 않는다.
+- 실제 Chromium에서는 합성 전사 응답만 사용해 localhost와 tailnet 화면을 검증했다. 열기 전 preview 요청 0건, 한 번 열기 뒤 1건, read-only 2줄 본문 선택, HTTP clipboard 실패 시 fallback 복사와 focus 복원, 2.5초 성공 표시 원복, 닫기 뒤 본문 제거, 409 검증 실패와 재시도 복구가 동작했다. 320/375/414/768/1440px에서 페이지 가로 overflow와 preview 버튼 줄바꿈·viewport 이탈이 없었다.
+- Python 전체 unittest 765개, React/Vitest 전체 264개, `compileall`, production build와 `git diff --check`가 통과했다. 두 차례 reviewer 확인에서 capability off UI 노출과 historical recovery MIME 호환 지적을 보완한 뒤 P0-P2 잔여 finding이 없었다.
+
+## 2026-08-09
+
+### lecture_recordings 미사용 중복 파일 정리
+- `/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings`
+  전체 878개 파일을 regular-file/symlink/hardlink, 운영 jobs DB 경로,
+  Storage v2 source/artifact hash, archive-evidence revision hash와 대조했다.
+  기존 `scripts/cleanup.py --dry-run`은 7일 경과만으로 audio 41개와 transcript
+  296개를 후보로 잡아 “미사용” 판정 근거가 되지 않으므로 apply하지 않았다.
+- Storage v2 library와 archive-evidence verifier가 각각 issue 0이고, 운영
+  `PENDING`/`PROCESSING`/`NEEDS_REVIEW`/`ERROR` job과 postprocess row가 모두
+  0인 상태에서 초기 plan count 456, bytes 1,376,239,370, SHA-256
+  `e35b8a2a4f4a9914e85c06da7efba7b1f4d7154f4e934d1e780844d85ee1da4e`로
+  후보를 닫았다. 모두 2026-2 activation 이전 파일이다.
+- 검증된 Storage v2 사본이 있는 audio 41개, transcript/quality 308개,
+  summary 97개와 `.DS_Store` 4개, stale `.claude` 설정 1개를 상대경로를
+  유지한 한 묶음으로 격리한 뒤 iCloud 휴지통
+  `/Users/geonha/Library/Mobile Documents/.Trash/lecture-recordings-unused-20260809T092942+0900`
+  으로 이동했다. 이동 직후 감사 경로를 재대조해 실패 원위치 증거 audio 1개와
+  같은 bytes여도 filename provenance가 다른 historical archive 4개를 원위치로
+  복구했다. 이어 코드 재검토에서 `DONE`/`NEEDS_REVIEW` job의 legacy transcript
+  경로가 같은 SHA 입력의 dedupe replay에 직접 사용됨을 확인해 transcript/quality
+  308개도 해시 대조 후 전부 원위치로 복구했다.
+- 최종 이동 범위는 Storage v2 exact copy가 있는 audio 41개와 summary 97개,
+  `.DS_Store` 4개, stale `.claude` 설정 1개, 합계 143개/1,369,111,071바이트다.
+  최종 휴지통 manifest SHA-256은
+  `5098323cbdaa52cff43e32f0df1a654f1d18acaa9fe7425c6b5c45a9bbc0eda7`이며
+  휴지통은 비우지 않았다.
+- dedupe replay 입력인 transcript/quality 308개와 Storage v2에 없는
+  `260519OOP_1` transcript TXT/JSON/quality 3개, unique `03_correction`
+  Markdown 99개, prompt 9개, 과거 복구 archive 310개, manual-review 5개,
+  `99_errors` 원본 1개는 삭제하지 않았다. 정리 후 root는 735개/24MB이며 같은
+  hash/reference/runtime-reference 기준의 확정 미사용 후보는 0개다.
+- 사후 Storage v2/ archive-evidence verifier와 SQLite quick/FK 검사가 통과했고,
+  jobs DB SHA-256
+  `2a276cf0f96f77c50a60ea10f9efde7d751b1babb090d82e61aae2ce981331ee`는
+  정리 전과 같았다. downstream은 2026-2 7과목, 모든 active/problem/pending/
+  unqueued/invalid count 0인 `HEALTHY`를 유지했다. Dedupe가 SHA별로 선택하는
+  131개 job 중 기존 transcript pair가 있는 105개는 모두 존재한다. 나머지
+  26개 pair는 최초 311-file inventory에도 없던 선행 결손이며 이번 정리가 새로
+  만든 누락은 0개다.
+
+### 전역 Hermes runtime 영구 폐기
+- 사용자 launchd domain에서 실행 중이던 `ai.hermes.webui`,
+  `ai.hermes.gateway-club-bot`, `ai.hermes.gateway`와 재시도 대기 중이던
+  `ai.hermes.dashboard.remote`를 bootout했다. 메인 gateway의 자식
+  `ouroboros mcp serve`를 포함해 관련 프로세스가 모두 종료된 뒤 자동 시작
+  plist를 활성 경로에서 제거했다.
+- 전용 `~/.hermes` 9.6GB, `DEV/hermes-webui` 117MB clone,
+  `~/.local/bin/{hermes,club-bot,node,npm,npx}`, lock state와 Hermes app
+  support/cache/WebKit/preferences/recent-document 상태를 macOS 휴지통으로
+  이동했다. 직접 삭제 명령은 실행 환경의 안전 정책상 사용하지 않았으며,
+  휴지통을 비우기 전에는 복구할 수 있지만 기존 경로에서는 실행되지 않는다.
+- `.zshrc`와 `.zprofile`에서 Hermes가 추가한 중복 PATH block만 제거했다.
+  새 login shell에서 `hermes`/`club-bot`은 해석되지 않고 `node`, `npm`,
+  `npx`는 `/opt/homebrew/bin`으로 해석된다. 후처리 설정이 고정한
+  `/Users/geonha/.local/bin/codex`도 계속 실행 가능하며 `codex-cli 0.146.1`을
+  확인했다.
+- 비활성 혼합 사용자 자료인 `/Users/geonha/DEV/hermes-lab` 18GB,
+  lecture_stt의 과거 폐기 report/worklog와 Tirith 감사 로그는 실행 경로가
+  아니므로 보존했다. STT 원본, 교정·요약, 시간표, Obsidian vault, 운영 DB와
+  lecture_stt LaunchAgent는 제거 범위에 포함하지 않았다.
+- 후속 확인에서 네 `ai.hermes.*` launchd label과 Hermes/Ouroboros 프로세스,
+  모든 확인 대상 활성 경로가 부재했다. lecture_stt downstream은 계속
+  running이며 status는 2026-2 7과목, active/problem/pending/unqueued/invalid
+  전부 0인 `HEALTHY`였다. 상세 metadata-only 증거는 gitignored
+  `state/reports/hermes-system-retirement-20260809/README.md`에 남겼다.
+
+### 학기 전환 단일 기준과 운영 상태 보완
+- 수동으로 맞추던 `transcript_delivery.activation_cutoff`를 제거하고 active semester
+  snapshot의 timezone-aware `activated_at`을 raw route와 postprocess backlog
+  cutoff의 단일 기준으로 사용한다. Queue row에는 enqueue 당시 cutoff와 snapshot
+  hash가 계속 고정된다.
+- 학기 `apply`는 jobs DB에 `BEGIN IMMEDIATE`를 잡아 STT
+  `PENDING`/`PROCESSING`, postprocess `PENDING`, 현재 cutoff 이후 `DONE`이지만
+  queue row가 없는 완료 직후 작업이 모두 0인지 마지막으로 확인한 뒤에만 active
+  snapshot을 원자 교체한다. DB/table 부재나 진행 중 작업은 기존 snapshot을
+  유지한 채 fail-closed한다.
+- 완료 시각이 손상된 queue 미적재 `DONE` 한 건이 전체 reconciliation과 상태
+  확인을 종료시키던 문제를 닫았다. 해당 행은 `INVALID_COMPLETION_TIMESTAMP`로
+  격리하고 뒤의 정상 행은 계속 처리하며, status와 학기 전환 gate에는
+  `invalid_unqueued_done_jobs`로 노출한다.
+- `scripts/distribute_status.sh` 기본 summary에 active semester/effective cutoff,
+  STT 진행·문제, postprocess 대기·문제 건수와 `HEALTHY`/`BUSY`/`ATTENTION`
+  판정을 추가했다. 상태 확인은 읽기 전용이며 원본·교정·요약 본문을 출력하지 않는다.
+- Reviewer의 malformed historical DONE 지적을 행 단위 격리로 보완한 뒤 재검토에서
+  P0/P1/P2 잔여 finding이 없었다. Python 전체 unittest 756개와 `compileall`,
+  `git diff --check`가 통과했다. 운영 상태는 2026-2/`HEALTHY`, STT active·problem,
+  postprocess pending·problem, queue 미적재·시간 불명 DONE이 모두 0이었고 DB
+  quick/FK 검사도 정상이다. Distribute LaunchAgent만 재기동한 뒤 첫 scan에서
+  reconciled/processed/error/reconciliation_errors가 모두 0임을 확인했다.
+
+### 원본 전사와 중간 산출물의 학기·과목별 보관
+- 새 강의 작업의 raw TXT/JSON/quality sidecar를
+  `02_transcripts/<semester>/<course_dir>`에, Codex 교정 TXT/JSON을
+  `03_correction/<semester>/<course_dir>`에, 요약 Markdown을
+  `04_summarize/<semester>/<course_dir>`에 보관하도록 경로 계약을 통일했다.
+  STT와 downstream은 활성 학기 snapshot, filename alias, lecture-only 시간표
+  fallback을 사용하는 동일 route 결정 함수를 공유한다.
+- 기존 root 직속 전사·교정·요약 파일과 이미 DB에 경로가 고정된 queue row는
+  이동하거나 다시 쓰지 않는다. 과목을 확정하지 못한 강의 raw는 평면 경로에
+  보존하고 후처리는 `UNROUTED`, 비강의는 `SKIPPED`로 닫아 임의 과목 배정을
+  막는다.
+- course-scoped parent는 실제 write 직전에만 생성한다. 설정 root 바깥 경로,
+  절대경로·traversal, symlink, 비-directory component는 거부하며 dry-run은
+  학기·과목 폴더를 만들지 않는다. Cleanup, 웹 패널 집계, 수동 correction
+  discovery와 Storage v2 quality-sidecar 탐색도 중첩 경로를 인식하도록
+  호환 범위를 넓혔다.
+- STT raw route는 active semester snapshot만 의존하도록 Codex binary와
+  correction/summary staging validation에서 분리했다. 따라서 downstream
+  준비가 일시적으로 깨져도 raw 전사 보존은 계속되고, 전체 postprocess 설정
+  검증은 별도 distribute worker가 소유한다. Raw parent도 경로 계산 시에는
+  만들지 않고 실제 write 직전에 containment와 동일 stem, symlink 부재를 다시
+  확인한 뒤 생성한다.
+- 2026-2 active snapshot의 7개 alias를 실제 timetable과 함께 읽어
+  `CA/CN/DB/IS/IT/HMS/WLT`가 각 course directory로 매핑되는 격리
+  `/private/tmp` canary를 통과했다. Reviewer 최종 재검토에서 P0/P1/P2 잔여
+  finding은 없었고 Python 전체 unittest 741개, `compileall`, shell syntax,
+  source plist lint, `git diff --check`가 통과했다.
+- 운영 적용 직전 `jobs`는 `DONE=132`, active job 0, postprocess row 0이었다.
+  `com.geonha.lecture-stt-distribute`만 재시작해 running 상태와
+  `reconciled=0/processed=0/error=0` scan을 확인했다. 재시작 전후
+  `02_transcripts=311`, `03_correction=99`, `04_summarize=97` 파일과 metadata
+  inventory digest
+  `33defa8df6a3e87160edf14b22ea95ceb118c509a1bdddcf8ff3c4468fbebf4e`가
+  같아 기존 iCloud artifact를 이동·수정하지 않았음을 확인했다.
+
+## 2026-08-07
+
+### 2026-2 시간표 등록과 학기별 route activation
+- `/Users/geonha/GH_archive/01_TUK/01_current_semester`의 7개 과목
+  강의계획서 PDF를 텍스트 추출과 첫 페이지 렌더로 대조했다. 과목코드,
+  과목명, 요일·시작/종료 시각, 강의실이 Storage v2의 2026-2 선택 시간표
+  7과목·11개 수업 block과 일치했다.
+- `config/semesters/2026-2.yaml`에 vault/current-semester root,
+  `06_lecture_notes/02_origin`, `06_lecture_notes/01_summarize`, 과목 폴더와
+  `CA/CN/DB/IS/IT/HMS/WLT`
+  filename alias를 등록했다. 매 학기에는 이 manifest 하나를 새 후보로
+  교체하고 plan/apply 검증을 거치도록 했다.
+- 정확한 과목 수 7과 plan SHA-256
+  `88f09f99aac77f9befaa2f4f222bd6bef48ad05ea8bd344e752afc8bd6e7d8e5`,
+  timetable selection SHA-256
+  `f6df355cea09bbee6973d00396d6b34e2874ae313af2047f3fa54455b02f028a`
+  guard로 `state/active-semester.json`을 `@2`로 다시 활성화했다. 새
+  `activated_at`과 config cutoff는 `2026-08-07T15:32:00.112520+09:00`이다.
+  Activation은 vault
+  marker/root containment, symlink 부재, 기존 course/origin/summary 폴더, 선택된
+  시간표의 exact code/name 집합을 확인하며 폴더를 자동 생성하지 않는다.
+
+### Codex CLI 교정·요약 자동화로 후속 교체
+- Hermes와 Hermes cron/operator는 영구 폐기 상태를 유지했다. 직접 LLM API,
+  API key adapter, 운영 fake backend는 추가하지 않았다. 새
+  `src/lecture_stt/downstream/postprocess.py`는 저장된 ChatGPT 로그인 세션으로
+  `codex exec`를 실행하고, 격리 temp directory와 `--ephemeral`, read-only
+  sandbox, user config/rules 무시, JSON output schema를 강제한다. Shell,
+  unified-exec, apps/plugins, browser/computer, multi-agent feature도 끈다.
+  Child environment는 HOME/PATH/locale/temp/CODEX_HOME만 전달하며 API key를 전달하지 않는다.
+- `transcript_delivery.py`를 raw direct-copy에서 correction→summary→delivery
+  상태머신으로 교체하고 `transcript_postprocess_jobs`에 source/staging/final
+  hash, 단계별 상태·attempt, active semester/cutoff, course route와 generator
+  provenance를 고정한다. 구조 검증 실패는 `NEEDS_REVIEW`, 반복 실행 실패는
+  기본 3회 뒤 `ERROR`, 기존 다른 bytes는 `CONFLICT`로 격리한다.
+- Codex 결과 hash를 staging write 전에 DB intent로 먼저 고정하고 correction
+  JSON을 TXT보다 먼저 기록한다. 파일 생성 뒤 `READY` commit 전 crash가 나도
+  pinned JSON/TXT/Markdown을 재검증해 재생성 없이 이어가며, intent가 없는
+  기존 stage 파일은 `CONFLICT`로 닫는다. Active snapshot의 manifest source
+  path/hash도 queue에 실제로 pin한다.
+- 원본 `02_transcripts` TXT/JSON은 수정하지 않는다. 검증된 교정 pair는
+  `03_correction` staging과 과목별 `06_lecture_notes/02_origin`, 요약 Markdown은
+  `04_summarize` staging과 `06_lecture_notes/01_summarize`에 no-overwrite로
+  기록한다. Correction은 source segment 정수 ID·개수·순서와 JSON의 비본문
+  metadata를 유지하고, 요약은 고정 7-section Markdown 계약을 사용한다.
+- 학기 manifest/active snapshot을 `@2`로 올리고 `summary_subdir`와 양쪽
+  destination directory의 선존재 검증을 추가했다. 학기마다 manifest를
+  plan/apply한 뒤 config의 `activation_cutoff`를 새 `activated_at`으로 함께
+  갱신해 과거 backlog가 새 학기로 유입되지 않게 한다.
+- 변경 전 config/active snapshot/운영 DB는
+  `state/backups/postprocess-20260807T145608+0900`에 보존했고 DB backup
+  integrity는 `ok`였다. 합성 전사에 대한 실제 Codex correction+summary
+  canary는 segment ID `[0, 1]`, summary heading 7개, temp residue 0으로
+  두 차례 통과했고 hardened canary는 staged summary 재검증도 통과했다.
+  Reviewer가 발견한 crash-window와 manifest provenance 문제를 보완한 뒤
+  재검토에서 P0/P1/P2 잔여 이슈가 없었다. Python 전체 unittest 727개,
+  `compileall`, shell syntax, source/installed plist lint, `git diff --check`가
+  통과했다.
+- 운영 DB에는 additive `transcript_postprocess_jobs` table만 만들었고 row는
+  0건이다. 기존 jobs 132/DONE 132, 과거 `deliveries` 247건은 유지됐으며
+  integrity/foreign-key 검사가 통과했다. `com.geonha.lecture-stt-distribute`
+  LaunchAgent를 새 PATH와 `SuccessfulExit=false` 정책으로 재등록했고 새
+  postprocess event에서 reconciled/processed/delivered 모두 0인 것을 확인했다.
+
+### 초기 DONE transcript 직접 전달 구현 (당일 Codex 후처리로 교체됨)
+- STT가 `DONE`을 commit한 뒤 운영 `state/jobs.sqlite3`에
+  `transcript_deliveries` row를 만들고 별도 worker가 원본 TXT/JSON과
+  deterministic Markdown 전사 노트를 활성 학기의 과목별
+  `06_lecture_notes/02_origin`으로 copy-only 전달한다. Source를 삭제하지
+  않고 기존 파일은 같은 hash일 때만 idempotent success로 인정하며,
+  다른 bytes는 `CONFLICT`로 남겨 덮어쓰지 않는다.
+- Filename alias를 우선하고, alias가 없는 `LECTURE` profile만 녹음 시각과
+  시간표의 유일 후보로 fallback한다. 일반 녹음은 `SKIPPED`, 강의 후보
+  없음·복수는 `UNROUTED`로 기록한다. `NEEDS_REVIEW`와 `ERROR`는 자동
+  전달하지 않는다. Queue row에는 enqueue 당시 semester/course/root/
+  destination과 source·active snapshot hash를 고정해 학기 전환 뒤에도
+  기존 작업의 목적지가 바뀌지 않게 했다.
+- Worker reconciliation은 활성화 이후 `DONE`인데 queue row가 없는 좁은
+  crash window만 보충한다. `--dry-run`은 SQLite `mode=ro/query_only`로
+  prospective route를 계산하며 DB/table/row, lock, JSONL, 목적 파일을
+  만들거나 갱신하지 않는다. Hardlink 미지원 fallback도
+  `O_CREAT|O_EXCL`로만 생성해 race 중 기존 파일을 덮어쓸 수 없게 했다.
+- 외부 AI 교정·요약 operator는 영구 폐기했다. 저장소의 operator 코드,
+  prompt/runbook, CI job, 테스트, 활성 runtime 경로를 제거했고 기존 운영
+  state는 삭제하지 않고
+  `state/reports/retired-ai-postprocess-20260807`로 이동해 증거를 보존했다.
+  과거 correction/summary 원장 247개 row와 관련 archive evidence는 역사
+  자료로만 유지하며 새 worker가 읽거나 갱신하지 않는다.
+
+### 초기 직접 전달 구현 당시 검증과 운영 적용
+- 변경 전 `config/config.yaml`과 `state/jobs.sqlite3`를
+  `state/backups/transcript-delivery-20260807T132103+0900`에 보존했고 DB
+  integrity를 확인했다. 운영 job 132건과 과거 delivery 247건은 유지됐다.
+- 격리 temp vault에서 alias `_N`, activation snapshot 교체 뒤 pinned route,
+  source 보존, PENDING→DELIVERED, 재실행 idempotence를 확인했다. 실제 학기
+  저장소에서도 하드링크 실패를 강제한 canary TXT/JSON/Markdown 3개가
+  exclusive-create fallback으로 전달되는지 검증하고 exact hash 확인 뒤
+  카나리 파일 3개만 정리했다.
+- Reviewer 재검토는 P0-P2 잔여 이슈가 없었고 Python 전체 unittest
+  716개가 통과했다. `compileall`, `git diff --check`, 두 운영 SQLite의
+  integrity/foreign-key 검사도 통과했다. Direct-delivery launchd를 등록한
+  뒤 queue 0, 신규 backlog 전달 0, worker running을 확인했다.
+
 ## 2026-07-28
 
 ### Controller runtime web decoder closeout

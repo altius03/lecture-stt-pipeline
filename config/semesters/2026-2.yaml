@@ -1,0 +1,37 @@
+schema_version: lecture-stt/semester-manifest@2
+semester: "2026-2"
+vault_root: /Users/geonha/GH_archive
+semester_root: /Users/geonha/GH_archive/01_TUK/01_current_semester
+timetable_db_path: /Users/geonha/DEV/lecture_stt/state/storage-v2.sqlite3
+origin_subdir: 06_lecture_notes/02_origin
+summary_subdir: 06_lecture_notes/01_summarize
+match_margin_minutes: 30
+courses:
+  - course_code: ACS24020-01
+    course_name: 컴퓨터구조
+    course_dir: 01_computer_architecture
+    aliases: [CA]
+  - course_code: ACS35010-03
+    course_name: 컴퓨터네트워크
+    course_dir: 02_computer_network
+    aliases: [CN]
+  - course_code: ACS26015-11
+    course_name: 데이터베이스
+    course_dir: 03_database
+    aliases: [DB]
+  - course_code: ACS2B001-12
+    course_name: 정보보안개론
+    course_dir: 04_introduction_to_information_security
+    aliases: [IS]
+  - course_code: ACS49010-01
+    course_name: IT신기술
+    course_dir: 05_it_new_technology
+    aliases: [IT]
+  - course_code: AAK10049-04
+    course_name: 인간과현대사회
+    course_dir: 06_humans_in_modern_society
+    aliases: [HMS]
+  - course_code: AAK10042-03
+    course_name: 서구문학과기술문명
+    course_dir: 07_technologies_in_western_literature
+    aliases: [WLT]

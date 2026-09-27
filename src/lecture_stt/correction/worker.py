@@ -100,8 +100,8 @@ class CorrectionWorker:
         txt_paths: dict[str, Path] = {}
         json_paths: dict[str, Path] = {}
 
-        for path in src.iterdir():
-            if not path.is_file():
+        for path in src.rglob("*"):
+            if not path.is_file() or path.is_symlink():
                 continue
             if is_temporary_file(path):
                 continue
@@ -111,20 +111,24 @@ class CorrectionWorker:
                     continue
             except OSError:
                 continue
+            relative_key = str(path.relative_to(src).with_suffix(""))
             if path.suffix.lower() == ".txt":
-                txt_paths[path.stem] = path
-            elif path.suffix.lower() == ".json":
-                json_paths[path.stem] = path
+                txt_paths[relative_key] = path
+            elif path.suffix.lower() == ".json" and not path.name.endswith(
+                ".quality.json"
+            ):
+                json_paths[relative_key] = path
 
-        for stem, txt_path in sorted(txt_paths.items()):
-            if stem not in json_paths:
+        for relative_key, txt_path in sorted(txt_paths.items()):
+            if relative_key not in json_paths:
                 continue
-            if stem in done_stems:
+            if relative_key in done_stems:
                 continue
+            stem = txt_path.stem
             pairs.append(PendingPair(
                 stem=stem,
                 txt_path=txt_path,
-                json_path=json_paths[stem],
+                json_path=json_paths[relative_key],
                 subject_abbr=_parse_subject(stem),
             ))
 
@@ -137,13 +141,16 @@ class CorrectionWorker:
             return set()
         txt_stems: set[str] = set()
         json_stems: set[str] = set()
-        for path in correction_dir.iterdir():
-            if not path.is_file():
+        for path in correction_dir.rglob("*"):
+            if not path.is_file() or path.is_symlink():
                 continue
+            relative_key = str(path.relative_to(correction_dir).with_suffix(""))
             if path.suffix.lower() == ".txt":
-                txt_stems.add(path.stem)
-            elif path.suffix.lower() == ".json":
-                json_stems.add(path.stem)
+                txt_stems.add(relative_key)
+            elif path.suffix.lower() == ".json" and not path.name.endswith(
+                ".quality.json"
+            ):
+                json_stems.add(relative_key)
         return txt_stems & json_stems
 
 # ── 설정 로딩 ──────────────────────────────────────────────────────

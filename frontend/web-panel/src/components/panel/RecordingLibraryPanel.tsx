@@ -1,8 +1,11 @@
+import { useEffect, useRef, useState } from "react"
+
 import { EmptyState } from "../ui/EmptyState"
 import { ErrorState } from "../ui/ErrorState"
 import { LoadingBlock } from "../ui/LoadingBlock"
 import { SectionCard } from "../ui/SectionCard"
 import { useRecordingLibrary } from "../../hooks/useRecordingLibrary"
+import { useTranscriptPreview } from "../../hooks/useTranscriptPreview"
 import type {
   RecordingArtifactStage,
   RecordingContextMetadata,
@@ -13,6 +16,7 @@ import type {
   RecordingLibrarySummary,
   RecordingReviewSeverity,
   RecordingTitleSource,
+  TranscriptPreviewPayload,
 } from "../../types"
 
 const JOB_STATUS_LABELS: Record<RecordingLibraryJobStatus, string> = {
@@ -96,6 +100,10 @@ function formatBytes(value: number | null): string {
   return `${(value / (1024 * 1024)).toFixed(1)}MiB`
 }
 
+function formatCharacters(value: number): string {
+  return new Intl.NumberFormat("ko-KR").format(value)
+}
+
 function statusTone(status: RecordingLibraryJobStatus): string {
   if (status === "error") {
     return "is-error"
@@ -155,6 +163,272 @@ function groupedArtifacts(job: RecordingDetailJob): Record<RecordingArtifactStag
       summary: [],
       supporting: [],
     },
+  )
+}
+
+function findPreviewableTranscriptTarget(detail: RecordingDetailPayload): {
+  job: RecordingDetailJob
+  jobKey: string
+  revision: number
+  storageKey: string
+} | null {
+  const currentJob = detail.jobs.find((job) => job.is_current) ?? null
+  if (currentJob === null) {
+    return null
+  }
+  if (currentJob.status !== "done" || currentJob.progress !== 100) {
+    return null
+  }
+  const latestTranscript = currentJob.artifacts.find(
+    (artifact) => artifact.artifact_kind === "transcript_raw_text" && artifact.is_latest,
+  )
+  if (!latestTranscript) {
+    return null
+  }
+  return {
+    job: currentJob,
+    jobKey: currentJob.job_key,
+    revision: latestTranscript.revision,
+    storageKey: detail.recording.storage_key,
+  }
+}
+
+function previewErrorLabel(status: number | null): string {
+  if (status === 404) {
+    return "미리보기 없음"
+  }
+  if (status === 403) {
+    return "접근 제한"
+  }
+  if (status === 409) {
+    return "검증 실패"
+  }
+  return "읽기 오류"
+}
+
+async function copyTextToClipboard(
+  text: string,
+  copyButton: HTMLButtonElement,
+): Promise<void> {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text)
+      return
+    }
+  } catch {
+    // Fall through to the legacy copy path for non-secure contexts.
+  }
+
+  const activeElement = document.activeElement instanceof HTMLElement
+    ? document.activeElement
+    : null
+  const textarea = document.createElement("textarea")
+  textarea.value = text
+  textarea.setAttribute("readonly", "true")
+  textarea.tabIndex = -1
+  textarea.style.position = "fixed"
+  textarea.style.top = "0"
+  textarea.style.left = "0"
+  textarea.style.opacity = "0"
+  textarea.style.pointerEvents = "none"
+  document.body.append(textarea)
+  textarea.select()
+  textarea.setSelectionRange(0, text.length)
+  const execCommand = document.execCommand as ((commandId: string) => boolean) | undefined
+  let copied = false
+  try {
+    copied = execCommand?.call(document, "copy") ?? false
+  } catch {
+    copied = false
+  } finally {
+    textarea.remove()
+    if (copyButton.isConnected) {
+      copyButton.focus({ preventScroll: true })
+    } else {
+      activeElement?.focus({ preventScroll: true })
+    }
+  }
+  if (!copied) {
+    throw new Error("브라우저가 전사 본문 복사를 허용하지 않았습니다.")
+  }
+}
+
+function TranscriptPreviewCard({
+  detail,
+  preview,
+  isOpen,
+  loading,
+  error,
+  errorStatus,
+  onOpen,
+  onRetry,
+  onClose,
+}: {
+  detail: RecordingDetailPayload
+  preview: TranscriptPreviewPayload | null
+  isOpen: boolean
+  loading: boolean
+  error: string | null
+  errorStatus: number | null
+  onOpen: () => void
+  onRetry: () => void
+  onClose: () => void
+}) {
+  const [copyButtonLabel, setCopyButtonLabel] = useState("전체 복사")
+  const [copyError, setCopyError] = useState<string | null>(null)
+  const [copyLiveMessage, setCopyLiveMessage] = useState<string | null>(null)
+  const resetCopyLabelTimerRef = useRef<number | null>(null)
+
+  useEffect(() => {
+    if (resetCopyLabelTimerRef.current !== null) {
+      window.clearTimeout(resetCopyLabelTimerRef.current)
+      resetCopyLabelTimerRef.current = null
+    }
+    setCopyButtonLabel("전체 복사")
+    setCopyError(null)
+    setCopyLiveMessage(null)
+  }, [detail.recording.storage_key, isOpen, preview?.transcript.revision])
+
+  useEffect(() => {
+    return () => {
+      if (resetCopyLabelTimerRef.current !== null) {
+        window.clearTimeout(resetCopyLabelTimerRef.current)
+      }
+    }
+  }, [])
+
+  async function handleCopy(copyButton: HTMLButtonElement): Promise<void> {
+    if (preview === null) {
+      return
+    }
+    try {
+      await copyTextToClipboard(preview.transcript.text, copyButton)
+      if (resetCopyLabelTimerRef.current !== null) {
+        window.clearTimeout(resetCopyLabelTimerRef.current)
+      }
+      setCopyError(null)
+      setCopyButtonLabel("복사됨")
+      setCopyLiveMessage("복사됨")
+      resetCopyLabelTimerRef.current = window.setTimeout(() => {
+        setCopyButtonLabel("전체 복사")
+        setCopyLiveMessage(null)
+        resetCopyLabelTimerRef.current = null
+      }, 2500)
+    } catch (copyError) {
+      setCopyButtonLabel("전체 복사")
+      const message =
+        copyError instanceof Error
+          ? copyError.message
+          : "전사 본문을 복사하지 못했습니다."
+      setCopyError(message)
+      setCopyLiveMessage(message)
+    }
+  }
+
+  if (!isOpen) {
+    return (
+      <SectionCard label="Transcript Preview" title="전사 본문 미리보기">
+        <p className="notice-copy">
+          완료된 현재 작업의 최신 원문 전사만 필요할 때 불러옵니다. 버튼을 누르기 전에는 본문을 자동으로 가져오지 않습니다.
+        </p>
+        <div className="action-row">
+          <button type="button" className="button-secondary" onClick={onOpen}>
+            미리보기 열기
+          </button>
+        </div>
+      </SectionCard>
+    )
+  }
+
+  return (
+    <SectionCard label="Transcript Preview" title={detail.recording.display_name}>
+      <div className="recording-library-preview-shell">
+        <div className="recording-library-preview-header">
+          <div>
+            <p className="notice-copy">
+              창을 닫거나 다른 녹음을 선택하면 현재 본문과 요청을 바로 지웁니다.
+            </p>
+          </div>
+          <div className="action-row">
+            {preview !== null ? (
+              <button
+                type="button"
+                className="button-secondary"
+                onClick={(event) => {
+                  void handleCopy(event.currentTarget)
+                }}
+              >
+                {copyButtonLabel}
+              </button>
+            ) : null}
+            <button type="button" className="button-secondary" onClick={onClose}>
+              닫기
+            </button>
+          </div>
+        </div>
+
+        {loading ? (
+          <div className="recording-library-preview-state" aria-live="polite" aria-atomic="true">
+            <span className="status-pill is-processing">불러오는 중</span>
+            <p className="notice-copy">전사 본문과 메타데이터를 읽는 중입니다.</p>
+          </div>
+        ) : error ? (
+          <div className="recording-library-preview-state" aria-live="polite" aria-atomic="true">
+            <span className={`status-pill ${errorStatus === 403 || errorStatus === 404 ? "is-review" : "is-error"}`}>
+              {previewErrorLabel(errorStatus)}
+            </span>
+            <p className="notice-copy">{error}</p>
+            <div className="action-row">
+              <button type="button" onClick={onRetry}>다시 읽기</button>
+            </div>
+          </div>
+        ) : preview === null ? (
+          <div className="recording-library-preview-state" aria-live="polite" aria-atomic="true">
+            <span className="status-pill is-neutral">대기</span>
+            <p className="notice-copy">미리보기 응답을 기다리는 중입니다.</p>
+          </div>
+        ) : (
+          <>
+            <dl className="recording-library-definition-grid recording-library-preview-meta">
+              <div>
+                <dt>job</dt>
+                <dd>{preview.transcript.job_key}</dd>
+              </div>
+              <div>
+                <dt>revision</dt>
+                <dd>r{preview.transcript.revision}</dd>
+              </div>
+              <div>
+                <dt>크기</dt>
+                <dd>{formatBytes(preview.transcript.bytes)}</dd>
+              </div>
+              <div>
+                <dt>문자 수</dt>
+                <dd>{formatCharacters(preview.transcript.characters)}</dd>
+              </div>
+              <div>
+                <dt>생성 시각</dt>
+                <dd>{formatTimestamp(preview.transcript.created_at)}</dd>
+              </div>
+            </dl>
+            <label className="recording-library-preview-body">
+              <span className="recording-library-preview-label">읽기 전용 본문</span>
+              <textarea
+                readOnly
+                value={preview.transcript.text}
+                aria-label="전사 본문 미리보기"
+                className="recording-library-preview-textarea"
+              />
+            </label>
+          </>
+        )}
+
+        <div aria-live="polite" aria-atomic="true">
+          {copyError ? <p className="inline-error">{copyError}</p> : null}
+          <span className="screen-reader-only">{copyLiveMessage ?? ""}</span>
+        </div>
+      </div>
+    </SectionCard>
   )
 }
 
@@ -286,9 +560,27 @@ function LibraryList({
 function LibraryDetail({
   detail,
   outsideCurrentPage,
+  previewableCurrentJob,
+  preview,
+  previewOpen,
+  previewLoading,
+  previewError,
+  previewErrorStatus,
+  onOpenPreview,
+  onRetryPreview,
+  onClosePreview,
 }: {
   detail: RecordingDetailPayload
   outsideCurrentPage: boolean
+  previewableCurrentJob: RecordingDetailJob | null
+  preview: TranscriptPreviewPayload | null
+  previewOpen: boolean
+  previewLoading: boolean
+  previewError: string | null
+  previewErrorStatus: number | null
+  onOpenPreview: () => void
+  onRetryPreview: () => void
+  onClosePreview: () => void
 }) {
   return (
     <div className="recording-library-detail-stack">
@@ -346,6 +638,20 @@ function LibraryDetail({
           </div>
         </dl>
       </SectionCard>
+
+      {previewableCurrentJob ? (
+        <TranscriptPreviewCard
+          detail={detail}
+          preview={preview}
+          isOpen={previewOpen}
+          loading={previewLoading}
+          error={previewError}
+          errorStatus={previewErrorStatus}
+          onOpen={onOpenPreview}
+          onRetry={onRetryPreview}
+          onClose={onClosePreview}
+        />
+      ) : null}
 
       <SectionCard label="Bounded Detail" title="job · artifact · review 범위">
         <div className="recording-library-limit-grid">
@@ -484,6 +790,29 @@ export function RecordingLibraryPanel({
     enabled: true,
     selectedStorageKey,
   })
+  const previewTarget =
+    detail && list?.capabilities?.transcript_preview === true
+      ? findPreviewableTranscriptTarget(detail)
+      : null
+  const {
+    isOpen: previewOpen,
+    preview,
+    previewLoading,
+    previewError,
+    previewErrorStatus,
+    openPreview,
+    closePreview,
+    retryPreview,
+  } = useTranscriptPreview({
+    enabled: previewTarget !== null,
+    target: previewTarget
+      ? {
+          storageKey: previewTarget.storageKey,
+          jobKey: previewTarget.jobKey,
+          revision: previewTarget.revision,
+        }
+      : null,
+  })
 
   if (listLoading && list === null) {
     return (
@@ -564,7 +893,23 @@ export function RecordingLibraryPanel({
               }}
             />
           ) : (
-            <LibraryDetail detail={detail} outsideCurrentPage={outsideCurrentPage} />
+            <LibraryDetail
+              detail={detail}
+              outsideCurrentPage={outsideCurrentPage}
+              previewableCurrentJob={previewTarget?.job ?? null}
+              preview={preview}
+              previewOpen={previewOpen}
+              previewLoading={previewLoading}
+              previewError={previewError}
+              previewErrorStatus={previewErrorStatus}
+              onOpenPreview={openPreview}
+              onRetryPreview={() => {
+                void retryPreview()
+              }}
+              onClosePreview={() => {
+                void closePreview()
+              }}
+            />
           )}
         </section>
       </div>

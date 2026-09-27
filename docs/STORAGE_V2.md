@@ -380,14 +380,19 @@ manifest는 recording 루트 안에서만 자기 파일을 참조해야 한다. 
 
 ## 호환 어댑터 방향
 
-초기 단계에서는 기존 v1 파이프라인을 바로 지우지 않는다.
+현재도 v1 canonical transcript와 v2 preserve-first 보관소는 분리한다.
 
-- v1 inbox polling/STT/downstream는 유지
+- v1 inbox polling/STT와 `02_transcripts` 정본은 유지한다. 새 강의 정본은 active semester route가 확정되면 `02_transcripts/<semester>/<course_dir>`에 보존하고, 기존 root 직속 정본은 이동하지 않는다.
+- v1의 active downstream은 `DONE` transcript를 학기 manifest에 고정하고 Codex CLI 교정·요약 뒤 Obsidian course route로 전달한다
 - v2 import adapter가 완료된 recording만 병행 적재
 - web panel / dashboard는 v1+v2를 동시에 읽는 호환 레이어를 둔다
-- Hermes/후처리도 최종적으로는 `artifacts`와 `review_items`를 기준으로 옮긴다
+- Hermes operator와 cron은 영구 폐기했다. 현재 Codex postprocess 원장과 staging은 v1 runtime 경계이며, 과거 `deliveries` correction/summary 원장은 legacy archive evidence로만 읽는다
+
+v1 DB의 `jobs.transcript_txt_path`와 `jobs.transcript_json_path`는 평면/중첩 여부와 무관하게 각 정본의 절대경로를 계속 소유한다. Storage v2 importer는 이 DB 경로를 기준으로 원본을 찾고 quality sidecar도 transcript JSON과 같은 parent에서 찾는다. 새 staging은 `03_correction/<semester>/<course_dir>`와 `04_summarize/<semester>/<course_dir>`에 생성하지만, 기존 평면 파일과 이미 경로가 고정된 queue row를 재배치하거나 자동 이관하지 않는다.
 
 즉, cut-over 전까지는 dual-read/dual-write가 아니라 preserve-first import + 점진 전환이 기본이다.
+
+학기 activation은 Storage v2의 선택된 `schedule_semester_selections`와 `schedule_entries`를 읽기 전용 검증 근거로 사용한다. 활성 snapshot은 timetable DB를 수정하지 않으며, Codex postprocess도 새 recording/artifact row를 v2에 자동 생성하지 않는다. 과목 폴더 slug는 timetable closed schema에 없으므로 `config/semesters/<semester>.yaml`에 명시하고 course code/name 집합이 active timetable과 정확히 일치하는지만 검증한다. Apply는 별도 v1 jobs DB의 active STT/postprocess, 현재 cutoff 이후 queue 미적재 DONE, 완료 시각을 판정할 수 없는 미적재 DONE이 0인지 쓰기 잠금 안에서 확인하지만 row를 수정하지 않는다. Snapshot의 timezone-aware `activated_at`이 유일한 backlog cutoff이고, postprocess row는 이 cutoff와 source/staging/final hash, semester/root/course/destination, generator provenance를 enqueue 시점에 고정해 후속 학기 전환이 과거 작업의 목적지를 바꾸지 못하게 한다.
 
 ## Preserve-first importer
 
@@ -396,6 +401,8 @@ manifest는 recording 루트 안에서만 자기 파일을 참조해야 한다. 
 - legacy DB 경로는 CLI에서 반드시 명시한다. regular file인 독립 snapshot만 허용하고 symlink, hardlink, 손상된 DB, 비어 있지 않은 `-wal`/rollback journal을 계획 단계부터 거부한다.
 - snapshot은 `mode=ro&immutable=1`로 열기 전과 연결·조회 뒤에 본체 stat/hash와 WAL/journal/SHM 상태를 다시 확인한다. `PRAGMA quick_check`도 통과해야 한다.
 - `01_audio`~`04_summarize`의 파일은 읽기·해시·복사만 하며 삭제, rename, overwrite하지 않는다.
+- Import 자체는 위 원칙을 유지한다. 별도 운영 cleanup은 사용자의 명시적 삭제 요청, library/archive-evidence verifier issue 0, active/problem/postprocess row 0, closed count/bytes/plan SHA-256, 각 legacy 파일과 보존 사본의 실제 SHA-256 일치가 모두 있을 때만 이미 import된 중복을 복구 가능한 휴지통으로 이동할 수 있다. 보존 사본이 없거나 정본이 모호한 파일은 cleanup 후보가 아니다.
+- 2026-08-09 이 경계로 과거 v1 audio 41개, summary 97개와 disposable metadata 5개를 iCloud 휴지통으로 이동했다. 초기 격리에 포함했던 transcript/quality 308개는 코드 재검토에서 legacy jobs DB의 dedupe replay가 직접 읽는 활성 경로임을 확인해 해시 대조 후 모두 복구했다. 실패 원위치 audio 1개와 같은 bytes지만 filename provenance가 다른 historical archive 4개도 복구했다. 따라서 legacy transcript/quality 311개, unique correction Markdown 99개, prompt 9개, historical-recovery archive 310개, manual-review 5개는 계속 보존한다. 이는 Storage v2 write/read cut-over가 아니며 새 STT/Codex artifact는 계속 v1 학기·과목 경로에 먼저 기록된다.
 - artifact 경로가 legacy root 밖이거나 symlink/비정규 파일이면 해당 recording을 fail-closed로 차단한다.
 - 선택 필터나 `--limit`을 적용하기 전에 모든 legacy job과 delivery의 lineage·경로·inode claim을 조사한다. 같은 파일이 원본과 전사/교정/요약처럼 다른 역할로 해석되거나 서로 다른 canonical base에 공유되면 차단한다. 같은 녹음의 source 재시도 공유만 허용한다.
 - delivery artifact는 `deliveries.source_job_id`로 소유자를 정한다. 중복 canonical base의 비소유 job에는 공유 산출물을 붙이지 않으며 owner가 모호하면 차단한다. ownerless delivery가 어느 job에도 매칭되지 않더라도 실제 교정/요약 파일이 남아 있거나 경로가 안전하지 않으면 무시하지 않고 discovery를 중단한다.

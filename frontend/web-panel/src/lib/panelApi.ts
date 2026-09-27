@@ -9,6 +9,7 @@ import { decodeLogPayload, decodePanelActionResponse, decodePanelState } from ".
 import {
   decodeRecordingDetail,
   decodeRecordingLibraryList,
+  decodeTranscriptPreview,
 } from "./decodeRecordingLibrary"
 import {
   decodeClassificationConfirmationPlan,
@@ -49,6 +50,7 @@ import type {
   RecordingDetailPayload,
   RecordingLibraryListPayload,
   TimetableEntriesPayload,
+  TranscriptPreviewPayload,
   TitleSuggestionConfirmationPlan,
   TitleSuggestionConfirmationResult,
   TitleSuggestionDetailPayload,
@@ -89,6 +91,7 @@ export const TIMETABLE_ENDPOINTS = {
 export const TITLE_SUGGESTION_ENDPOINT = "/api/storage-v2/title-suggestions"
 export const UNIFIED_REVIEW_ENDPOINT = "/api/storage-v2/review-feed"
 export const RECORDING_LIBRARY_ENDPOINT = "/api/storage-v2/library/recordings"
+export const RECORDING_TRANSCRIPT_PREVIEW_SUFFIX = "transcript-preview"
 export const TRANSCRIPTION_ANALYTICS_ENDPOINT =
   "/api/storage-v2/analytics/transcriptions"
 const SHA256_DIGEST_PATTERN = /^[a-f0-9]{64}$/
@@ -183,6 +186,27 @@ function readApiErrorMessage(payload: unknown): string | null {
   return typeof error === "string" ? error : null
 }
 
+export class PanelApiError extends Error {
+  readonly status: number
+
+  constructor(message: string, status: number) {
+    super(message)
+    this.name = "PanelApiError"
+    this.status = status
+  }
+}
+
+function createApiError(
+  response: Response,
+  payload: unknown,
+  fallback: string,
+): PanelApiError {
+  return new PanelApiError(
+    readApiErrorMessage(payload) ?? fallback,
+    response.status,
+  )
+}
+
 async function readJson(response: Response): Promise<unknown> {
   try {
     return await response.json()
@@ -275,13 +299,68 @@ export async function fetchRecordingDetail(
   )
   const payload = await readJson(response)
   if (!response.ok) {
-    throw new Error(readApiErrorMessage(payload) ?? `Failed to fetch recording detail: ${response.status}`)
+    throw createApiError(
+      response,
+      payload,
+      `Failed to fetch recording detail: ${response.status}`,
+    )
   }
   const detail = decodeRecordingDetail(payload)
   if (detail.recording.storage_key !== storageKey) {
     throw new Error("Recording detail response storage_key does not match the request.")
   }
   return detail
+}
+
+export async function fetchTranscriptPreview(
+  storageKey: string,
+  signal?: AbortSignal,
+  expectations?: {
+    jobKey?: string
+    revision?: number
+  },
+): Promise<TranscriptPreviewPayload> {
+  if (!storageKey) {
+    throw new Error("녹음 storage_key를 입력하세요.")
+  }
+  if (storageKey !== storageKey.trim()) {
+    throw new Error("Recording storage_key must not include surrounding whitespace.")
+  }
+  if (!CASE_KEY_PATTERN.test(storageKey)) {
+    throw new Error("Recording storage_key must use the canonical ASCII key format.")
+  }
+  const response = await fetch(
+    `${RECORDING_LIBRARY_ENDPOINT}/${encodeURIComponent(storageKey)}/${RECORDING_TRANSCRIPT_PREVIEW_SUFFIX}`,
+    {
+      cache: "no-store",
+      signal,
+    },
+  )
+  const payload = await readJson(response)
+  if (!response.ok) {
+    const fallback = response.status === 404
+      ? "전사 미리보기를 찾지 못했습니다."
+      : response.status === 403
+        ? "전사 미리보기 접근이 허용되지 않았습니다."
+        : response.status === 409
+          ? "전사 미리보기를 아직 열 수 없습니다."
+          : `Failed to fetch transcript preview: ${response.status}`
+    throw createApiError(response, payload, fallback)
+  }
+  const preview = decodeTranscriptPreview(payload)
+  if (preview.recording.storage_key !== storageKey) {
+    throw new Error("Transcript preview response storage_key does not match the request.")
+  }
+  if (expectations?.jobKey && preview.transcript.job_key !== expectations.jobKey) {
+    throw new Error("Transcript preview response job_key does not match the current detail selection.")
+  }
+  if (
+    typeof expectations?.revision === "number"
+    && preview.transcript.revision !== expectations.revision
+  ) {
+    throw new Error("Transcript preview response revision does not match the current detail selection.")
+  }
+  return preview
 }
 
 export async function fetchLogs(endpoint: string, offset: number | null): Promise<LogPayload> {

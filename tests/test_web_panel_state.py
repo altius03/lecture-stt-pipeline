@@ -432,13 +432,91 @@ class WebPanelStateSnapshotTests(unittest.TestCase):
                 payload["disabled_reason"],
                 "recording_library_disabled",
             )
+            self.assertEqual(
+                payload["capabilities"],
+                {"transcript_preview": False},
+            )
             self.assertFalse((root / "state" / "storage-v2.sqlite3").exists())
             with self.assertRaises(
                 web_panel_state.RecordingLibraryDisabledError
             ):
                 state.recording_library_detail("recording_a")
+            with self.assertRaises(
+                web_panel_state.RecordingLibraryDisabledError
+            ):
+                state.recording_library_transcript_preview("recording_a")
 
     def test_enabled_recording_library_delegates_with_resolved_db_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config_dir = root / "config"
+            config_dir.mkdir(parents=True, exist_ok=True)
+            (config_dir / "config.yaml").write_text(
+                "paths:\n"
+                "  db_path: state/jobs.sqlite3\n"
+                "storage_v2:\n"
+                "  db_path: state/storage-v2.sqlite3\n"
+                "  records_root: private/records\n"
+                "  library:\n"
+                "    enabled: true\n"
+                "    transcript_preview_enabled: true\n"
+                "    transcript_preview_max_bytes: 4096\n"
+                "logging:\n"
+                "  file: logs/app.log\n",
+                encoding="utf-8",
+            )
+            state = web_panel_state.ControlState(repo_root=root)
+
+            with mock.patch.object(
+                web_panel_state,
+                "list_recordings",
+                return_value={"available": True, "summaries": []},
+            ) as list_recordings:
+                list_payload = state.recording_library_list(limit=25, offset=10)
+            with mock.patch.object(
+                web_panel_state,
+                "read_recording_detail",
+                return_value={"available": True, "recording": {"storage_key": "recording_a"}},
+            ) as read_detail:
+                detail_payload = state.recording_library_detail("recording_a")
+            with mock.patch.object(
+                web_panel_state,
+                "read_recording_transcript_preview",
+                return_value={"recording": {"storage_key": "recording_a"}},
+            ) as read_preview:
+                preview_payload = state.recording_library_transcript_preview(
+                    "recording_a"
+                )
+
+            self.assertTrue(list_payload["available"])
+            self.assertEqual(
+                list_payload["capabilities"],
+                {"transcript_preview": True},
+            )
+            list_recordings.assert_called_once_with(
+                root / "state" / "storage-v2.sqlite3",
+                limit=25,
+                offset=10,
+            )
+            self.assertEqual(detail_payload["recording"]["storage_key"], "recording_a")
+            read_detail.assert_called_once_with(
+                root / "state" / "storage-v2.sqlite3",
+                "recording_a",
+            )
+            self.assertEqual(
+                preview_payload["recording"]["storage_key"],
+                "recording_a",
+            )
+            read_preview.assert_called_once_with(
+                root / "state" / "storage-v2.sqlite3",
+                root / "private" / "records",
+                "recording_a",
+                max_bytes=4096,
+            )
+
+    def test_enabled_recording_library_list_defaults_preview_capability_to_false(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             config_dir = root / "config"
@@ -460,26 +538,64 @@ class WebPanelStateSnapshotTests(unittest.TestCase):
                 web_panel_state,
                 "list_recordings",
                 return_value={"available": True, "summaries": []},
-            ) as list_recordings:
-                list_payload = state.recording_library_list(limit=25, offset=10)
-            with mock.patch.object(
-                web_panel_state,
-                "read_recording_detail",
-                return_value={"available": True, "recording": {"storage_key": "recording_a"}},
-            ) as read_detail:
-                detail_payload = state.recording_library_detail("recording_a")
+            ):
+                payload = state.recording_library_list()
 
-            self.assertTrue(list_payload["available"])
-            list_recordings.assert_called_once_with(
-                root / "state" / "storage-v2.sqlite3",
-                limit=25,
-                offset=10,
+            self.assertEqual(
+                payload["capabilities"],
+                {"transcript_preview": False},
             )
-            self.assertEqual(detail_payload["recording"]["storage_key"], "recording_a")
-            read_detail.assert_called_once_with(
-                root / "state" / "storage-v2.sqlite3",
-                "recording_a",
+
+    def test_recording_library_preview_requires_records_root_and_strict_int_max_bytes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config_dir = root / "config"
+            config_dir.mkdir(parents=True, exist_ok=True)
+            config_path = config_dir / "config.yaml"
+            config_path.write_text(
+                "paths:\n"
+                "  db_path: state/jobs.sqlite3\n"
+                "storage_v2:\n"
+                "  db_path: state/storage-v2.sqlite3\n"
+                "  library:\n"
+                "    enabled: true\n"
+                "    transcript_preview_enabled: true\n"
+                "logging:\n"
+                "  file: logs/app.log\n",
+                encoding="utf-8",
             )
+            missing_root_state = web_panel_state.ControlState(repo_root=root)
+
+            with self.assertRaisesRegex(RuntimeError, "records_root"):
+                missing_root_state.recording_library_transcript_preview(
+                    "recording_a"
+                )
+
+            config_path.write_text(
+                "paths:\n"
+                "  db_path: state/jobs.sqlite3\n"
+                "storage_v2:\n"
+                "  db_path: state/storage-v2.sqlite3\n"
+                "  records_root: private/records\n"
+                "  library:\n"
+                "    enabled: true\n"
+                "    transcript_preview_enabled: true\n"
+                '    transcript_preview_max_bytes: "4096"\n'
+                "logging:\n"
+                "  file: logs/app.log\n",
+                encoding="utf-8",
+            )
+            invalid_max_state = web_panel_state.ControlState(repo_root=root)
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "transcript_preview_max_bytes must be an integer",
+            ):
+                invalid_max_state.recording_library_transcript_preview(
+                    "recording_a"
+                )
 
     def test_unified_review_feed_uses_same_db_path_and_source_gates(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1860,3 +1976,18 @@ class WebPanelControllerExecutionOwnerTests(unittest.TestCase):
             (transcript_dir / "orphan.quality.json").write_text("{}", encoding="utf-8")
 
             self.assertEqual(web_panel_state.ControlState._count_transcript_sets(transcript_dir), "1")
+
+    def test_transcript_count_includes_nested_course_sets(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            transcript_dir = Path(temp_dir)
+            for course in ("01_computer_architecture", "02_computer_network"):
+                course_dir = transcript_dir / "2026-2" / course
+                course_dir.mkdir(parents=True)
+                (course_dir / "same_stem.txt").write_text("transcript", encoding="utf-8")
+                (course_dir / "same_stem.json").write_text("{}", encoding="utf-8")
+                (course_dir / "same_stem.quality.json").write_text("{}", encoding="utf-8")
+
+            self.assertEqual(
+                web_panel_state.ControlState._count_transcript_sets(transcript_dir),
+                "2",
+            )

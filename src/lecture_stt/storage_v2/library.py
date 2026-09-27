@@ -1,16 +1,31 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+import errno
+import fcntl
+import hashlib
+import hmac
+import os
 import sqlite3
+import stat
 import unicodedata
-from pathlib import Path
-from typing import Any
+from pathlib import Path, PurePosixPath
+from typing import Any, Iterator
 
-from lecture_stt.storage_v2.manifest import validate_storage_key
+from lecture_stt.shared.paths import repo_root
+from lecture_stt.storage_v2.manifest import (
+    ManifestValidationError,
+    validate_relative_path,
+    validate_storage_key,
+)
 from lecture_stt.storage_v2.repository import connect_v2, require_v2_schema
 
 
 LIST_SCHEMA_VERSION = "storage-v2/recording-library-list@1"
 DETAIL_SCHEMA_VERSION = "storage-v2/recording-detail@1"
+TRANSCRIPT_PREVIEW_SCHEMA_VERSION = "storage-v2/transcript-preview@1"
+DEFAULT_TRANSCRIPT_PREVIEW_MAX_BYTES = 2 * 1024 * 1024
+MAX_TRANSCRIPT_PREVIEW_MAX_BYTES = 16 * 1024 * 1024
 _JS_SAFE_INTEGER_MAX = 9_007_199_254_740_991
 _STORAGE_KEY_MAX = 255
 _JOB_KEY_MAX = 255
@@ -81,6 +96,14 @@ class RecordingLibraryDisabledError(RecordingLibraryError):
 
 class RecordingLibraryNotFoundError(RecordingLibraryError):
     """The requested recording does not exist."""
+
+
+class RecordingLibraryConflictError(RecordingLibraryError):
+    """The requested recording preview failed an integrity or identity check."""
+
+
+class RecordingLibraryUnavailableError(RecordingLibraryError):
+    """The requested recording preview cannot be served safely."""
 
 
 def _status_counts_zero() -> dict[str, int]:
@@ -193,6 +216,258 @@ def _open_readonly(db_path: Path | str) -> sqlite3.Connection:
         conn.close()
         raise
     return conn
+
+
+def _assert_database_outside_records_root(
+    db_path: Path | str,
+    records_root: Path | str,
+) -> None:
+    try:
+        database = Path(db_path).expanduser().resolve(strict=True)
+        root = Path(records_root).expanduser().resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise RecordingLibraryUnavailableError(
+            "Storage v2 transcript preview is unavailable"
+        ) from exc
+    try:
+        database.relative_to(root)
+    except ValueError:
+        return
+    raise RecordingLibraryUnavailableError(
+        "Storage v2 transcript preview is unavailable"
+    )
+
+
+def _file_snapshot(
+    metadata: os.stat_result,
+) -> tuple[int, int, int, int, int, int, int]:
+    return (
+        int(metadata.st_dev),
+        int(metadata.st_ino),
+        int(metadata.st_mode),
+        int(metadata.st_nlink),
+        int(metadata.st_size),
+        int(metadata.st_mtime_ns),
+        int(metadata.st_ctime_ns),
+    )
+
+
+def _directory_flags() -> int:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    return flags
+
+
+def _regular_file_flags() -> int:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    return flags
+
+
+@contextmanager
+def _locked_records_root(records_root: Path | str) -> Iterator[int]:
+    raw = Path(records_root).expanduser()
+    try:
+        raw_metadata = raw.lstat()
+    except FileNotFoundError as exc:
+        raise RecordingLibraryUnavailableError(
+            "Storage v2 transcript preview is unavailable"
+        ) from exc
+    if raw.is_symlink() or not stat.S_ISDIR(raw_metadata.st_mode):
+        raise RecordingLibraryUnavailableError(
+            "Storage v2 transcript preview is unavailable"
+        )
+    resolved = raw.resolve(strict=True)
+    unsafe = {
+        Path("/").resolve(),
+        Path.home().resolve(),
+        repo_root().resolve(),
+    }
+    if resolved in unsafe:
+        raise RecordingLibraryUnavailableError(
+            "Storage v2 transcript preview is unavailable"
+        )
+    root_fd = os.open(resolved, _directory_flags())
+    baseline = _file_snapshot(os.fstat(root_fd))
+    try:
+        fcntl.flock(root_fd, fcntl.LOCK_SH)
+        current = _file_snapshot(os.stat(resolved, follow_symlinks=False))
+        if current[:4] != baseline[:4] or not stat.S_ISDIR(current[2]):
+            raise RecordingLibraryConflictError(
+                "Storage v2 records root identity changed while locking"
+            )
+        yield root_fd
+        after = _file_snapshot(os.stat(resolved, follow_symlinks=False))
+        if after[:4] != baseline[:4] or not stat.S_ISDIR(after[2]):
+            raise RecordingLibraryConflictError(
+                "Storage v2 records root identity changed during preview read"
+            )
+    finally:
+        try:
+            fcntl.flock(root_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(root_fd)
+
+
+def _open_preview_fd(
+    root_fd: int,
+    *,
+    storage_key: str,
+    path_rel: str,
+) -> int:
+    components = (storage_key, *PurePosixPath(path_rel).parts)
+    current_fd = os.dup(root_fd)
+    try:
+        for component in components[:-1]:
+            next_fd = os.open(
+                component,
+                _directory_flags(),
+                dir_fd=current_fd,
+            )
+            os.close(current_fd)
+            current_fd = next_fd
+        file_fd = os.open(
+            components[-1],
+            _regular_file_flags(),
+            dir_fd=current_fd,
+        )
+        try:
+            metadata = os.fstat(file_fd)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise OSError(
+                    errno.EINVAL,
+                    "Transcript artifact is not a regular file",
+                )
+            if metadata.st_nlink != 1:
+                raise OSError(
+                    errno.EMLINK,
+                    "Transcript artifact must not be hard-linked",
+                )
+        except BaseException:
+            os.close(file_fd)
+            raise
+        return file_fd
+    finally:
+        os.close(current_fd)
+
+
+def _validate_transcript_preview_max_bytes(value: Any) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 1 <= value <= MAX_TRANSCRIPT_PREVIEW_MAX_BYTES
+    ):
+        raise ValueError(
+            "max_bytes must be between 1 and "
+            f"{MAX_TRANSCRIPT_PREVIEW_MAX_BYTES}"
+        )
+    return int(value)
+
+
+def _read_preview_text(
+    root_fd: int,
+    *,
+    storage_key: Any,
+    path_rel: Any,
+    expected_sha256: Any,
+    expected_bytes: Any,
+    max_bytes: int,
+) -> str:
+    try:
+        normalized_key = validate_storage_key(
+            str(storage_key),
+            field="storage_key",
+        )
+        normalized_path = validate_relative_path(
+            str(path_rel),
+            field="transcript.path_rel",
+        )
+    except ManifestValidationError as exc:
+        raise RecordingLibraryConflictError(
+            f"Transcript metadata is invalid for {storage_key}"
+        ) from exc
+    if (
+        not isinstance(expected_sha256, str)
+        or len(expected_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in expected_sha256)
+        or isinstance(expected_bytes, bool)
+        or not isinstance(expected_bytes, int)
+        or expected_bytes < 0
+    ):
+        raise RecordingLibraryConflictError(
+            f"Transcript metadata is invalid for {normalized_key}"
+        )
+    if expected_bytes > max_bytes:
+        raise RecordingLibraryConflictError(
+            f"Transcript exceeds the configured read limit for {normalized_key}"
+        )
+    try:
+        descriptor = _open_preview_fd(
+            root_fd,
+            storage_key=normalized_key,
+            path_rel=normalized_path,
+        )
+    except (FileNotFoundError, OSError) as exc:
+        raise RecordingLibraryUnavailableError(
+            "Storage v2 transcript preview is unavailable"
+        ) from exc
+    try:
+        before = os.fstat(descriptor)
+        if before.st_size > max_bytes:
+            raise RecordingLibraryConflictError(
+                f"Transcript exceeds the configured read limit for {normalized_key}"
+            )
+        payload = bytearray()
+        while True:
+            remaining = max_bytes + 1 - len(payload)
+            if remaining <= 0:
+                raise RecordingLibraryConflictError(
+                    f"Transcript exceeds the configured read limit for {normalized_key}"
+                )
+            chunk = os.read(descriptor, min(65536, remaining))
+            if not chunk:
+                break
+            payload.extend(chunk)
+        after = os.fstat(descriptor)
+        if _file_snapshot(before) != _file_snapshot(after):
+            raise RecordingLibraryConflictError(
+                f"Transcript changed while reading for {normalized_key}"
+            )
+        if len(payload) != before.st_size:
+            raise RecordingLibraryConflictError(
+                f"Transcript size changed while reading for {normalized_key}"
+            )
+        observed_sha256 = hashlib.sha256(payload).hexdigest()
+        if len(payload) != expected_bytes or not hmac.compare_digest(
+            observed_sha256,
+            expected_sha256,
+        ):
+            raise RecordingLibraryConflictError(
+                f"Transcript artifact metadata does not match for {normalized_key}"
+            )
+        try:
+            decoded = payload.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise RecordingLibraryConflictError(
+                f"Transcript is not valid UTF-8 for {normalized_key}"
+            ) from exc
+    finally:
+        os.close(descriptor)
+    if "\x00" in decoded:
+        raise RecordingLibraryConflictError(
+            f"Transcript contains unsupported NUL bytes for {normalized_key}"
+        )
+    return decoded
 
 
 def _title_payload(title: str | None, source: str | None) -> dict[str, str] | None:
@@ -391,6 +666,9 @@ def disabled_recording_library_list(
             "limit": normalized_limit,
             "offset": normalized_offset,
         },
+        "capabilities": {
+            "transcript_preview": False,
+        },
         "counts": _status_counts_zero(),
         "total": 0,
         "summaries": [],
@@ -548,6 +826,9 @@ def list_recordings(
         "filters": {
             "limit": normalized_limit,
             "offset": normalized_offset,
+        },
+        "capabilities": {
+            "transcript_preview": False,
         },
         "counts": counts,
         "total": counts["recordings"],
@@ -987,4 +1268,164 @@ def read_recording_detail(
             _detail_review_payload(row)
             for row in returned_review_rows
         ],
+    }
+
+
+def read_recording_transcript_preview(
+    db_path: Path | str,
+    records_root: Path | str,
+    storage_key: str,
+    *,
+    max_bytes: int = DEFAULT_TRANSCRIPT_PREVIEW_MAX_BYTES,
+) -> dict[str, Any]:
+    normalized_storage_key = _validate_recording_key(storage_key)
+    normalized_max_bytes = _validate_transcript_preview_max_bytes(
+        max_bytes
+    )
+    _assert_database_outside_records_root(db_path, records_root)
+    with _locked_records_root(records_root) as root_fd:
+        conn = _open_readonly(db_path)
+        try:
+            conn.execute("BEGIN")
+            recording = conn.execute(
+                """
+                SELECT
+                    recording.id,
+                    recording.storage_key,
+                    recording.original_name_nfc,
+                    title.title
+                FROM recordings AS recording
+                LEFT JOIN recording_titles AS title
+                  ON title.recording_id = recording.id
+                 AND title.is_current = 1
+                WHERE recording.storage_key = ?
+                  AND recording.archived_at IS NULL
+                """,
+                (normalized_storage_key,),
+            ).fetchone()
+            if recording is None:
+                raise RecordingLibraryNotFoundError(
+                    f"Recording not found: {normalized_storage_key}"
+                )
+            transcript = conn.execute(
+                """
+                SELECT
+                    job.job_key,
+                    artifact.revision,
+                    artifact.bytes,
+                    artifact.mime_type,
+                    artifact.created_at,
+                    artifact.path_rel,
+                    artifact.content_sha256
+                FROM transcription_jobs AS job
+                JOIN artifacts AS artifact
+                  ON artifact.recording_id = job.recording_id
+                 AND artifact.job_id = job.id
+                 AND artifact.artifact_kind = 'transcript_raw_text'
+                 AND artifact.is_latest = 1
+                 AND artifact.archived_at IS NULL
+                WHERE job.recording_id = ?
+                  AND job.is_current = 1
+                  AND job.archived_at IS NULL
+                  AND job.status = 'done'
+                  AND job.progress = 100
+                ORDER BY artifact.revision DESC, artifact.id DESC
+                LIMIT 1
+                """,
+                (int(recording["id"]),),
+            ).fetchone()
+            if transcript is None:
+                raise RecordingLibraryNotFoundError(
+                    f"Transcript preview not available for {normalized_storage_key}"
+                )
+            job_key = _bounded_text(
+                transcript["job_key"],
+                field="transcript.job_key",
+                max_length=_JOB_KEY_MAX,
+                required=True,
+            )
+            assert job_key is not None
+            actual_path_rel = _bounded_text(
+                transcript["path_rel"],
+                field="transcript.path_rel",
+                max_length=4096,
+                required=True,
+            )
+            assert actual_path_rel is not None
+            if actual_path_rel != f"jobs/{job_key}/transcript.txt":
+                raise RecordingLibraryConflictError(
+                    f"Transcript preview artifact is not canonical for {normalized_storage_key}"
+                )
+            mime_type = _bounded_text(
+                transcript["mime_type"],
+                field="transcript.mime_type",
+                max_length=_TEXT_256_MAX,
+                required=True,
+            )
+            assert mime_type is not None
+            mime_essence = mime_type.partition(";")[0].strip().lower()
+            if mime_essence != "text/plain":
+                raise RecordingLibraryConflictError(
+                    f"Transcript preview artifact is not canonical for {normalized_storage_key}"
+                )
+            original_name_nfc = _bounded_text(
+                recording["original_name_nfc"],
+                field="recording.original_name_nfc",
+                max_length=_NAME_MAX,
+                required=True,
+            )
+            assert original_name_nfc is not None
+            text = _read_preview_text(
+                root_fd,
+                storage_key=recording["storage_key"],
+                path_rel=transcript["path_rel"],
+                expected_sha256=transcript["content_sha256"],
+                expected_bytes=transcript["bytes"],
+                max_bytes=normalized_max_bytes,
+            )
+        finally:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            conn.close()
+
+    return {
+        "schema_version": TRANSCRIPT_PREVIEW_SCHEMA_VERSION,
+        "available": True,
+        "recording": {
+            "storage_key": _validate_recording_key(recording["storage_key"]),
+            "display_name": _display_name(
+                recording["title"],
+                original_name_nfc,
+            ),
+        },
+        "transcript": {
+            "job_key": _bounded_text(
+                job_key,
+                field="transcript.job_key",
+                max_length=_JOB_KEY_MAX,
+                required=True,
+            ),
+            "revision": _bounded_int(
+                transcript["revision"],
+                field="transcript.revision",
+                minimum=1,
+            ),
+            "bytes": _bounded_int(
+                transcript["bytes"],
+                field="transcript.bytes",
+            ),
+            "characters": _bounded_int(
+                len(text),
+                field="transcript.characters",
+            ),
+            "created_at": _bounded_text(
+                transcript["created_at"],
+                field="transcript.created_at",
+                max_length=_TIMESTAMP_MAX,
+                required=True,
+            ),
+            "text": text,
+        },
     }

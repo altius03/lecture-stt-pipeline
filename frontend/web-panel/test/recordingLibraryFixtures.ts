@@ -1,6 +1,7 @@
 import type {
   RecordingDetailPayload,
   RecordingLibraryListPayload,
+  TranscriptPreviewPayload,
 } from "../src/types"
 
 export function buildRecordingLibraryListPayload(
@@ -25,6 +26,9 @@ export function buildRecordingLibraryListPayload(
       open_reviews: 1,
     },
     total: 2,
+    capabilities: {
+      transcript_preview: true,
+    },
     summaries: [
       {
         storage_key: "rec_2026_07_23_ds_05",
@@ -255,5 +259,38 @@ export function buildRecordingDetailPayload(
         resolved_at: primary ? "2026-07-23T13:12:00+09:00" : "2026-07-22T19:08:00+09:00",
       },
     ],
+  }
+}
+
+export function buildTranscriptPreviewPayload(
+  storageKey = "rec_meeting_2026_07_22",
+): TranscriptPreviewPayload {
+  const displayName =
+    storageKey === "rec_2026_07_23_ds_05"
+      ? "2026-07-23 자료구조 5교시"
+      : "프로젝트 회의 메모"
+  const text =
+    storageKey === "rec_2026_07_23_ds_05"
+      ? "첫 줄입니다.\n둘째 줄입니다."
+      : "회의 안건 정리입니다.\n다음 액션은 테스트 추가입니다."
+
+  return {
+    schema_version: "storage-v2/transcript-preview@1",
+    available: true,
+    recording: {
+      storage_key: storageKey,
+      display_name: displayName,
+    },
+    transcript: {
+      job_key: storageKey === "rec_2026_07_23_ds_05" ? "job_ds_05" : "job_meeting_01",
+      revision: 2,
+      bytes: new TextEncoder().encode(text).length,
+      characters: Array.from(text).length,
+      created_at:
+        storageKey === "rec_2026_07_23_ds_05"
+          ? "2026-07-23T13:09:00+09:00"
+          : "2026-07-22T19:10:00+09:00",
+      text,
+    },
   }
 }

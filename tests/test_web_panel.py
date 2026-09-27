@@ -20,6 +20,7 @@ from lecture_stt.storage_v2.archive_review import (  # noqa: E402
     ArchiveReviewWriteDisabledError,
 )
 from lecture_stt.storage_v2.library import (  # noqa: E402
+    RecordingLibraryConflictError,
     RecordingLibraryDisabledError,
     RecordingLibraryNotFoundError,
 )
@@ -375,6 +376,10 @@ class WebPanelRequestHandlerTests(unittest.TestCase):
             "available": True,
             "recording": {"storage_key": "recording_a"},
         }
+        state.recording_library_transcript_preview.return_value = {
+            "recording": {"storage_key": "recording_a"},
+            "transcript": {"text": "본문"},
+        }
         web_panel.STATE = state
 
         list_handler = object.__new__(web_panel.RequestHandler)
@@ -402,6 +407,25 @@ class WebPanelRequestHandlerTests(unittest.TestCase):
         detail_handler._write_json.assert_called_once_with(
             200,
             {"available": True, "recording": {"storage_key": "recording_a"}},
+        )
+
+        preview_handler = object.__new__(web_panel.RequestHandler)
+        preview_handler.path = (
+            "/api/storage-v2/library/recordings/recording_a/transcript-preview"
+        )
+        preview_handler._write_json = mock.Mock()
+        preview_handler._api_error = mock.Mock()
+        preview_handler.do_GET()
+
+        state.recording_library_transcript_preview.assert_called_once_with(
+            "recording_a"
+        )
+        preview_handler._write_json.assert_called_once_with(
+            200,
+            {
+                "recording": {"storage_key": "recording_a"},
+                "transcript": {"text": "본문"},
+            },
         )
 
     def test_recording_library_list_route_is_exact_query_fail_closed(self) -> None:
@@ -523,6 +547,18 @@ class WebPanelRequestHandlerTests(unittest.TestCase):
         trailing_handler.do_GET()
         trailing_handler._api_error.assert_called_once_with(404, "Not Found")
 
+        preview_query_handler = object.__new__(web_panel.RequestHandler)
+        preview_query_handler.path = (
+            "/api/storage-v2/library/recordings/recording_a/transcript-preview?offset=1"
+        )
+        preview_query_handler._write_json = mock.Mock()
+        preview_query_handler._api_error = mock.Mock()
+        preview_query_handler.do_GET()
+        preview_query_handler._api_error.assert_called_once_with(
+            400,
+            "recording detail does not accept query parameters",
+        )
+
         state.recording_library_detail.side_effect = RecordingLibraryDisabledError(
             "Recording library API is disabled"
         )
@@ -560,6 +596,24 @@ class WebPanelRequestHandlerTests(unittest.TestCase):
         failure_handler._api_error.assert_called_once_with(
             503,
             "Recording library is unavailable",
+        )
+
+        state.recording_library_detail.side_effect = None
+        state.recording_library_transcript_preview.side_effect = (
+            RecordingLibraryConflictError(
+                "Transcript artifact metadata does not match for recording_a"
+            )
+        )
+        preview_conflict_handler = object.__new__(web_panel.RequestHandler)
+        preview_conflict_handler.path = (
+            "/api/storage-v2/library/recordings/recording_a/transcript-preview"
+        )
+        preview_conflict_handler._write_json = mock.Mock()
+        preview_conflict_handler._api_error = mock.Mock()
+        preview_conflict_handler.do_GET()
+        preview_conflict_handler._api_error.assert_called_once_with(
+            409,
+            "Transcript artifact metadata does not match for recording_a",
         )
 
     def test_unified_review_feed_route_dispatches_and_fails_closed(self) -> None:

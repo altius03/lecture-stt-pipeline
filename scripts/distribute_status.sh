@@ -10,4 +10,4 @@ fi
 
 export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 
-exec "$PYTHON_BIN" -m lecture_stt.downstream.status --config "$REPO_ROOT/config/config.yaml" "$@"
+exec "$PYTHON_BIN" -m lecture_stt.downstream.transcript_status --config "$REPO_ROOT/config/config.yaml" "$@"

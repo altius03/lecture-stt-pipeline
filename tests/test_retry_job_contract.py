@@ -96,6 +96,7 @@ class RetryJobContractTests(unittest.TestCase):
         status: str = db.STATUS_PENDING,
         current_step: str | None = None,
         canonical_audio_path: Path | None = None,
+        transcript_relative_dir: str | None = None,
     ) -> tuple[int, Path]:
         audio_path = canonical_audio_path or (self.audio_root / name)
         if canonical_audio_path is None:
@@ -104,6 +105,10 @@ class RetryJobContractTests(unittest.TestCase):
             canonical_audio_path.parent.mkdir(parents=True, exist_ok=True)
             if not canonical_audio_path.exists() and audio_bytes:
                 canonical_audio_path.write_bytes(audio_bytes)
+        transcript_parent = self.root / "transcripts"
+        if transcript_relative_dir:
+            transcript_parent = transcript_parent / transcript_relative_dir
+            transcript_parent.mkdir(parents=True, exist_ok=True)
         engine_params = {
             "transcription_failures": failures,
             "transcription_max_retries": max_retries,
@@ -116,8 +121,8 @@ class RetryJobContractTests(unittest.TestCase):
             orig_name=name,
             canonical_base=Path(name).stem,
             canonical_audio_path=str(audio_path),
-            transcript_txt_path=str(self.root / "transcripts" / f"{Path(name).stem}.txt"),
-            transcript_json_path=str(self.root / "transcripts" / f"{Path(name).stem}.json"),
+            transcript_txt_path=str(transcript_parent / f"{Path(name).stem}.txt"),
+            transcript_json_path=str(transcript_parent / f"{Path(name).stem}.json"),
             engine_params=engine_params,
             current_step=step,
             progress_pct=18,
@@ -161,6 +166,56 @@ class RetryJobContractTests(unittest.TestCase):
             revalidated["claim_fence"]["transcript_txt_path"],
             str(self.root / "transcripts" / "retry-audio.txt"),
         )
+
+    def test_nested_transcript_descendants_are_allowed_and_pinned(self) -> None:
+        job_id, audio_path = self._create_retry_job(
+            transcript_relative_dir="2026-2/cs201",
+        )
+
+        plan = build_retry_job_plan(self.config, job_id=job_id)
+        self.assertEqual(
+            plan["retry_job"]["transcript_txt_relative_path"],
+            "2026-2/cs201/retry-audio.txt",
+        )
+        self.assertEqual(
+            plan["retry_job"]["transcript_json_relative_path"],
+            "2026-2/cs201/retry-audio.json",
+        )
+
+        revalidated = revalidate_retry_job_plan(self.config, self.conn, plan)
+        self.assertEqual(revalidated["canonical_audio_path"], audio_path)
+        self.assertEqual(
+            revalidated["claim_fence"]["transcript_txt_path"],
+            str(self.root / "transcripts" / "2026-2" / "cs201" / "retry-audio.txt"),
+        )
+
+    def test_descendant_transcript_symlink_is_rejected(self) -> None:
+        job_id, _ = self._create_retry_job(transcript_relative_dir="2026-3/cs201")
+        transcript_root = self.root / "transcripts"
+        symlink_parent = transcript_root / "2026-3" / "legacy"
+        real_parent = self.root / "real-transcripts" / "2026-3" / "legacy"
+        (real_parent / "cs201").mkdir(parents=True)
+        (real_parent / "cs201" / "retry-audio.txt").write_text(
+            "transcript",
+            encoding="utf-8",
+        )
+        (real_parent / "cs201" / "retry-audio.json").write_text(
+            "{}",
+            encoding="utf-8",
+        )
+        symlink_parent.symlink_to(real_parent, target_is_directory=True)
+        db.update_job(
+            self.conn,
+            job_id,
+            transcript_txt_path=str(symlink_parent / "cs201" / "retry-audio.txt"),
+            transcript_json_path=str(symlink_parent / "cs201" / "retry-audio.json"),
+        )
+
+        with self.assertRaisesRegex(
+            RetryJobConflictError,
+            "symlink components",
+        ):
+            build_retry_job_plan(self.config)
 
     def test_zero_candidates_are_rejected(self) -> None:
         with self.assertRaisesRegex(RetryJobConflictError, "found 0"):

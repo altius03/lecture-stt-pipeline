@@ -16,6 +16,11 @@ STATUS_DONE = "DONE"
 STATUS_NEEDS_REVIEW = "NEEDS_REVIEW"
 STATUS_ERROR = "ERROR"
 
+
+class TranscriptSchemaCompatibilityError(sqlite3.DatabaseError):
+    """Raised when an existing transcript table cannot be migrated additively."""
+
+
 DELIVERY_COLUMN_DEFS = {
     "source_job_id": "INTEGER",
     "subject_abbr": "TEXT NOT NULL DEFAULT 'UNKNOWN'",
@@ -36,6 +41,102 @@ DELIVERY_COLUMN_DEFS = {
     "obsidian_done": "INTEGER NOT NULL DEFAULT 0",
     "last_error_code": "TEXT",
     "last_error": "TEXT",
+    "last_attempted_at": "TEXT",
+    "completed_at": "TEXT",
+    "updated_at": "TEXT NOT NULL",
+}
+
+TRANSCRIPT_DELIVERY_COLUMN_DEFS = {
+    "source_job_id": "INTEGER PRIMARY KEY",
+    "source_recording_id": "INTEGER",
+    "storage_key": "TEXT",
+    "logical_stem": "TEXT NOT NULL",
+    "semester": "TEXT",
+    "course_code": "TEXT",
+    "course_name": "TEXT",
+    "course_dir": "TEXT",
+    "vault_root_path": "TEXT",
+    "semester_root_path": "TEXT",
+    "course_root_path": "TEXT",
+    "origin_dir_path": "TEXT",
+    "source_txt_path": "TEXT NOT NULL",
+    "source_txt_sha256": "TEXT NOT NULL",
+    "source_json_path": "TEXT NOT NULL",
+    "source_json_sha256": "TEXT NOT NULL",
+    "destination_txt_path": "TEXT",
+    "destination_txt_sha256": "TEXT",
+    "destination_json_path": "TEXT",
+    "destination_json_sha256": "TEXT",
+    "destination_md_path": "TEXT",
+    "destination_md_sha256": "TEXT",
+    "route_method": "TEXT NOT NULL",
+    "active_semester_path": "TEXT",
+    "active_semester_sha256": "TEXT",
+    "manifest_path": "TEXT",
+    "manifest_sha256": "TEXT",
+    "status": "TEXT NOT NULL DEFAULT 'PENDING'",
+    "attempt_count": "INTEGER NOT NULL DEFAULT 0",
+    "error_count": "INTEGER NOT NULL DEFAULT 0",
+    "last_error_code": "TEXT",
+    "last_error": "TEXT",
+    "created_at": "TEXT NOT NULL",
+    "last_attempted_at": "TEXT",
+    "completed_at": "TEXT",
+    "updated_at": "TEXT NOT NULL",
+}
+
+TRANSCRIPT_POSTPROCESS_JOB_COLUMN_DEFS = {
+    "source_job_id": "INTEGER PRIMARY KEY",
+    "storage_key": "TEXT",
+    "logical_stem": "TEXT NOT NULL",
+    "semester": "TEXT",
+    "course_code": "TEXT",
+    "course_name": "TEXT",
+    "course_dir": "TEXT",
+    "vault_root_path": "TEXT",
+    "semester_root_path": "TEXT",
+    "course_root_path": "TEXT",
+    "origin_dir_path": "TEXT",
+    "summary_dir_path": "TEXT",
+    "active_semester_path": "TEXT",
+    "active_semester_sha256": "TEXT",
+    "manifest_source_path": "TEXT",
+    "manifest_source_sha256": "TEXT",
+    "activation_cutoff": "TEXT NOT NULL",
+    "route_method": "TEXT NOT NULL",
+    "status": "TEXT NOT NULL DEFAULT 'PENDING'",
+    "source_txt_path": "TEXT NOT NULL",
+    "source_txt_sha256": "TEXT NOT NULL",
+    "source_json_path": "TEXT NOT NULL",
+    "source_json_sha256": "TEXT NOT NULL",
+    "correction_stage_txt_path": "TEXT",
+    "correction_stage_txt_sha256": "TEXT",
+    "correction_stage_json_path": "TEXT",
+    "correction_stage_json_sha256": "TEXT",
+    "summary_stage_md_path": "TEXT",
+    "summary_stage_md_sha256": "TEXT",
+    "destination_txt_path": "TEXT",
+    "destination_txt_sha256": "TEXT",
+    "destination_json_path": "TEXT",
+    "destination_json_sha256": "TEXT",
+    "destination_summary_md_path": "TEXT",
+    "destination_summary_md_sha256": "TEXT",
+    "generator_backend": "TEXT NOT NULL",
+    "generator_program": "TEXT",
+    "generator_model": "TEXT",
+    "generator_reasoning_effort": "TEXT",
+    "generator_prompt_version": "TEXT",
+    "correction_status": "TEXT NOT NULL DEFAULT 'PENDING'",
+    "summary_status": "TEXT NOT NULL DEFAULT 'BLOCKED'",
+    "delivery_status": "TEXT NOT NULL DEFAULT 'BLOCKED'",
+    "correction_attempt_count": "INTEGER NOT NULL DEFAULT 0",
+    "summary_attempt_count": "INTEGER NOT NULL DEFAULT 0",
+    "delivery_attempt_count": "INTEGER NOT NULL DEFAULT 0",
+    "error_count": "INTEGER NOT NULL DEFAULT 0",
+    "last_error_stage": "TEXT",
+    "last_error_code": "TEXT",
+    "last_error": "TEXT",
+    "created_at": "TEXT NOT NULL",
     "last_attempted_at": "TEXT",
     "completed_at": "TEXT",
     "updated_at": "TEXT NOT NULL",
@@ -94,6 +195,8 @@ def init_db(db_path: str) -> sqlite3.Connection:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs (created_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_updated_at ON jobs (updated_at)")
     init_deliveries_table(conn)
+    init_transcript_deliveries_table(conn)
+    init_transcript_postprocess_jobs_table(conn)
     conn.commit()
     return conn
 
@@ -101,6 +204,104 @@ def init_db(db_path: str) -> sqlite3.Connection:
 def _existing_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
     rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
     return {str(row["name"]) for row in rows}
+
+
+def _is_safe_additive_column(column_def: str) -> bool:
+    normalized = " ".join(column_def.upper().split())
+    if "PRIMARY KEY" in normalized or "UNIQUE" in normalized:
+        return False
+    return "NOT NULL" not in normalized or "DEFAULT" in normalized
+
+
+def _quote_pragma_identifier(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
+
+
+def _has_source_job_conflict_key(
+    conn: sqlite3.Connection,
+    table_name: str,
+) -> bool:
+    table_info = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    primary_key_columns = sorted(
+        (int(row["pk"]), str(row["name"]))
+        for row in table_info
+        if int(row["pk"]) > 0
+    )
+    if primary_key_columns == [(1, "source_job_id")]:
+        return True
+
+    indexes = conn.execute(f"PRAGMA index_list({table_name})").fetchall()
+    for index in indexes:
+        if int(index["unique"]) != 1 or int(index["partial"]) != 0:
+            continue
+        index_name = _quote_pragma_identifier(str(index["name"]))
+        indexed_columns = conn.execute(
+            f"PRAGMA index_info({index_name})"
+        ).fetchall()
+        column_names = [
+            str(row["name"])
+            for row in sorted(indexed_columns, key=lambda row: int(row["seqno"]))
+        ]
+        if column_names == ["source_job_id"]:
+            return True
+    return False
+
+
+def _ensure_transcript_table_schema(
+    conn: sqlite3.Connection,
+    *,
+    table_name: str,
+    create_sql: str,
+    column_defs: Dict[str, str],
+) -> None:
+    """Apply safe additions, rebuilding only an incompatible empty table."""
+
+    existing = _existing_columns(conn, table_name)
+    missing = [name for name in column_defs if name not in existing]
+    non_additive = [
+        name for name in missing if not _is_safe_additive_column(column_defs[name])
+    ]
+    incompatibilities: list[str] = []
+    if non_additive:
+        details = ", ".join(
+            f"{name} ({column_defs[name]})" for name in non_additive
+        )
+        incompatibilities.append(f"missing non-additive column(s): {details}")
+    if "source_job_id" in existing and not _has_source_job_conflict_key(
+        conn,
+        table_name,
+    ):
+        incompatibilities.append(
+            "source_job_id lacks a required single-column PRIMARY KEY or "
+            "non-partial UNIQUE constraint"
+        )
+
+    if incompatibilities:
+        has_rows = (
+            conn.execute(f"SELECT 1 FROM {table_name} LIMIT 1").fetchone()
+            is not None
+        )
+        if has_rows:
+            raise TranscriptSchemaCompatibilityError(
+                f"incompatible non-empty schema for {table_name}: "
+                f"{'; '.join(incompatibilities)}. Automatic migration was not "
+                "attempted because required key constraints and non-additive columns "
+                "cannot be introduced safely for existing rows. Back up the database, "
+                "then explicitly migrate the existing rows into the canonical schema "
+                "or recreate the table after preserving its data."
+            )
+
+        # With no rows to preserve, rebuilding avoids SQLite's ADD COLUMN and
+        # constraint restrictions while producing the exact canonical schema.
+        conn.execute(f"DROP TABLE {table_name}")
+        conn.execute(create_sql)
+        return
+
+    for column_name in missing:
+        conn.execute(
+            f"ALTER TABLE {table_name} ADD COLUMN {column_name} "
+            f"{column_defs[column_name]}"
+        )
 
 
 def _ensure_job_columns(conn: sqlite3.Connection, required: set[str]) -> None:
@@ -155,6 +356,158 @@ def init_deliveries_table(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def init_transcript_deliveries_table(conn: sqlite3.Connection) -> None:
+    create_sql = """
+        CREATE TABLE IF NOT EXISTS transcript_deliveries (
+            source_job_id INTEGER PRIMARY KEY,
+            source_recording_id INTEGER,
+            storage_key TEXT,
+            logical_stem TEXT NOT NULL,
+            semester TEXT,
+            course_code TEXT,
+            course_name TEXT,
+            course_dir TEXT,
+            vault_root_path TEXT,
+            semester_root_path TEXT,
+            course_root_path TEXT,
+            origin_dir_path TEXT,
+            source_txt_path TEXT NOT NULL,
+            source_txt_sha256 TEXT NOT NULL,
+            source_json_path TEXT NOT NULL,
+            source_json_sha256 TEXT NOT NULL,
+            destination_txt_path TEXT,
+            destination_txt_sha256 TEXT,
+            destination_json_path TEXT,
+            destination_json_sha256 TEXT,
+            destination_md_path TEXT,
+            destination_md_sha256 TEXT,
+            route_method TEXT NOT NULL,
+            active_semester_path TEXT,
+            active_semester_sha256 TEXT,
+            manifest_path TEXT,
+            manifest_sha256 TEXT,
+            status TEXT NOT NULL DEFAULT 'PENDING',
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            error_count INTEGER NOT NULL DEFAULT 0,
+            last_error_code TEXT,
+            last_error TEXT,
+            created_at TEXT NOT NULL,
+            last_attempted_at TEXT,
+            completed_at TEXT,
+            updated_at TEXT NOT NULL
+        )
+        """
+    conn.execute(create_sql)
+    _ensure_transcript_table_schema(
+        conn,
+        table_name="transcript_deliveries",
+        create_sql=create_sql,
+        column_defs=TRANSCRIPT_DELIVERY_COLUMN_DEFS,
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_transcript_deliveries_status "
+        "ON transcript_deliveries (status)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_transcript_deliveries_storage_key "
+        "ON transcript_deliveries (storage_key)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_transcript_deliveries_updated_at "
+        "ON transcript_deliveries (updated_at)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_transcript_deliveries_completed_at "
+        "ON transcript_deliveries (completed_at)"
+    )
+    conn.commit()
+
+
+def init_transcript_postprocess_jobs_table(conn: sqlite3.Connection) -> None:
+    create_sql = """
+        CREATE TABLE IF NOT EXISTS transcript_postprocess_jobs (
+            source_job_id INTEGER PRIMARY KEY,
+            storage_key TEXT,
+            logical_stem TEXT NOT NULL,
+            semester TEXT,
+            course_code TEXT,
+            course_name TEXT,
+            course_dir TEXT,
+            vault_root_path TEXT,
+            semester_root_path TEXT,
+            course_root_path TEXT,
+            origin_dir_path TEXT,
+            summary_dir_path TEXT,
+            active_semester_path TEXT,
+            active_semester_sha256 TEXT,
+            manifest_source_path TEXT,
+            manifest_source_sha256 TEXT,
+            activation_cutoff TEXT NOT NULL,
+            route_method TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'PENDING',
+            source_txt_path TEXT NOT NULL,
+            source_txt_sha256 TEXT NOT NULL,
+            source_json_path TEXT NOT NULL,
+            source_json_sha256 TEXT NOT NULL,
+            correction_stage_txt_path TEXT,
+            correction_stage_txt_sha256 TEXT,
+            correction_stage_json_path TEXT,
+            correction_stage_json_sha256 TEXT,
+            summary_stage_md_path TEXT,
+            summary_stage_md_sha256 TEXT,
+            destination_txt_path TEXT,
+            destination_txt_sha256 TEXT,
+            destination_json_path TEXT,
+            destination_json_sha256 TEXT,
+            destination_summary_md_path TEXT,
+            destination_summary_md_sha256 TEXT,
+            generator_backend TEXT NOT NULL,
+            generator_program TEXT,
+            generator_model TEXT,
+            generator_reasoning_effort TEXT,
+            generator_prompt_version TEXT,
+            correction_status TEXT NOT NULL DEFAULT 'PENDING',
+            summary_status TEXT NOT NULL DEFAULT 'BLOCKED',
+            delivery_status TEXT NOT NULL DEFAULT 'BLOCKED',
+            correction_attempt_count INTEGER NOT NULL DEFAULT 0,
+            summary_attempt_count INTEGER NOT NULL DEFAULT 0,
+            delivery_attempt_count INTEGER NOT NULL DEFAULT 0,
+            error_count INTEGER NOT NULL DEFAULT 0,
+            last_error_stage TEXT,
+            last_error_code TEXT,
+            last_error TEXT,
+            created_at TEXT NOT NULL,
+            last_attempted_at TEXT,
+            completed_at TEXT,
+            updated_at TEXT NOT NULL
+        )
+        """
+    conn.execute(create_sql)
+    _ensure_transcript_table_schema(
+        conn,
+        table_name="transcript_postprocess_jobs",
+        create_sql=create_sql,
+        column_defs=TRANSCRIPT_POSTPROCESS_JOB_COLUMN_DEFS,
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_transcript_postprocess_jobs_status "
+        "ON transcript_postprocess_jobs (status)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_transcript_postprocess_jobs_stage_status "
+        "ON transcript_postprocess_jobs (correction_status, summary_status, delivery_status)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_transcript_postprocess_jobs_updated_at "
+        "ON transcript_postprocess_jobs (updated_at)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_transcript_postprocess_jobs_completed_at "
+        "ON transcript_postprocess_jobs (completed_at)"
+    )
+    conn.commit()
+
+
 def _now() -> str:
     return utils.now_iso()
 
@@ -195,6 +548,135 @@ def upsert_delivery(conn: sqlite3.Connection, logical_stem: str, **fields: Any) 
         payload,
     )
     conn.commit()
+
+
+def get_transcript_delivery(
+    conn: sqlite3.Connection,
+    source_job_id: int,
+) -> Optional[sqlite3.Row]:
+    try:
+        return conn.execute(
+            "SELECT * FROM transcript_deliveries WHERE source_job_id = ?",
+            (source_job_id,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+
+
+def upsert_transcript_delivery(
+    conn: sqlite3.Connection,
+    source_job_id: int,
+    **fields: Any,
+) -> None:
+    payload = _clean_payload(fields)
+    payload["updated_at"] = _now()
+    payload["source_job_id"] = source_job_id
+    payload.setdefault("created_at", payload["updated_at"])
+    columns = ", ".join(payload.keys())
+    placeholders = ", ".join([":" + key for key in payload.keys()])
+    update_clause = ", ".join(
+        f"{key} = excluded.{key}"
+        for key in payload
+        if key not in {"source_job_id", "created_at"}
+    )
+    conn.execute(
+        f"INSERT INTO transcript_deliveries ({columns}) VALUES ({placeholders}) "
+        f"ON CONFLICT(source_job_id) DO UPDATE SET {update_clause}",
+        payload,
+    )
+    conn.commit()
+
+
+def list_transcript_deliveries_by_status(
+    conn: sqlite3.Connection,
+    status: str,
+) -> list[sqlite3.Row]:
+    try:
+        return conn.execute(
+            "SELECT * FROM transcript_deliveries WHERE status = ? "
+            "ORDER BY updated_at ASC, source_job_id ASC",
+            (status,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+
+
+def get_transcript_postprocess_job(
+    conn: sqlite3.Connection,
+    source_job_id: int,
+) -> Optional[sqlite3.Row]:
+    try:
+        return conn.execute(
+            "SELECT * FROM transcript_postprocess_jobs WHERE source_job_id = ?",
+            (source_job_id,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+
+
+def insert_transcript_postprocess_job_if_absent(
+    conn: sqlite3.Connection,
+    source_job_id: int,
+    **fields: Any,
+) -> bool:
+    payload = _clean_payload(fields)
+    payload["source_job_id"] = source_job_id
+    payload.setdefault("created_at", _now())
+    payload.setdefault("updated_at", payload["created_at"])
+    columns = ", ".join(payload.keys())
+    placeholders = ", ".join([":" + key for key in payload.keys()])
+    cursor = conn.execute(
+        f"INSERT INTO transcript_postprocess_jobs ({columns}) VALUES ({placeholders}) "
+        "ON CONFLICT(source_job_id) DO NOTHING",
+        payload,
+    )
+    conn.commit()
+    return cursor.rowcount == 1
+
+
+def update_transcript_postprocess_job(
+    conn: sqlite3.Connection,
+    source_job_id: int,
+    **fields: Any,
+) -> None:
+    if not fields:
+        return
+    payload = _clean_payload(fields)
+    payload["source_job_id"] = source_job_id
+    payload["updated_at"] = _now()
+    assignments = ", ".join(f"{key} = :{key}" for key in payload if key != "source_job_id")
+    conn.execute(
+        f"UPDATE transcript_postprocess_jobs SET {assignments} "
+        "WHERE source_job_id = :source_job_id",
+        payload,
+    )
+    conn.commit()
+
+
+def list_transcript_postprocess_jobs(
+    conn: sqlite3.Connection,
+    *,
+    statuses: tuple[str, ...] | None = None,
+    limit: int | None = None,
+) -> list[sqlite3.Row]:
+    try:
+        params: list[Any] = []
+        where = ""
+        if statuses:
+            placeholders = ",".join("?" for _ in statuses)
+            where = f"WHERE status IN ({placeholders})"
+            params.extend(statuses)
+        limit_clause = ""
+        if limit is not None:
+            limit_clause = " LIMIT ?"
+            params.append(max(0, int(limit)))
+        return conn.execute(
+            "SELECT * FROM transcript_postprocess_jobs "
+            f"{where} ORDER BY updated_at ASC, source_job_id ASC{limit_clause}",
+            params,
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
 
 
 def find_latest_job_by_canonical_base(conn: sqlite3.Connection, canonical_base: str) -> Optional[sqlite3.Row]:
@@ -436,8 +918,8 @@ def _validate_recovered_quality_scorecard(
     except FileNotFoundError:
         # Transcript JSON is written before its metadata-only scorecard. A crash
         # in that narrow window is safe to repair deterministically from the
-        # persisted metadata; rebuilding also keeps the Hermes picker from
-        # mistaking this result for a pre-scorecard legacy transcript.
+        # persisted metadata; rebuilding also keeps downstream quality gates
+        # from mistaking this result for a pre-scorecard legacy transcript.
         try:
             write_quality_scorecard(json_path, metadata)
             validate_quality_scorecard(json_path, metadata)

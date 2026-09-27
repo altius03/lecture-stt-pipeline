@@ -746,6 +746,10 @@ export interface RecordingLibraryListCounts {
   open_reviews: number
 }
 
+export interface RecordingLibraryCapabilities {
+  transcript_preview: boolean
+}
+
 export interface RecordingLibraryListPayload {
   schema_version: "storage-v2/recording-library-list@1"
   available: boolean
@@ -757,6 +761,7 @@ export interface RecordingLibraryListPayload {
   counts: RecordingLibraryListCounts
   total: number
   summaries: RecordingLibrarySummary[]
+  capabilities: RecordingLibraryCapabilities
 }
 
 export interface RecordingDetailArtifact {
@@ -827,6 +832,27 @@ export interface RecordingDetailPayload {
   limits: RecordingDetailLimits
   jobs: RecordingDetailJob[]
   reviews: RecordingDetailReview[]
+}
+
+export interface TranscriptPreviewRecording {
+  storage_key: string
+  display_name: string
+}
+
+export interface TranscriptPreviewArtifact {
+  job_key: string
+  revision: number
+  bytes: number
+  characters: number
+  created_at: string
+  text: string
+}
+
+export interface TranscriptPreviewPayload {
+  schema_version: "storage-v2/transcript-preview@1"
+  available: true
+  recording: TranscriptPreviewRecording
+  transcript: TranscriptPreviewArtifact
 }
 
 export type TranscriptionAnalyticsPeriod = "day" | "week" | "month"
