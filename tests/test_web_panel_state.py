@@ -172,6 +172,41 @@ class WebPanelStateSnapshotTests(unittest.TestCase):
             self.assertTrue(saved["notification"]["send_review"])
             self.assertIn("다음 시작부터 적용", state.notice)
 
+    def test_save_config_keeps_original_when_replace_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.yaml"
+            config_path.write_text("notification:\n  provider: telegram\n", encoding="utf-8")
+            config_path.chmod(0o600)
+            state = object.__new__(web_panel_state.ControlState)
+            state.config_path = config_path
+            state.config_data = {"notification": {"provider": "telegram"}}
+
+            with mock.patch.object(web_panel_state.os, "replace", side_effect=OSError("replace failed")):
+                with self.assertRaisesRegex(OSError, "replace failed"):
+                    state._save_config({"notification": {"provider": "discord"}})
+
+            self.assertEqual(config_path.read_text(encoding="utf-8"), "notification:\n  provider: telegram\n")
+            self.assertEqual(stat.S_IMODE(config_path.stat().st_mode), 0o600)
+            self.assertEqual(state.config_data["notification"]["provider"], "telegram")
+            self.assertEqual(list(config_path.parent.iterdir()), [config_path])
+
+    def test_save_config_reports_directory_sync_failure_after_replace(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.yaml"
+            config_path.write_text("notification:\n  provider: telegram\n", encoding="utf-8")
+            state = object.__new__(web_panel_state.ControlState)
+            state.config_path = config_path
+            state.config_data = {"notification": {"provider": "telegram"}}
+
+            with mock.patch.object(
+                web_panel_state.os, "fsync", side_effect=[None, OSError("directory sync failed")]
+            ):
+                synced = state._save_config({"notification": {"provider": "discord"}})
+
+            self.assertFalse(synced)
+            self.assertIn("discord", config_path.read_text(encoding="utf-8"))
+            self.assertEqual(state.config_data["notification"]["provider"], "discord")
+
     def test_control_state_resolves_env_backed_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -1939,7 +1974,11 @@ class WebPanelControllerExecutionOwnerTests(unittest.TestCase):
             log_path = root / "app.log"
             log_path.write_text("old log", encoding="utf-8")
             with sqlite3.connect(db_path) as conn:
-                conn.execute("CREATE TABLE jobs (id INTEGER PRIMARY KEY, status TEXT NOT NULL)")
+                conn.execute(
+                    "CREATE TABLE jobs (id INTEGER PRIMARY KEY, status TEXT NOT NULL, "
+                    "deduped_from_job_id INTEGER)"
+                )
+                conn.execute("CREATE TABLE transcript_postprocess_jobs (source_job_id INTEGER PRIMARY KEY)")
                 conn.executemany(
                     "INSERT INTO jobs (id, status) VALUES (?, ?)",
                     [
@@ -1947,25 +1986,73 @@ class WebPanelControllerExecutionOwnerTests(unittest.TestCase):
                         (2, "ERROR"),
                         (3, "NEEDS_REVIEW"),
                         (4, "PROCESSING"),
+                        (5, "DONE"),
+                        (6, "DONE"),
+                        (7, "DONE"),
                     ],
                 )
+                conn.execute("INSERT INTO transcript_postprocess_jobs VALUES (1)")
+                conn.execute("UPDATE jobs SET deduped_from_job_id = 5 WHERE id = 3")
+                conn.execute("UPDATE jobs SET deduped_from_job_id = 7 WHERE id = 5")
+                conn.execute("UPDATE jobs SET deduped_from_job_id = 2 WHERE id = 6")
 
             state = object.__new__(web_panel_state.ControlState)
             state.db_path = db_path
             state.log_path = log_path
+            state.notice = ""
+            state.config_data = {"transcript_delivery": {"enabled": False}}
+            state._set_poll_boost = mock.Mock()
+
+            state.clear_history()
+
+            with sqlite3.connect(db_path) as conn:
+                jobs = conn.execute("SELECT id, status FROM jobs ORDER BY id").fetchall()
+                queued = conn.execute("SELECT source_job_id FROM transcript_postprocess_jobs").fetchall()
+            self.assertEqual(jobs, [(1, "DONE"), (3, "NEEDS_REVIEW"), (4, "PROCESSING"), (5, "DONE"), (7, "DONE")])
+            self.assertEqual(queued, [(1,)])
+            self.assertEqual(log_path.read_text(encoding="utf-8"), "")
+            self.assertIn("다른 원장이 참조하는 작업", state.notice)
+
+    def test_clear_history_preserves_unqueued_done_when_delivery_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "jobs.sqlite3"
+            with sqlite3.connect(db_path) as conn:
+                conn.execute("CREATE TABLE jobs (id INTEGER PRIMARY KEY, status TEXT NOT NULL)")
+                conn.executemany(
+                    "INSERT INTO jobs (id, status) VALUES (?, ?)",
+                    [(1, "DONE"), (2, "ERROR")],
+                )
+
+            state = object.__new__(web_panel_state.ControlState)
+            state.db_path = db_path
+            state.log_path = Path(temp_dir) / "missing.log"
+            state.config_data = {"transcript_delivery": {"enabled": True}}
             state.notice = ""
             state._set_poll_boost = mock.Mock()
 
             state.clear_history()
 
             with sqlite3.connect(db_path) as conn:
-                statuses = [
-                    row[0]
-                    for row in conn.execute("SELECT status FROM jobs ORDER BY id").fetchall()
-                ]
-            self.assertEqual(statuses, ["NEEDS_REVIEW", "PROCESSING"])
-            self.assertEqual(log_path.read_text(encoding="utf-8"), "")
-            self.assertIn("확인 필요 항목은 보존", state.notice)
+                self.assertEqual(
+                    conn.execute("SELECT id, status FROM jobs ORDER BY id").fetchall(),
+                    [(1, "DONE")],
+                )
+            self.assertIn("후처리 재조정 대상은 보존", state.notice)
+
+    def test_clear_history_reports_db_failure_without_truncating_log(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            log_path = root / "app.log"
+            log_path.write_text("keep log", encoding="utf-8")
+            state = object.__new__(web_panel_state.ControlState)
+            state.db_path = root / "jobs.sqlite3"
+            state.log_path = log_path
+            state.config_data = {}
+            state.notice = ""
+
+            self.assertFalse(state.clear_history())
+            self.assertIn("이력 초기화 실패", state.notice)
+            self.assertEqual(log_path.read_text(encoding="utf-8"), "keep log")
 
     def test_transcript_count_ignores_quality_scorecard_sidecars(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

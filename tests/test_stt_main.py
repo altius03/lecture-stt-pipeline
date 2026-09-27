@@ -328,6 +328,22 @@ class SttPipelineBehaviorTests(unittest.TestCase):
         os.utime(path, (aged, aged))
         return path
 
+    def test_transcription_progress_callback_throttles_small_updates(self) -> None:
+        self.pipeline._update_progress = mock.Mock()
+        callback = self.pipeline._transcription_progress_callback(7, 100)
+        with mock.patch.object(stt_main.time, "monotonic", side_effect=[10.0, 11.0, 12.0]):
+            callback(0.0, 100.0, 100)
+            callback(1.0, 100.0, 100)
+            callback(50.0, 100.0, 70)
+
+        self.assertEqual(self.pipeline._update_progress.call_count, 2)
+        self.pipeline._update_progress.assert_any_call(
+            7, "전사 시작/진행", progress=18, eta_sec=100
+        )
+        self.pipeline._update_progress.assert_any_call(
+            7, "전사 시작/진행", progress=45, eta_sec=70
+        )
+
     def _quality_metadata(self, canonical_base: str, txt_path: Path, json_path: Path) -> dict:
         return {
             "canonical_base": canonical_base,
@@ -1166,11 +1182,22 @@ class SttPipelineBehaviorTests(unittest.TestCase):
 
         duplicate_path = self.watch_dir / "dedupe-copy.m4a"
         duplicate_path.write_bytes(b"same-audio")
+        original_replay = self.pipeline._replay_existing_job
+
+        def replay_after_claim(**kwargs):
+            status = self.pipeline.conn.execute(
+                "SELECT status FROM jobs WHERE id = ?", (kwargs["job_id"],)
+            ).fetchone()["status"]
+            self.assertEqual(status, stt_main.STATUS_PROCESSING)
+            return original_replay(**kwargs)
+
         with mock.patch.object(
             self.pipeline.worker,
             "transcribe_file",
             wraps=self.pipeline.worker.transcribe_file,
-        ) as transcribe_file:
+        ) as transcribe_file, mock.patch.object(
+            self.pipeline, "_replay_existing_job", side_effect=replay_after_claim
+        ):
             self.pipeline.process_job(duplicate_path)
 
         self.assertEqual(transcribe_file.call_count, 0)
@@ -1192,6 +1219,118 @@ class SttPipelineBehaviorTests(unittest.TestCase):
         self.assertEqual(scorecard["canonical_base"], "dedupe-copy")
         self.assertNotIn("segments", scorecard)
         self.assertNotIn("테스트", scorecard_text)
+
+    def test_deduped_output_recovery_preserves_lineage_after_interruption(self) -> None:
+        original = self.watch_dir / "lineage-original.m4a"
+        original.write_bytes(b"lineage-audio")
+        self.pipeline.process_job(original)
+        original_id = self.pipeline.conn.execute(
+            "SELECT id FROM jobs WHERE orig_name = ?", (original.name,)
+        ).fetchone()["id"]
+        original_json = self.transcript_dir / "lineage-original.json"
+        original_payload = json.loads(original_json.read_text(encoding="utf-8"))
+        original_payload["metadata"].pop("profile", None)
+        original_json.write_text(json.dumps(original_payload, ensure_ascii=False), encoding="utf-8")
+
+        replay = self.watch_dir / "lineage-replay.m4a"
+        replay.write_bytes(b"lineage-audio")
+        validate_output = self.pipeline._validate_output_files
+
+        def interrupt_after_output(*args):
+            validate_output(*args)
+            raise KeyboardInterrupt("simulated worker crash")
+
+        with mock.patch.object(self.pipeline, "_validate_output_files", side_effect=interrupt_after_output):
+            with self.assertRaises(KeyboardInterrupt):
+                self.pipeline.process_job(replay)
+
+        row = self.pipeline.conn.execute(
+            "SELECT id, status, is_deduped, deduped_from_job_id FROM jobs WHERE orig_name = ?",
+            (replay.name,),
+        ).fetchone()
+        self.assertEqual(row["status"], stt_main.STATUS_PROCESSING)
+        self.assertEqual(stt_main.db.recover_processing_jobs(self.pipeline.conn)["done"], 1)
+        recovered = stt_main.db.get_job(self.pipeline.conn, row["id"])
+        self.assertEqual(recovered["status"], stt_main.STATUS_DONE)
+        self.assertEqual(recovered["is_deduped"], 1)
+        self.assertEqual(recovered["deduped_from_job_id"], original_id)
+        replay_metadata = json.loads(
+            (self.transcript_dir / "lineage-replay.json").read_text(encoding="utf-8")
+        )["metadata"]
+        self.assertEqual(replay_metadata["profile"]["key"], "legacy-unknown")
+        self.assertEqual(json.loads(recovered["engine_params"])["profile"], replay_metadata["profile"])
+
+    def test_failed_dedupe_replay_falls_back_without_lineage(self) -> None:
+        original = self.watch_dir / "fallback-original.m4a"
+        original.write_bytes(b"fallback-audio")
+        self.pipeline.process_job(original)
+        replay = self.watch_dir / "fallback-replay.m4a"
+        replay.write_bytes(b"fallback-audio")
+        write_output = self.pipeline._write_output
+        attempts = 0
+
+        def fail_first_output(*args):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise OSError("replay output failed")
+            return write_output(*args)
+
+        with mock.patch.object(self.pipeline, "_write_output", side_effect=fail_first_output), mock.patch.object(
+            self.pipeline.worker, "transcribe_file", wraps=self.pipeline.worker.transcribe_file
+        ) as transcribe:
+            self.pipeline.process_job(replay)
+
+        row = self.pipeline.conn.execute(
+            "SELECT status, is_deduped, deduped_from_job_id FROM jobs WHERE orig_name = ?",
+            (replay.name,),
+        ).fetchone()
+        self.assertEqual(row["status"], stt_main.STATUS_DONE)
+        self.assertEqual(row["is_deduped"], 0)
+        self.assertIsNone(row["deduped_from_job_id"])
+        self.assertEqual(transcribe.call_count, 1)
+
+    def test_failed_replay_then_interrupted_transcription_recovers_without_lineage(self) -> None:
+        original = self.watch_dir / "fallback-crash-original.m4a"
+        original.write_bytes(b"fallback-crash-audio")
+        self.pipeline.process_job(original)
+        replay = self.watch_dir / "fallback-crash-replay.m4a"
+        replay.write_bytes(b"fallback-crash-audio")
+        write_output = self.pipeline._write_output
+        validate_output = self.pipeline._validate_output_files
+        attempts = 0
+
+        def fail_replay_output(*args):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise OSError("replay output failed")
+            return write_output(*args)
+
+        def interrupt_after_transcription(*args):
+            validate_output(*args)
+            raise KeyboardInterrupt("simulated worker crash")
+
+        with mock.patch.object(self.pipeline, "_write_output", side_effect=fail_replay_output), mock.patch.object(
+            self.pipeline, "_validate_output_files", side_effect=interrupt_after_transcription
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                self.pipeline.process_job(replay)
+
+        row = self.pipeline.conn.execute(
+            "SELECT id, status, is_deduped, deduped_from_job_id FROM jobs WHERE orig_name = ?",
+            (replay.name,),
+        ).fetchone()
+        self.assertEqual(row["status"], stt_main.STATUS_PROCESSING)
+        self.assertEqual(row["is_deduped"], 0)
+        self.assertIsNone(row["deduped_from_job_id"])
+        self.assertEqual(stt_main.db.recover_processing_jobs(self.pipeline.conn)["done"], 1)
+        recovered = stt_main.db.get_job(self.pipeline.conn, row["id"])
+        self.assertEqual(recovered["status"], stt_main.STATUS_DONE)
+        transcript_metadata = json.loads(
+            (self.transcript_dir / "fallback-crash-replay.json").read_text(encoding="utf-8")
+        )["metadata"]
+        self.assertEqual(json.loads(recovered["engine_params"])["profile"], transcript_metadata["profile"])
 
     def test_deduped_pre_profile_output_is_not_attributed_to_active_profile(self) -> None:
         original_path = self.watch_dir / "legacy-original.m4a"
@@ -1305,6 +1444,8 @@ class SttPipelineBehaviorTests(unittest.TestCase):
         staged_path = self.pipeline.staging_dir / "recover.m4a"
         staged_path.parent.mkdir(parents=True, exist_ok=True)
         staged_path.write_bytes(b"staged-audio")
+        partial_copy = self.pipeline.staging_dir / ".recover.partial.tmp"
+        partial_copy.write_bytes(b"partial")
         source_path = self.watch_dir / "recover.m4a"
 
         self.pipeline.conn.execute(
@@ -1329,8 +1470,77 @@ class SttPipelineBehaviorTests(unittest.TestCase):
 
         self.assertTrue(source_path.exists())
         self.assertFalse(staged_path.exists())
+        self.assertEqual(partial_copy.read_bytes(), b"partial")
         remaining = self.pipeline.conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
         self.assertEqual(remaining, 0)
+
+    def test_startup_recovery_keeps_new_staging_file_with_done_name(self) -> None:
+        staged_path = self.pipeline.staging_dir / "sample.m4a"
+        staged_path.parent.mkdir(parents=True, exist_ok=True)
+        staged_path.write_bytes(b"new-audio")
+        old_audio = self.audio_dir / "sample.m4a"
+        old_audio.write_bytes(b"old-audio")
+        self.pipeline.conn.execute(
+            "INSERT INTO jobs (status, created_at, updated_at, orig_inbox_path, orig_name, "
+            "canonical_base, canonical_audio_path) "
+            "VALUES (?, datetime('now'), datetime('now'), ?, ?, ?, ?)",
+            (stt_main.STATUS_DONE, str(self.watch_dir / "sample.m4a"), "sample.m4a", "sample", str(old_audio)),
+        )
+        self.pipeline.conn.commit()
+
+        self.pipeline.startup_recovery()
+
+        self.assertEqual((self.watch_dir / "sample.m4a").read_bytes(), b"new-audio")
+        self.assertEqual(old_audio.read_bytes(), b"old-audio")
+        self.assertFalse(staged_path.exists())
+
+    def test_startup_recovery_preserves_claim_when_staging_file_is_missing(self) -> None:
+        staged_path = self.pipeline.staging_dir / "orphan.m4a"
+        canonical_audio = self.audio_dir / "orphan.m4a"
+        canonical_audio.write_bytes(b"claimed-audio")
+        self.pipeline.conn.execute(
+            "INSERT INTO jobs (status, created_at, updated_at, orig_inbox_path, orig_name, "
+            "canonical_base, canonical_audio_path, current_step) "
+            "VALUES (?, datetime('now'), datetime('now'), ?, ?, ?, ?, ?)",
+            (stt_main.STATUS_PENDING, str(self.watch_dir / "orphan.m4a"), "orphan.m4a", "orphan", str(staged_path), "로컬 staging"),
+        )
+        self.pipeline.conn.commit()
+
+        self.pipeline.startup_recovery()
+
+        row = self.pipeline.conn.execute("SELECT status, error_message FROM jobs").fetchone()
+        self.assertEqual(row["status"], stt_main.STATUS_NEEDS_REVIEW)
+        self.assertIn("staging 파일이 없음", row["error_message"])
+        self.assertEqual(canonical_audio.read_bytes(), b"claimed-audio")
+
+    def test_startup_recovery_requeues_first_processing_and_completes_written_output(self) -> None:
+        interrupted_audio = self.audio_dir / "interrupted.m4a"
+        interrupted_audio.write_bytes(b"interrupted-audio")
+        replay_audio = self.audio_dir / "replay.m4a"
+        replay_audio.write_bytes(b"replay-audio")
+        replay_txt = self.transcript_dir / "replay.txt"
+        replay_json = self.transcript_dir / "replay.json"
+        replay_txt.write_text("replayed", encoding="utf-8")
+        replay_json.write_text('{"segments": [{"text": "replayed"}]}', encoding="utf-8")
+        for name, audio, txt, json_path in (
+            ("interrupted", interrupted_audio, self.transcript_dir / "interrupted.txt", self.transcript_dir / "interrupted.json"),
+            ("replay", replay_audio, replay_txt, replay_json),
+        ):
+            self.pipeline.conn.execute(
+                "INSERT INTO jobs (status, created_at, updated_at, orig_inbox_path, orig_name, "
+                "canonical_base, canonical_audio_path, transcript_txt_path, transcript_json_path, "
+                "engine_params, current_step) VALUES (?, datetime('now'), datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?)",
+                (stt_main.STATUS_PROCESSING, str(self.watch_dir / f"{name}.m4a"), f"{name}.m4a", name,
+                 str(audio), str(txt), str(json_path), "{}", "전사 시작/진행"),
+            )
+        self.pipeline.conn.commit()
+
+        self.pipeline.startup_recovery()
+
+        self.assertEqual((self.watch_dir / "interrupted.m4a").read_bytes(), b"interrupted-audio")
+        self.assertFalse(interrupted_audio.exists())
+        rows = self.pipeline.conn.execute("SELECT canonical_base, status FROM jobs").fetchall()
+        self.assertEqual([(row["canonical_base"], row["status"]) for row in rows], [("replay", stt_main.STATUS_DONE)])
 
     def test_startup_recovery_requeues_pending_canonical_audio_jobs(self) -> None:
         canonical_audio = self.audio_dir / "stuck.m4a"

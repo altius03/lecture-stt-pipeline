@@ -10,7 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from lecture_stt.shared.paths import repo_root
+from lecture_stt.shared.paths import env_file, repo_root, runtime_env
 from lecture_stt.storage_v2.archive_review import (
     ArchiveReviewConflictError,
     ArchiveReviewNotFoundError,
@@ -182,18 +182,39 @@ def _parse_event_streams(query: dict[str, list[str]]) -> tuple[str, ...]:
 
 
 class RequestHandler(BaseHTTPRequestHandler):
+    FORM_BODY_LIMIT_BYTES = 4 * 1024
     JSON_BODY_LIMIT_BYTES = 32 * 1024
     _DECIMAL_RE = re.compile(r"^(?:0|[1-9][0-9]*)$")
 
+    def _trusted_host(self) -> bool:
+        server = getattr(self, "server", None)
+        if server is None:  # Direct handler calls in unit tests.
+            return True
+        host = self.headers.get("Host", "").strip().lower()
+        return host in getattr(server, "allowed_hosts", ())
+
     def _read_form_fields(self) -> dict[str, str]:
+        content_type = str(self.headers.get("Content-Type", "")).split(";", 1)[0].strip().lower()
+        if content_type != "application/x-www-form-urlencoded":
+            raise ValueError("Content-Type must be application/x-www-form-urlencoded")
         raw_length = self.headers.get("Content-Length", "0")
         try:
-            length = max(0, int(raw_length))
-        except (TypeError, ValueError):
-            length = 0
-        if length <= 0:
+            length = int(raw_length)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Invalid Content-Length") from exc
+        if length > self.FORM_BODY_LIMIT_BYTES:
+            raise ValueError("Form request body is too large")
+        if length < 0:
+            raise ValueError("Invalid Content-Length")
+        if length == 0:
             return {}
-        body = self.rfile.read(length).decode("utf-8", errors="replace")
+        try:
+            raw_body = self.rfile.read(length)
+            if len(raw_body) != length:
+                raise ValueError("Incomplete form request body")
+            body = raw_body.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise ValueError("Invalid form request body") from exc
         parsed = parse_qs(body, keep_blank_values=True)
         return {key: values[-1] if values else "" for key, values in parsed.items()}
 
@@ -296,17 +317,24 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def _action_clear_history(self) -> None:
         assert STATE is not None
-        STATE.clear_history()
+        if not STATE.clear_history():
+            self._api_error(500, STATE.notice)
+            return
         self._write_json(200, {"ok": True, "notice": STATE.notice})
 
     def _action_notification_update(self, selection: str, apply_now: bool = True) -> None:
         assert STATE is not None
         try:
-            STATE.update_notification_selection(selection)
+            directory_synced = STATE.update_notification_selection(selection)
             if apply_now:
                 STATE.restart_worker_for_notification()
+            if directory_synced is False:
+                STATE.notice += " 디렉터리 동기화를 확인하지 못해 재시작 후 설정 유지 여부를 확인해야 합니다."
         except RuntimeError as exc:
             self._api_error(400, str(exc))
+            return
+        except OSError as exc:
+            self._api_error(500, f"설정 저장 실패: {exc}")
             return
         self._write_json(200, {"ok": True, "notice": STATE.notice})
 
@@ -1091,6 +1119,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
 
     def do_GET(self) -> None:  # noqa: N802
+        if not self._trusted_host():
+            self._api_error(403, "Untrusted Host")
+            return
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
 
@@ -1263,6 +1294,25 @@ class RequestHandler(BaseHTTPRequestHandler):
         self._write(404, "Not Found", "text/plain; charset=utf-8")
 
     def do_POST(self) -> None:  # noqa: N802
+        if not self._trusted_host():
+            self._api_error(403, "Untrusted Host")
+            return
+        headers = getattr(self, "headers", {})
+        origin = headers.get("Origin")
+        try:
+            parsed_origin = urlparse(origin) if origin else None
+        except ValueError:
+            parsed_origin = None
+        if headers.get("Sec-Fetch-Site") not in (None, "same-origin", "none") or (
+            origin
+            and (
+                parsed_origin is None
+                or parsed_origin.scheme not in {"http", "https"}
+                or parsed_origin.netloc.lower() != str(headers.get("Host", "")).lower()
+            )
+        ):
+            self._api_error(403, "Cross-origin request is not allowed")
+            return
         parsed = urlparse(self.path)
 
         if parsed.path.startswith("/api/"):
@@ -1350,7 +1400,11 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._action_clear_history()
                 return
             if parsed.path == "/api/notification":
-                fields = self._read_form_fields()
+                try:
+                    fields = self._read_form_fields()
+                except ValueError as exc:
+                    self._api_error(400, str(exc))
+                    return
                 selection = fields.get("selection", "")
                 apply_now_raw = fields.get("apply_now")
                 if apply_now_raw is None or apply_now_raw == "":
@@ -1394,6 +1448,10 @@ def main() -> None:
         ) from exc
     except OSError as exc:
         raise RuntimeError(f"Cannot bind web control panel to {host}:{port}. {exc}") from exc
+
+    server.allowed_hosts = {f"{name}:{server.server_port}" for name in ("127.0.0.1", "localhost")}
+    configured_hosts = runtime_env(dotenv_path=env_file(root)).get("WEB_PANEL_ALLOWED_HOSTS", "")
+    server.allowed_hosts.update(name.strip().lower() for name in configured_hosts.split(",") if name.strip())
 
     STATE.set_shutdown_handler(server.shutdown)
     print(f"Web control panel running at http://{host}:{port}")

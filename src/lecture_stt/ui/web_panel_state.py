@@ -11,6 +11,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections import deque
@@ -213,10 +214,32 @@ class ControlState:
             raise ValueError(f"Invalid config format: {self.config_path}")
         return loaded
 
-    def _save_config(self, config_data: dict[str, Any]) -> None:
-        with self.config_path.open("w", encoding="utf-8") as handle:
-            yaml.safe_dump(config_data, handle, allow_unicode=True, sort_keys=False)
-        self.config_data = config_data
+    def _save_config(self, config_data: dict[str, Any]) -> bool:
+        payload = yaml.safe_dump(config_data, allow_unicode=True, sort_keys=False)
+        mode = stat.S_IMODE(self.config_path.stat().st_mode)
+        fd, temporary = tempfile.mkstemp(
+            prefix=f".{self.config_path.name}.", dir=self.config_path.parent
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fchmod(handle.fileno(), mode)
+                os.fsync(handle.fileno())
+            os.replace(temporary, self.config_path)
+            self.config_data = config_data
+            try:
+                directory_fd = os.open(self.config_path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            except OSError:
+                return False  # The replacement succeeded, but rename durability is unconfirmed.
+            return True
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
 
     def _runtime_env(self) -> dict[str, str]:
         return runtime_env(dotenv_path=env_file(self.repo_root))
@@ -341,7 +364,7 @@ class ControlState:
             "options": self._notification_options(),
         }
 
-    def update_notification_selection(self, selection: str) -> None:
+    def update_notification_selection(self, selection: str) -> bool:
         normalized = str(selection or "").strip().lower()
         if normalized not in NOTIFICATION_SELECTIONS:
             raise RuntimeError("지원하지 않는 알림 채널 선택입니다.")
@@ -370,7 +393,7 @@ class ControlState:
             notification_cfg.update({"provider": "noop", "enabled": False, "dual_send_providers": []})
 
         config_data["notification"] = notification_cfg
-        self._save_config(config_data)
+        directory_synced = self._save_config(config_data)
 
         if self._has_active_runtime():
             self._notification_restart_required = True
@@ -379,6 +402,7 @@ class ControlState:
             self._notification_restart_required = False
             self.notice = "알림 채널이 저장되었습니다. 다음 시작부터 적용됩니다."
         self._set_poll_boost()
+        return directory_synced
 
     def _wait_for_worker_shutdown(self, timeout_sec: float = 30.0) -> bool:
         deadline = time.monotonic() + max(0.0, timeout_sec)
@@ -2499,37 +2523,67 @@ class ControlState:
         except Exception:
             return "오류"
 
-    def _truncate_log(self) -> None:
+    def _truncate_log(self) -> bool:
         if not self.log_path.exists():
-            return
+            return True
         try:
             self.log_path.write_text("", encoding="utf-8")
+            return True
         except Exception:
             try:
                 self.log_path.unlink()
                 self.log_path.touch()
+                return True
             except Exception:
-                pass
+                return False
 
-    def clear_history(self) -> None:
-        """완료/오류 이력과 로그만 정리하고 확인 필요 작업은 보존한다."""
+    def clear_history(self) -> bool:
+        """완료/오류 이력 중 다른 원장에서 참조하지 않는 작업만 정리한다."""
         try:
             with sqlite3.connect(self.db_path, timeout=3.0) as conn:
                 conn.execute("PRAGMA busy_timeout = 3000")
-                # PROCESSING 작업은 건드리지 않는다 — 워커가 실제 처리 중일 수 있음
-                conn.execute("DELETE FROM jobs WHERE status IN ('DONE', 'ERROR')")
-                conn.commit()
+                conn.execute("BEGIN IMMEDIATE")
+                tables = {
+                    row[0]
+                    for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+                }
+                protected = ["SELECT id FROM jobs WHERE status NOT IN ('DONE', 'ERROR')"]
+                protected.extend(
+                    f"SELECT source_job_id FROM {table} WHERE source_job_id IS NOT NULL"
+                    for table in ("deliveries", "transcript_deliveries", "transcript_postprocess_jobs")
+                    if table in tables
+                )
+                delivery_cfg = getattr(self, "config_data", {}).get("transcript_delivery") or {}
+                if delivery_cfg.get("enabled") is True:
+                    # DONE without a queue row is still a reconciliation source.
+                    protected.append("SELECT id FROM jobs WHERE status = 'DONE'")
+                if "deduped_from_job_id" in {
+                    row[1] for row in conn.execute("PRAGMA table_info(jobs)")
+                }:
+                    protected.append(
+                        "SELECT jobs.deduped_from_job_id FROM jobs "
+                        "JOIN protected ON jobs.id = protected.id "
+                        "WHERE jobs.deduped_from_job_id IS NOT NULL"
+                    )
+                query = (
+                    "WITH RECURSIVE protected(id) AS (" + " UNION ".join(protected) + ") "
+                    "DELETE FROM jobs WHERE status IN ('DONE', 'ERROR') "
+                    "AND id NOT IN (SELECT id FROM protected)"
+                )
+                conn.execute(query)
         except Exception as exc:
             self.notice = f"이력 초기화 실패: {exc}"
-            return
+            return False
 
         try:
-            self._truncate_log()
-        except Exception:
-            pass
-
-        self.notice = "완료/오류 이력과 로그를 정리했습니다. 확인 필요 항목은 보존됩니다."
+            log_cleared = self._truncate_log()
+        except OSError:
+            log_cleared = False
+        self.notice = "정리 가능한 완료/오류 이력을 정리했습니다. 확인 필요 항목, 다른 원장이 참조하는 작업, 후처리 재조정 대상은 보존됩니다."
+        if not log_cleared:
+            self.notice += " 로그는 지우지 못했습니다."
         self._set_poll_boost()
+        return True
 
     def _folder_counts(self) -> dict[str, str]:
         return {

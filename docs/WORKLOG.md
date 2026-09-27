@@ -3,6 +3,27 @@
 이 파일은 저장소에 반영된 변경을 날짜순으로 누적 기록한다.
 최신 항목을 위에 추가한다.
 
+## 2026-09-28
+
+### 기존 자료 압축 보관 및 운영 상태 초기화
+- iCloud `lecture_recordings`의 오디오·전사·교정·프롬프트·기존 정리 보관본 등 800개 파일(541,296,205바이트)을 `~/Archives/lecture_stt/lecture-recordings-20260928T001445+0900.tar.gz`로 압축했다. 내부 manifest의 파일별 SHA-256, 압축본 재독해, 현재 원본 전체와의 재대조에서 누락·추가·변경 0건을 확인한 뒤 원본 800개만 제거했다.
+- `GH_archive`의 과거 학기 전달 강의노트 640개(18,293,382바이트)는 `~/Archives/lecture_stt/delivered-lecture-notes-20260928T002123+0900.tar.gz`에 별도 압축·검증했다. 사용자 확인 후 현재 원본 전체를 압축본의 파일별 SHA-256과 재대조해 640개를 제거했고, 여섯 과목의 `06_lecture_notes`에 남은 파일은 0개다.
+- 두 압축본의 SHA-256은 같은 보관 폴더의 `SHA256SUMS`에 기록했다. 사후 검사에서 iCloud 활성 경로의 파일은 0개이고 기본 입력·산출 폴더만 비어 있다. 운영 `state`, 로그, 캐시, Storage v2 records와 실행 중인 lecture-stt LaunchAgent는 없었다.
+- 누락된 로컬 `.env`에는 녹음 루트 경로만 0600 권한으로 다시 설정했다. 기존 알림 secret이나 downstream 경로는 새로 만들지 않았다.
+
+### 안전성 및 중복 코드 정리
+- 웹 패널 설정 저장은 같은 디렉터리의 임시 파일에 기록·동기화한 뒤 원자적으로 교체하고 기존 권한을 보존한다. 교체 실패 시 원본과 메모리 설정이 유지되는 회귀 검사를 추가했다.
+- `clear_history`는 후처리·전달 원장과 삭제 후에도 남을 dedupe 작업이 참조하는 완료/오류 job을 보존한다. 후처리 활성화 중에는 미큐잉 `DONE` job도 재조정 입력으로 남긴다. DB 정리 실패는 HTTP 500으로 알리고 로그를 그대로 둔다.
+- 패널 GET/POST는 신뢰할 수 있는 Host만 받고, POST는 잘못된 Origin과 교차 출처 브라우저 요청을 거부한다. 알림 form의 Content-Type, 길이, UTF-8을 검사하고 본문을 4 KiB로 제한한다. Tailscale Serve의 외부 Host는 재사용 전에 `.env`의 `WEB_PANEL_ALLOWED_HOSTS`에 명시해야 한다.
+- 설정 파일 교체 뒤 디렉터리 동기화가 실패하면 저장된 값을 유지하고 응답에 지속성 확인 경고를 담는다. 교체 전 저장 실패는 HTTP 500으로 돌려준다.
+- 신규/재시도 전사의 동일한 진행률 callback을 한 메서드로 합쳤다. controller evidence 테스트의 생성 스크립트는 현재 테스트 Python을 사용해 시스템 Python 버전에 영향을 받지 않는다.
+- `setup_launchd.sh`는 실제 worker가 읽는 `config/config.yaml`의 `execution_owner`가 `python`이 아니면 서비스 등록 전에 중단한다. 별도 `LECTURE_STT_CONFIG` 환경변수가 controller 설정을 숨길 수 없도록 격리 실행 테스트를 보강했다.
+- 예약된 `cleanup.py`는 plist에서 `--apply`를 전달하지 않아 기본 dry-run으로 실행됨을 확인했다.
+- 시작 복구는 과거 `DONE`과 이름만 같은 새 staging 녹음을 삭제하지 않고 inbox로 되돌린다. 실제로 되돌린 staging 파일의 row만 정리하며, staging 파일이 사라진 claim은 `NEEDS_REVIEW`로 남겨 canonical 오디오 고립 가능성을 드러낸다.
+- 일반 전사 중 중단된 `PROCESSING`을 먼저 복구하고 미완성 입력을 inbox에 재등록한다. dedupe replay도 산출물을 쓰기 전에 `PROCESSING`으로 claim하고 계보·결과 metadata를 먼저 기록해 완성 직후 중단돼도 DB와 JSON의 profile이 일치한다. 복제 실패 뒤 일반 전사로 대체되면 원래 engine 설정과 계보를 즉시 복원한다.
+- 공용 `safe_move_file`은 macOS/Linux의 원자적 no-clobber rename으로 대상 파일을 덮어쓰던 경쟁 상태를 없앴다. 심볼릭 링크 입력을 거부하고 이동 중 원본 경로가 바뀌면 가능한 경우 되돌린다. 장치가 다르면 복사 중 원본 변경으로 데이터가 유실될 수 있어 원본을 남기고 실패한다. 이동 뒤 fsync 실패는 이미 옮겨진 경로를 호출자가 추적할 수 있도록 경고로 기록한다. 감시기도 심볼릭 링크를 제외한다.
+- 전체 Python unittest 805개, React Vitest 264개, Python compileall, `bash -n` 및 `git diff --check`가 통과했다. 운영 서비스는 시작하거나 재시작하지 않았고 Git commit/push도 하지 않았다.
+
 ## 2026-09-27
 
 ### 학기 전환·전사 후처리 게시 차단 이슈 보강

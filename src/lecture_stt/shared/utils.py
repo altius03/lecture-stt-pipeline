@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import errno
+import ctypes
 import hashlib
 import json
 import logging
 import os
-import shutil
 import re
+import stat
+import sys
 import tempfile
 import time
 import traceback
@@ -150,75 +153,64 @@ def atomic_write(path: Union[str, Path], data: Any, encoding: str = "utf-8") -> 
     os.replace(temp_path, target)
 
 
-def _copy2_with_stream_fallback(src_path: Path, dst_path: Path) -> None:
-    try:
-        shutil.copy2(src_path, dst_path)
-        return
-    except OSError as exc:
-        if exc.errno != 11:
-            raise
-        logger.warning(
-            "copy2 failed with errno=11; falling back to streaming copy: %s -> %s",
-            src_path,
-            dst_path,
-        )
+def _rename_no_replace(src_path: Path, dst_path: Path) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    source = os.fsencode(src_path)
+    target = os.fsencode(dst_path)
+    if sys.platform == "darwin":
+        rename = getattr(libc, "renamex_np", None)
+        if rename is None:
+            raise OSError(errno.ENOTSUP, "Atomic no-clobber rename is unavailable")
+        rename.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint)
+        result = rename(source, target, 0x4)  # RENAME_EXCL
+    elif sys.platform.startswith("linux"):
+        rename = getattr(libc, "renameat2", None)
+        if rename is None:
+            raise OSError(errno.ENOTSUP, "Atomic no-clobber rename is unavailable")
+        rename.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+        result = rename(-100, source, -100, target, 0x1)  # AT_FDCWD, RENAME_NOREPLACE
+    else:
+        raise OSError(errno.ENOTSUP, "Atomic no-clobber rename is unavailable")
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), os.fspath(src_path), None, os.fspath(dst_path))
 
-    with src_path.open("rb") as source, dst_path.open("wb") as target:
-        shutil.copyfileobj(source, target, length=1024 * 1024)
-        target.flush()
-        os.fsync(target.fileno())
 
-    try:
-        shutil.copystat(src_path, dst_path)
-    except OSError:
-        logger.debug("Unable to copy file metadata %s -> %s", src_path, dst_path, exc_info=True)
-
-
-# os.replace 실패(크로스 디바이스) 시 복사-동기화-교체 방식으로 보완한다.
+# 같은 장치에서 원자적으로 이동하고 대상 파일이 생겼다면 원본을 보존한다.
 def safe_move_file(src: Union[str, Path], dst: Union[str, Path]) -> None:
     src_path = Path(src)
     dst_path = Path(dst)
-    if not src_path.exists():
-        raise FileNotFoundError(f"Source file does not exist: {src_path}")
-    if dst_path.exists():
+    if os.path.lexists(dst_path):
         raise FileExistsError(f"Destination file already exists: {dst_path}")
-
     ensure_dir(dst_path.parent)
-
-    try:
-        os.replace(src_path, dst_path)
-        return
-    except OSError:
-        # 다른 장치 이동인 경우를 대비해 copy/fync/replace로 대체 이동한다.
-        tmp_path = dst_path.with_name(f".{dst_path.name}.{uuid.uuid4().hex}.tmp")
-        copied = False
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise OSError(errno.ENOTSUP, "No-follow file open is unavailable")
+    with os.fdopen(os.open(src_path, os.O_RDONLY | os.O_NOFOLLOW), "rb") as source:
+        expected = os.fstat(source.fileno())
+        if not stat.S_ISREG(expected.st_mode):
+            raise ValueError(f"Source must be a regular file: {src_path}")
+        _rename_no_replace(src_path, dst_path)
+        actual = dst_path.lstat()
+        if not stat.S_ISREG(actual.st_mode) or (actual.st_dev, actual.st_ino) != (expected.st_dev, expected.st_ino):
+            try:
+                _rename_no_replace(dst_path, src_path)
+            except OSError:
+                raise RuntimeError(f"Source changed during move; preserved at {dst_path}")
+            raise RuntimeError(f"Source changed during move; restored at {src_path}")
         try:
-            _copy2_with_stream_fallback(src_path, tmp_path)
-            copied = True
+            os.fsync(source.fileno())
+        except OSError:
+            # 이름 이동은 이미 끝났다. 호출자에게 실패를 돌리면 새 위치를 추적하지 못한다.
+            logger.warning("Moved file, but file sync failed: %s", dst_path, exc_info=True)
+    for parent in {src_path.parent, dst_path.parent}:
+        try:
+            dir_fd = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
             try:
-                with open(tmp_path, "rb") as handle:
-                    os.fsync(handle.fileno())
-            except OSError:
-                logger.debug("Unable to fsync temporary copy %s", tmp_path, exc_info=True)
-
-            os.replace(tmp_path, dst_path)
-            try:
-                src_path.unlink()
-            except OSError:
-                logger.warning("Failed to remove source file after copy-move: %s", src_path, exc_info=True)
-            return
-        finally:
-            if copied and tmp_path.exists():
-                # os.replace가 이미 소비한 경우는 삭제 시도해도 대부분 no-op이다.
-                try:
-                    tmp_path.unlink()
-                except OSError:
-                    pass
-            if not copied and tmp_path.exists():
-                try:
-                    tmp_path.unlink()
-                except OSError:
-                    pass
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            logger.warning("Moved file, but directory sync failed: %s", parent, exc_info=True)
 
 
 def is_temporary_file(path: Path) -> bool:

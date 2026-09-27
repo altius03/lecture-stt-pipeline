@@ -1,6 +1,8 @@
 # Lecture STT Architecture
 
-기준일: 2026-09-02
+기준일: 2026-09-28
+
+현재 로컬 설정은 `app.execution_owner: python`이다. 2026-09-28 초기화 후 iCloud 녹음 경로는 비어 있고 운영 DB·로그·LaunchAgent는 없다. 아래 흐름도는 설정에 따라 선택할 수 있는 실행 경로까지 함께 나타낸다.
 
 ## 목적
 - iCloud inbox에 들어오는 강의·회의·대화·개인 메모 음성 파일을 자동으로 전사한다.
@@ -13,13 +15,15 @@
 ```mermaid
 flowchart LR
     PHONE["iPhone 단축어"] --> ICLOUD["iCloud inbox"]
-    ICLOUD --> GOOWNER["Go controller 실행 소유자"]
+    ICLOUD --> PYOWNER["Python PollingWatcher 기본 실행 주체"]
+    ICLOUD -. "controller 설정 시" .-> GOOWNER["Go controller 실행 소유자"]
     GOOWNER --> GOSHADOW["Go/Python lockstep 안정화 확인"]
     ICLOUD -. "bounded scan" .-> GOSHADOW
     ICLOUD --> WATCHER["Python canonical PollingWatcher probe"]
     WATCHER -. "canonical scan oracle" .-> GOSHADOW
     GOSHADOW --> SINGLEPLAN["Python single/retry exact plan CLI"]
     SINGLEPLAN --> GOOWNER
+    PYOWNER --> STAGING
     GOOWNER --> STAGING
     CTRLEVID["Temporary-only attempt evidence wrapper"] -. "exact read-only run" .-> GOSHADOW
     GOSHADOW -. "report@4" .-> CTRLEVID
@@ -121,10 +125,10 @@ flowchart LR
 - 메인 진입점 모듈은 `src/lecture_stt/stt/main.py`다.
 - `load_config()`와 `validate_config()`가 설정 파일을 읽고 경로, ffmpeg, 쓰기 권한을 검증한다.
 - `STTPipeline`이 전체 작업을 오케스트레이션한다.
-- `PollingWatcher`가 inbox 폴더를 polling하면서 일정 시간 이상 변하지 않은 파일만 안정 파일로 판단한다.
+- `PollingWatcher`가 inbox 폴더를 polling하면서 일정 시간 이상 변하지 않은 일반 파일만 안정 파일로 판단하고 심볼릭 링크는 제외한다.
 - 안정 파일은 먼저 로컬 `tmp/inbox_staging`으로 선점 이동한 뒤 `01_audio`로 옮겨, iCloud rename/sync 영향이 전사 중간 단계로 번지지 않게 한다.
-- 워커 시작 시 `tmp/inbox_staging`에 남아 있던 중단 파일과 `01_audio`에만 남은 pre-claim pending 오디오는 다시 inbox로 되돌려 재처리하고, 대응되는 stale job row도 정리한다.
-- 같은 SHA-256의 `DONE` 또는 `NEEDS_REVIEW` 작업이 있으면 기존 결과를 복제해 dedupe 처리한다. 원본 작업이 검토 상태라면 새 작업도 성공으로 승격하지 않고 `NEEDS_REVIEW`를 유지한다.
+- 워커 시작 시 `tmp/inbox_staging`의 파일은 과거 완료 작업과 이름이 같아도 inbox로 되돌린다. 실제로 되돌린 staging 파일에 대응하는 job row만 지우고, DB가 가리키는 staging 파일이 없으면 행을 `NEEDS_REVIEW`로 남겨 고립된 canonical 오디오를 조사할 수 있게 한다. 중단된 `PROCESSING`을 먼저 복구한 뒤 미완성 일반 작업의 `01_audio`를 inbox로 되돌린다.
+- 같은 SHA-256의 `DONE` 또는 `NEEDS_REVIEW` 작업이 있으면 기존 결과를 복제해 dedupe 처리한다. 복제 전에 새 job을 `PROCESSING`으로 claim하고 복제 계보와 결과 metadata를 먼저 기록하므로 산출물 완성 직후 중단된 작업도 이력을 유지하며 복구한다. 복제 실패 후 일반 전사로 대체하면 계보와 원래 engine 설정을 즉시 복원한다. 원본 작업이 검토 상태라면 새 작업도 성공으로 승격하지 않고 `NEEDS_REVIEW`를 유지한다.
 - 입력 stem은 NFC로 정규화하고 Unicode 문자·숫자를 보존한다. macOS/iCloud의 NFD 한글 파일명도 더 이상 `audio`로 붕괴하지 않는다.
 - `profiles.active`가 있으면 선택한 프로필의 transcribe override, 후처리 교정표, 품질 임계값을 적용한다. 프로필 설정이 없는 기존 config는 처리 동작을 바꾸지 않는 `legacy/unversioned` 프로필로 기록한다.
 - 중복이 아니면 `STTWorker`가 ffmpeg로 WAV 전처리 후 faster-whisper 전사를 수행한다.
@@ -155,7 +159,7 @@ flowchart LR
 - `src/lecture_stt/stt/profiles.py`: 프로필 스키마 검증, 활성 프로필 병합, 버전/hash snapshot
 - `src/lecture_stt/stt/quality_gate.py`: 품질 보고서와 metadata-only quality scorecard 생성
 - `src/lecture_stt/stt/notifier.py`: Telegram/Discord notifier, 중복 방지 마커, provider 팩토리
-- `src/lecture_stt/shared/utils.py`: 파일 이동, atomic write, hash, pause flag 등 공용 함수
+- `src/lecture_stt/shared/utils.py`: macOS/Linux의 원자적 no-clobber rename으로 대상 파일을 덮어쓰지 않는 이동, atomic write, hash, pause flag 등 공용 함수. 장치가 다른 경로는 원본을 보존하고 이동을 거부한다.
 - 메인 워커는 `state/stt.lock` 파일 락으로 단일 인스턴스를 보장하고, claim 전에 원본이 사라진 경우는 다른 워커 선점 또는 외부 rename 가능성으로 보고 경고 후 skip한다.
 - `--plan-single-job RELATIVE_PATH`는 watch root 직속 regular single-link
   파일 중 mtime age가 `stable_for_sec` 이상인 항목 하나의
@@ -284,7 +288,8 @@ flowchart LR
   및 hash 검증과 path exec 사이의 교체를 차단한다. `launchd` runtime은 계속
   지원하지만 해당 macOS 권한이 준비된 환경에서만 사용한다. 두 runtime 모두
   Python long-running worker를 spawn하지 않으며, controller 설정이 없으면
-  기존 Python behavior가 기본값이다.
+  기존 Python behavior가 기본값이다. `scripts/setup_launchd.sh`는 Python
+  실행 주체 전용으로, `execution_owner`가 다르면 서비스 등록 전에 중단한다.
 - 운영 console runtime의 stability 비교는 Python `stat-scan`이 반환한 닫힌
   direct-child `(name,size,mtime)` projection을 Go tracker와 canonical
   `PollingWatcher` 양쪽에 공급한다. Ownership report
@@ -585,7 +590,7 @@ flowchart LR
 - iCloud 이벤트는 controller가 소유하는 bounded polling + Python canonical
   안정화 창 + 기존 로컬 staging 흐름이 정본이다. 향후 파일 이벤트는 즉시
   깨우는 힌트로만 사용하고 주기적 reconcile을 유지한다.
-- 웹 패널 백엔드는 localhost bind를 유지하고 현재 Tailscale Serve가 tailnet 안에서만 중계한다. 애플리케이션 자체에는 사용자별 인증이나 Origin/Host/CSRF 검증이 없으므로 tailnet 접속자는 preview opt-in이 켜진 동안 전사 본문을 읽을 수 있다. 공개 인터넷으로의 노출은 허용하지 않으며, 범위를 넓히기 전 identity 검증과 mutating API audit가 선행되어야 한다.
+- 웹 패널 백엔드는 localhost bind를 기본으로 한다. GET/POST는 로컬 Host(`127.0.0.1`·`localhost`와 서버 포트) 또는 `.env`의 쉼표 구분 `WEB_PANEL_ALLOWED_HOSTS`에 명시한 Host만 받는다. Tailscale Serve가 외부 Host를 보존한다면 재개 전에 해당 도메인을 허용 목록에 추가해야 한다. POST는 `Origin`과 `Sec-Fetch-Site`도 검사한다. 애플리케이션 자체의 사용자별 인증은 없으므로 허용된 tailnet 접속자는 preview opt-in이 켜진 동안 전사 본문을 읽을 수 있다. 공개 인터넷 노출 전에는 identity 검증과 mutating API audit가 필요하다.
 
 ## 테스트 범위
 - 현재 자동 테스트는 STT pipeline, 학기 activation/direct transcript delivery, legacy archive compatibility, web panel state/backend, script entrypoints, cleanup/log retention을 함께 검증한다.

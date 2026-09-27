@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import unittest
 from unittest import mock
 
@@ -42,6 +43,21 @@ class WebPanelRequestHandlerTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         web_panel.STATE = self.prev_state
+
+    def test_main_allows_loopback_and_configured_proxy_hosts(self) -> None:
+        server = mock.Mock(server_port=8765)
+        server.serve_forever.side_effect = KeyboardInterrupt
+        with mock.patch.object(web_panel, "ThreadingHTTPServer", return_value=server), mock.patch.object(
+            web_panel, "ControlState"
+        ), mock.patch.object(
+            web_panel, "runtime_env", return_value={"WEB_PANEL_ALLOWED_HOSTS": "panel.example.ts.net"}
+        ), mock.patch.dict(os.environ, {"WEB_PANEL_HOST": "127.0.0.1", "WEB_PANEL_PORT": "8765"}):
+            web_panel.main()
+
+        self.assertEqual(
+            server.allowed_hosts,
+            {"127.0.0.1:8765", "localhost:8765", "panel.example.ts.net"},
+        )
 
     def test_exit_only_requests_server_shutdown(self) -> None:
         handler = object.__new__(web_panel.RequestHandler)
@@ -124,6 +140,80 @@ class WebPanelRequestHandlerTests(unittest.TestCase):
 
                 getattr(handler, handler_name).assert_called_once_with()
                 handler._api_error.assert_not_called()
+
+    def test_clear_history_returns_error_on_db_failure(self) -> None:
+        handler = object.__new__(web_panel.RequestHandler)
+        handler._api_error = mock.Mock()
+        handler._write_json = mock.Mock()
+        state = mock.Mock()
+        state.clear_history.return_value = False
+        state.notice = "이력 초기화 실패"
+        web_panel.STATE = state
+
+        handler._action_clear_history()
+
+        handler._api_error.assert_called_once_with(500, "이력 초기화 실패")
+        handler._write_json.assert_not_called()
+
+    def test_notification_rejects_oversized_form_before_reading(self) -> None:
+        handler = object.__new__(web_panel.RequestHandler)
+        handler.path = "/api/notification"
+        handler.headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Content-Length": str(handler.FORM_BODY_LIMIT_BYTES + 1),
+        }
+        handler.rfile = io.BytesIO(b"")
+        handler._action_notification_update = mock.Mock()
+        handler._api_error = mock.Mock()
+
+        handler.do_POST()
+
+        handler._action_notification_update.assert_not_called()
+        handler._api_error.assert_called_once_with(400, "Form request body is too large")
+        self.assertEqual(handler.rfile.tell(), 0)
+
+    def test_api_post_rejects_cross_origin_request(self) -> None:
+        handler = object.__new__(web_panel.RequestHandler)
+        handler.path = "/api/start"
+        handler.headers = {
+            "Host": "127.0.0.1:8765",
+            "Origin": "https://other.example",
+            "Sec-Fetch-Site": "cross-site",
+        }
+        handler._action_start = mock.Mock()
+        handler._api_error = mock.Mock()
+
+        handler.do_POST()
+
+        handler._action_start.assert_not_called()
+        handler._api_error.assert_called_once_with(403, "Cross-origin request is not allowed")
+
+    def test_api_post_rejects_malformed_origin(self) -> None:
+        handler = object.__new__(web_panel.RequestHandler)
+        handler.path = "/api/start"
+        handler.headers = {"Host": "127.0.0.1:8765", "Origin": "http://["}
+        handler._action_start = mock.Mock()
+        handler._api_error = mock.Mock()
+
+        handler.do_POST()
+
+        handler._action_start.assert_not_called()
+        handler._api_error.assert_called_once_with(403, "Cross-origin request is not allowed")
+
+    def test_api_requests_reject_untrusted_host(self) -> None:
+        for method in ("do_GET", "do_POST"):
+            with self.subTest(method=method):
+                handler = object.__new__(web_panel.RequestHandler)
+                handler.path = "/api/start"
+                handler.headers = {"Host": "attacker.example:8765", "Origin": "http://attacker.example:8765"}
+                handler.server = mock.Mock(allowed_hosts={"127.0.0.1:8765"})
+                handler._action_start = mock.Mock()
+                handler._api_error = mock.Mock()
+
+                getattr(handler, method)()
+
+                handler._action_start.assert_not_called()
+                handler._api_error.assert_called_once_with(403, "Untrusted Host")
 
     def test_api_events_route_dispatches_stream_handler(self) -> None:
         handler = object.__new__(web_panel.RequestHandler)
@@ -1040,7 +1130,7 @@ class WebPanelRequestHandlerTests(unittest.TestCase):
     def test_api_notification_route_defaults_to_deferred_apply(self) -> None:
         handler = object.__new__(web_panel.RequestHandler)
         handler.path = "/api/notification"
-        handler.headers = {"Content-Length": "14"}
+        handler.headers = {"Content-Type": "application/x-www-form-urlencoded", "Content-Length": "14"}
         handler.rfile = io.BytesIO(b"selection=both")
         handler._action_notification_update = mock.Mock()
         handler._api_error = mock.Mock()
@@ -1054,7 +1144,10 @@ class WebPanelRequestHandlerTests(unittest.TestCase):
         body = b"selection=discord&apply_now=1"
         handler = object.__new__(web_panel.RequestHandler)
         handler.path = "/api/notification"
-        handler.headers = {"Content-Length": str(len(body))}
+        handler.headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Content-Length": str(len(body)),
+        }
         handler.rfile = io.BytesIO(body)
         handler._action_notification_update = mock.Mock()
         handler._api_error = mock.Mock()
@@ -1063,6 +1156,34 @@ class WebPanelRequestHandlerTests(unittest.TestCase):
 
         handler._action_notification_update.assert_called_once_with("discord", apply_now=True)
         handler._api_error.assert_not_called()
+
+    def test_notification_update_reports_sync_warning_after_apply(self) -> None:
+        handler = object.__new__(web_panel.RequestHandler)
+        handler._write_json = mock.Mock()
+        state = mock.Mock()
+        state.notice = "저장됨"
+        state.update_notification_selection.return_value = False
+        state.restart_worker_for_notification.side_effect = lambda: setattr(state, "notice", "적용됨")
+        web_panel.STATE = state
+
+        handler._action_notification_update("both", apply_now=True)
+
+        state.restart_worker_for_notification.assert_called_once_with()
+        payload = handler._write_json.call_args.args[1]
+        self.assertTrue(payload["ok"])
+        self.assertIn("디렉터리 동기화를 확인하지 못해", payload["notice"])
+
+    def test_notification_update_reports_pre_replace_write_failure(self) -> None:
+        handler = object.__new__(web_panel.RequestHandler)
+        handler._api_error = mock.Mock()
+        state = mock.Mock()
+        state.update_notification_selection.side_effect = OSError("write failed")
+        web_panel.STATE = state
+
+        handler._action_notification_update("both", apply_now=True)
+
+        state.restart_worker_for_notification.assert_not_called()
+        handler._api_error.assert_called_once_with(500, "설정 저장 실패: write failed")
 
     def test_json_body_parser_rejects_malformed_or_oversized_payloads(self) -> None:
         handler = object.__new__(web_panel.RequestHandler)

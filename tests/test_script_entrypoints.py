@@ -28,6 +28,39 @@ def _load_module(module_name: str, path: Path):
 
 
 class ScriptEntrypointTests(unittest.TestCase):
+    def test_setup_launchd_refuses_controller_execution_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "scripts").mkdir()
+            (root / "config").mkdir()
+            (root / ".venv" / "bin").mkdir(parents=True)
+            shutil.copy2(REPO_ROOT / "scripts" / "setup_launchd.sh", root / "scripts" / "setup_launchd.sh")
+            (root / "config" / "config.yaml").write_text(
+                "app:\n  execution_owner: controller\n", encoding="utf-8"
+            )
+            python_wrapper = root / ".venv" / "bin" / "python"
+            python_wrapper.write_text(
+                f'#!/bin/sh\nif [ "$1" = "-m" ]; then exit 0; fi\nexec "{sys.executable}" "$@"\n',
+                encoding="utf-8",
+            )
+            python_wrapper.chmod(0o700)
+            override_config = root / "other-config.yaml"
+            override_config.write_text("app:\n  execution_owner: python\n", encoding="utf-8")
+            env = dict(os.environ)
+            env["HOME"] = str(root / "home")
+            env["LECTURE_STT_CONFIG"] = str(override_config)
+            result = subprocess.run(
+                ["bash", str(root / "scripts" / "setup_launchd.sh")],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("execution_owner=controller", result.stdout)
+            self.assertFalse((root / "home" / "Library" / "LaunchAgents").exists())
+
     def test_cleanup_script_runs_without_pythonpath(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

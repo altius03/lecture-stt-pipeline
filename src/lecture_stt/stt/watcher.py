@@ -38,7 +38,7 @@ class PollingWatcher:
             return stable_files
 
         for path in entries:
-            if not path.is_file():
+            if path.is_symlink() or not path.is_file():
                 continue
             if utils.is_temporary_file(path):
                 continue

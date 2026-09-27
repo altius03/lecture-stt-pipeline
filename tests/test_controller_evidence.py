@@ -93,7 +93,7 @@ class ControllerEvidenceTests(unittest.TestCase):
         path = workspace["repo_root"] / "controller"
         payload = json.dumps(report, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         path.write_text(
-            f"""#!/usr/bin/env python3
+            f"""#!{self.python_binary}
 import json
 import sys
 from pathlib import Path
@@ -125,7 +125,7 @@ print(payload)
     ) -> Path:
         path = workspace["repo_root"] / "controller-interrupt"
         path.write_text(
-            f"""#!/usr/bin/env python3
+            f"""#!{self.python_binary}
 import os
 import signal
 import subprocess
@@ -156,7 +156,7 @@ time.sleep(120)
         path = workspace["repo_root"] / "controller-success-on-signal"
         payload = json.dumps(report, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         path.write_text(
-            f"""#!/usr/bin/env python3
+            f"""#!{self.python_binary}
 import json
 import os
 import signal

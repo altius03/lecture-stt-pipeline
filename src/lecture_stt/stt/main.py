@@ -670,6 +670,33 @@ class STTPipeline:
         ratio = max(0.0, min(1.0, processed_audio_sec / audio_duration_sec))
         return max(18, min(72, int(round(18 + ratio * 54))))
 
+    def _transcription_progress_callback(
+        self, job_id: int, initial_eta: int | None
+    ) -> Callable[[float, float | None, int | None], None]:
+        last_update_at = 0.0
+        last_progress = 0
+        last_eta = initial_eta
+
+        def update(processed_sec: float, duration_sec: float | None, eta_sec: int | None) -> None:
+            nonlocal last_update_at, last_progress, last_eta
+            progress = self._transcription_progress_pct(processed_sec, duration_sec)
+            now = time.monotonic()
+            eta_changed = eta_sec is not None and (
+                last_eta is None or abs(eta_sec - last_eta) >= 15
+            )
+            if not (
+                progress >= last_progress + 2
+                or eta_changed
+                or now - last_update_at >= 3.0
+            ):
+                return
+            self._update_progress(job_id, "전사 시작/진행", progress=progress, eta_sec=eta_sec)
+            last_update_at = now
+            last_progress = progress
+            last_eta = eta_sec
+
+        return update
+
     def _time_based_progress(self, job_id: int, eta_sec: int | None) -> int | None:
         """started_at 기준 경과 시간 / 예상 총 시간으로 진행률을 계산한다."""
         if eta_sec is None or eta_sec <= 0:
@@ -781,15 +808,6 @@ class STTPipeline:
                 restored_staged,
                 cleared_jobs,
             )
-        restored_pending, cleared_pending_jobs = self._recover_pending_canonical_claims()
-        if restored_pending or cleared_pending_jobs:
-            self._log(
-                logging.INFO,
-                "Recovered pending canonical claims: restored=%s cleared_jobs=%s",
-                {"job_id": "-", "canonical_base": "-"},
-                restored_pending,
-                cleared_pending_jobs,
-            )
         counts = db.recover_processing_jobs(self.conn, stale_processing_hours=self.stale_processing_hours)
         if any(counts.values()):
             self._log(
@@ -800,6 +818,15 @@ class STTPipeline:
                 counts["needs_review"],
                 counts["pending"],
                 counts["error"],
+            )
+        restored_pending, cleared_pending_jobs = self._recover_pending_canonical_claims()
+        if restored_pending or cleared_pending_jobs:
+            self._log(
+                logging.INFO,
+                "Recovered pending canonical claims: restored=%s cleared_jobs=%s",
+                {"job_id": "-", "canonical_base": "-"},
+                restored_pending,
+                cleared_pending_jobs,
             )
 
     # 공통 로그 헬퍼: 작업 컨텍스트를 함께 출력한다.
@@ -949,40 +976,18 @@ class STTPipeline:
             )
         return candidate
 
-    def _original_base_from_staging_stem(self, stem: str) -> str:
-        # __stage__ 또는 __requeued__ 마커 앞부분만 추출해 원본 base를 복원한다.
-        for marker in ("__stage__", "__requeued__"):
-            if marker in stem:
-                return stem.split(marker)[0]
-        return utils.sanitize_stem(stem)
-
     def _recover_staged_claims(self) -> tuple[int, int]:
         restored = 0
         cleared_jobs = 0
+        requeued_paths: set[Path] = set()
 
         if self.staging_dir.exists() and self.staging_dir.is_dir():
             for item in sorted(self.staging_dir.iterdir()):
-                if not item.is_file():
-                    continue
-                # 이미 DONE된 base의 staging 잔여물은 재처리 없이 삭제한다.
-                original_base = self._original_base_from_staging_stem(item.stem)
-                done_row = self.conn.execute(
-                    "SELECT id FROM jobs WHERE canonical_base = ? AND status = ? LIMIT 1",
-                    (original_base, STATUS_DONE),
-                ).fetchone()
-                if done_row:
-                    self.logger.info(
-                        "recovery: staging 잔여물 삭제 (job %s 이미 DONE): %s",
-                        done_row["id"], item,
-                    )
-                    try:
-                        item.unlink()
-                    except OSError:
-                        pass
-                    cleared_jobs += 1
+                if not item.is_file() or item.is_symlink() or utils.is_temporary_file(item):
                     continue
                 target = self._requeue_target_for_staged(item, None)
                 utils.safe_move_file(item, target)
+                requeued_paths.add(item)
                 restored += 1
 
         rows = self.conn.execute(
@@ -1001,8 +1006,17 @@ class STTPipeline:
                 in_staging = False
             if not in_staging and str(row["current_step"] or "") != "로컬 staging":
                 continue
-            db.delete_job(self.conn, int(row["id"]))
-            cleared_jobs += 1
+            if audio_path in requeued_paths:
+                db.delete_job(self.conn, int(row["id"]))
+                cleared_jobs += 1
+            else:
+                db.set_status(
+                    self.conn,
+                    int(row["id"]),
+                    STATUS_NEEDS_REVIEW,
+                    current_step="staging 입력 위치 확인 필요",
+                    error_message=f"복구 시 staging 파일이 없음: {audio_path}",
+                )
 
         return restored, cleared_jobs
 
@@ -1154,6 +1168,7 @@ class STTPipeline:
                             canonical_audio_path: Path, txt_path: Path, json_path: Path,
                             duplicate) -> bool:
         # 동일 파일의 기존 결과를 복제해 처리 시간을 절약한다.
+        original_engine_params = db.get_job(self.conn, job_id)["engine_params"]
         prior_txt = Path(duplicate["transcript_txt_path"])
         prior_json = Path(duplicate["transcript_json_path"])
         try:
@@ -1225,6 +1240,13 @@ class STTPipeline:
             else:
                 metadata["quality"] = quality_evaluate(segments, text).to_dict()
 
+            db.update_job(
+                self.conn,
+                job_id,
+                engine_params=json.dumps(metadata),
+                is_deduped=1,
+                deduped_from_job_id=int(duplicate["id"]),
+            )
             self._write_output(txt_path, json_path, segments, text, metadata)
             self._validate_output_files(txt_path, json_path)
             self._update_progress(job_id, "전사문 생성(TXT/JSON)")
@@ -1295,6 +1317,15 @@ class STTPipeline:
             })
             return True
         except (OSError, json.JSONDecodeError, ValueError):
+            if db.get_job(self.conn, job_id)["status"] == STATUS_DONE:
+                return True
+            db.update_job(
+                self.conn,
+                job_id,
+                engine_params=original_engine_params,
+                is_deduped=0,
+                deduped_from_job_id=None,
+            )
             for replay_file in (txt_path, json_path):
                 try:
                     replay_file.unlink()
@@ -1640,6 +1671,11 @@ class STTPipeline:
             self._log(logging.INFO, "moved to stable folder", job_ctx)
             self._update_progress(job_id, "파일 이동", 30)
 
+            if not db.claim_job_for_processing(self.conn, job_id):
+                # 재사용 경로도 복구 가능한 PROCESSING 상태에서 산출물을 쓴다.
+                fail_step = "처리 상태 전환"
+                raise RuntimeError(f"Failed to claim job {job_id} as PROCESSING")
+
             duplicate = db.find_replayable_job_by_sha(self.conn, sha256)
             if duplicate and duplicate["id"] != job_id:
                 # 이미 변환 완료된 동일 파일이 있으면 결과를 재사용해 중복 작업 시간을 줄인다.
@@ -1661,10 +1697,6 @@ class STTPipeline:
                         job_id=job_id,
                     )
 
-            if not db.claim_job_for_processing(self.conn, job_id):
-                # 상태를 PROCESSING으로 바꿔 다른 워커가 같은 작업을 중복 처리하지 않게 막는다.
-                fail_step = "처리 상태 전환"
-                raise RuntimeError(f"Failed to claim job {job_id} as PROCESSING")
             started_at = utils.now_iso()
             eta = self._estimate_eta_sec()
             self._update_progress(job_id, "전사 시작/진행", None, eta)
@@ -1672,49 +1704,13 @@ class STTPipeline:
 
             # Whisper 전사 단계: 오디오에서 텍스트를 추출한다.
             fail_step = "전사 실행"
-            last_transcription_update_at = 0.0
-            last_transcription_progress = 0
-            last_transcription_eta: int | None = eta
-
-            def handle_transcription_progress(
-                processed_audio_sec: float,
-                audio_duration_sec: float | None,
-                eta_remaining_sec: int | None,
-            ) -> None:
-                nonlocal last_transcription_update_at, last_transcription_progress, last_transcription_eta
-
-                progress_pct = self._transcription_progress_pct(processed_audio_sec, audio_duration_sec)
-                now_mono = time.monotonic()
-                eta_changed = (
-                    eta_remaining_sec is not None
-                    and (
-                        last_transcription_eta is None
-                        or abs(eta_remaining_sec - last_transcription_eta) >= 15
-                    )
-                )
-                should_update = (
-                    progress_pct >= last_transcription_progress + 2
-                    or eta_changed
-                    or now_mono - last_transcription_update_at >= 3.0
-                )
-                if not should_update:
-                    return
-
-                self._update_progress(
-                    job_id,
-                    "전사 시작/진행",
-                    progress=progress_pct,
-                    eta_sec=eta_remaining_sec,
-                )
-                last_transcription_update_at = now_mono
-                last_transcription_progress = progress_pct
-                last_transcription_eta = eta_remaining_sec
+            progress_callback = self._transcription_progress_callback(job_id, eta)
 
             assert canonical_audio_final is not None
             segments, transcript_text, preprocess_sec, transcribe_sec, tmp_wav = self.worker.transcribe_file(
                 canonical_audio_final,
                 canonical_base,
-                progress_callback=handle_transcription_progress,
+                progress_callback=progress_callback,
             )
             total_sec = preprocess_sec + transcribe_sec
             ended_at = utils.now_iso()
@@ -1805,6 +1801,8 @@ class STTPipeline:
                 transcribe_sec=transcribe_sec,
                 total_sec=total_sec,
                 engine_params=json.dumps(metadata),
+                is_deduped=0,
+                deduped_from_job_id=None,
                 current_step="전체 완료",
                 progress_pct=100,
                 eta_sec=0,
@@ -2032,48 +2030,12 @@ class STTPipeline:
             self._update_progress(job_id, "전사 시작/진행", None, eta)
             self._log(logging.INFO, "transcription retry started", job_ctx)
 
-            last_transcription_update_at = 0.0
-            last_transcription_progress = 0
-            last_transcription_eta: int | None = eta
-
-            def handle_transcription_progress(
-                processed_audio_sec: float,
-                audio_duration_sec: float | None,
-                eta_remaining_sec: int | None,
-            ) -> None:
-                nonlocal last_transcription_update_at, last_transcription_progress, last_transcription_eta
-
-                progress_pct = self._transcription_progress_pct(processed_audio_sec, audio_duration_sec)
-                now_mono = time.monotonic()
-                eta_changed = (
-                    eta_remaining_sec is not None
-                    and (
-                        last_transcription_eta is None
-                        or abs(eta_remaining_sec - last_transcription_eta) >= 15
-                    )
-                )
-                should_update = (
-                    progress_pct >= last_transcription_progress + 2
-                    or eta_changed
-                    or now_mono - last_transcription_update_at >= 3.0
-                )
-                if not should_update:
-                    return
-
-                self._update_progress(
-                    job_id,
-                    "전사 시작/진행",
-                    progress=progress_pct,
-                    eta_sec=eta_remaining_sec,
-                )
-                last_transcription_update_at = now_mono
-                last_transcription_progress = progress_pct
-                last_transcription_eta = eta_remaining_sec
+            progress_callback = self._transcription_progress_callback(job_id, eta)
 
             segments, transcript_text, preprocess_sec, transcribe_sec, tmp_wav = self.worker.transcribe_file(
                 canonical_audio,
                 canonical_base,
-                progress_callback=handle_transcription_progress,
+                progress_callback=progress_callback,
             )
             total_sec = preprocess_sec + transcribe_sec
             ended_at = utils.now_iso()
