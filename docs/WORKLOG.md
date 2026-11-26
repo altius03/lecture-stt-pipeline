@@ -5,6 +5,8 @@
 
 ## 2026-11-27
 
+- [이슈 #12](https://github.com/altius03/lecture-stt-pipeline/issues/12) · [원음 보존과 전사·후처리 복구 검증](work-log/012-pipeline-reliability.md)
+
 - [이슈 #10](https://github.com/altius03/lecture-stt-pipeline/issues/10) · [main 운영 코드의 dev 통합](work-log/010-integrate-main.md) · [PR #11](https://github.com/altius03/lecture-stt-pipeline/pull/11)
 
 - [이슈 #7](https://github.com/altius03/lecture-stt-pipeline/issues/7) · [시스템·운영 이력 인수인계](work-log/007-system-handoff.md) · [main PR #8](https://github.com/altius03/lecture-stt-pipeline/pull/8) · [dev PR #9](https://github.com/altius03/lecture-stt-pipeline/pull/9)

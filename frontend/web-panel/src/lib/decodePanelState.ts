@@ -187,6 +187,7 @@ function decodeEndpoints(input: unknown): PanelEndpoints {
 function decodeActions(input: unknown): ActionSummary {
   const record = asRecord(input, "actions")
   return {
+    ...(record.can_control === undefined ? {} : { can_control: readBoolean(record, "can_control", "actions") }),
     pause_action: readLiteral(record, "pause_action", PAUSE_ACTIONS, "actions"),
     pause_label: readString(record, "pause_label", "actions"),
     endpoints: decodeEndpoints(record.endpoints),

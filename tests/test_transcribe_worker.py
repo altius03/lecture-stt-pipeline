@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 from lecture_stt.stt.transcribe import EngineParams, STTWorker, build_vad_parameters
 
@@ -22,6 +23,33 @@ class TranscribeWorkerVadCompatibilityTests(unittest.TestCase):
             vad_threshold=0.55,
             min_silence_duration_ms=1200,
         )
+
+    def test_failed_model_or_decoder_removes_partial_wav(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worker = STTWorker(self._params(), "/usr/bin/true", tmp)
+            source = root / "input.m4a"
+            wav = root / "example.wav"
+            wav.write_bytes(b"decoded")
+            with mock.patch.object(worker, "preprocess", return_value=wav), mock.patch.object(
+                worker, "transcribe", side_effect=RuntimeError("engine interrupted")
+            ), self.assertRaises(RuntimeError):
+                worker.transcribe_file(source, "example")
+            self.assertFalse(wav.exists())
+
+            def failed_decoder(cmd, **kwargs):
+                Path(cmd[-1]).write_bytes(b"partial")
+                return mock.Mock(returncode=1, stderr="decode error")
+
+            with mock.patch("subprocess.run", side_effect=failed_decoder), self.assertRaises(RuntimeError):
+                worker.preprocess(source, "example")
+            self.assertFalse(wav.exists())
+
+            wav.write_bytes(b"original WAV recording")
+            with mock.patch("subprocess.run", side_effect=failed_decoder), self.assertRaises(RuntimeError):
+                worker.preprocess(wav, "example")
+            self.assertEqual(wav.read_bytes(), b"original WAV recording")
+            self.assertEqual(list(root.glob("*.wav")), [wav])
 
     def test_build_vad_parameters_supports_faster_whisper_11_and_12_signatures(self) -> None:
         class Vad11:

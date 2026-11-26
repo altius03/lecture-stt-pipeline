@@ -90,6 +90,21 @@ describe("RecordingLibraryPanel", () => {
     expect(selectedRow?.className).toContain("is-selected")
   })
 
+  it("opens a recording on the next page", () => {
+    const first = buildRecordingLibraryListPayload()
+    first.total = 51
+    first.filters.limit = 50
+    const second = { ...first, summaries: [{ ...first.summaries[0], storage_key: "rec_51" }] }
+    const baseResult = useRecordingLibraryMock({ enabled: true, selectedStorageKey: null })
+    useRecordingLibraryMock.mockImplementation(({ offset }) => ({
+      ...baseResult, list: offset === 50 ? second : first,
+    }))
+    render(<RecordingLibraryPanel selectedStorageKey={null} />)
+    fireEvent.click(screen.getByRole("button", { name: "다음 페이지" }))
+    expect(screen.getByRole("link", { name: /2026-07-23/ }).getAttribute("href")).toBe("#library/rec_51")
+    expect(screen.getByRole("button", { name: "다음 페이지" }).hasAttribute("disabled")).toBe(true)
+  })
+
   it("shows the preview affordance only for a done current job with a latest transcript", () => {
     mockLibraryHook({
       detail: buildRecordingDetailPayload("rec_meeting_2026_07_22"),
@@ -266,7 +281,7 @@ describe("RecordingLibraryPanel", () => {
     render(<RecordingLibraryPanel selectedStorageKey="rec_2026_07_23_ds_05" />)
 
     expect(
-      screen.getByText(/현재 선택한 녹음은 첫 페이지 밖에 있어도 detail을 별도 read-only 조회로 유지합니다/),
+      screen.getByText(/선택한 녹음은 현재 목록 밖에 있습니다/),
     ).toBeTruthy()
     expect(
       screen.getByRole("heading", { name: "2026-07-23 자료구조 5교시" }),

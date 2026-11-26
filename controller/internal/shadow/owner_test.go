@@ -61,7 +61,7 @@ fi
 
 if [ "$module" = "lecture_stt.stt.main" ]; then
   for arg in "$@"; do
-    if [ "$arg" = "--plan-next-retry-job" ]; then
+    if [ "$arg" = "--prepare-controller-cycle" ]; then
       cat <<'JSON'
 %s
 JSON

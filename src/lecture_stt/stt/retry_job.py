@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+import errno
 import hashlib
 import json
 import os
@@ -74,6 +76,14 @@ class RetryJobWriteDisabledError(RetryJobContractError):
 
 class RetryJobConflictError(RetryJobContractError):
     pass
+
+
+class RetryInputUnavailable(RetryJobConflictError):
+    """A specific retry has unusable persisted inputs or row metadata."""
+
+
+class RetryInputBusy(RetryJobConflictError):
+    """An individual input cannot currently be read consistently."""
 
 
 def _canonical_json(value: Mapping[str, Any]) -> str:
@@ -236,15 +246,15 @@ def _load_audio_evidence(audio_root: Path, relative_path: str) -> dict[str, Any]
         try:
             audio_fd = os.open(relative_path, flags, dir_fd=root_fd)
         except OSError as exc:
-            raise RetryJobConflictError(
-                f"retry audio is not safely openable: {relative_path}"
-            ) from exc
+            if exc.errno in {errno.ENOENT, errno.ELOOP}:
+                raise RetryInputUnavailable(f"retry audio is not safely openable: {relative_path}") from exc
+            raise RetryInputBusy(f"retry audio is not safely openable: {relative_path}") from exc
 
         before = os.fstat(audio_fd)
         if not stat.S_ISREG(before.st_mode):
-            raise RetryJobConflictError("retry audio must be a regular file")
+            raise RetryInputUnavailable("retry audio must be a regular file")
         if before.st_nlink != 1:
-            raise RetryJobConflictError("retry audio must have exactly one hard link")
+            raise RetryInputUnavailable("retry audio must have exactly one hard link")
 
         digest = hashlib.sha256()
         while True:
@@ -265,11 +275,11 @@ def _load_audio_evidence(audio_root: Path, relative_path: str) -> dict[str, Any]
             "st_ctime_ns",
         )
         if any(getattr(before, field) != getattr(after, field) for field in stable_fields):
-            raise RetryJobConflictError("retry audio changed while it was hashed")
+            raise RetryInputBusy("retry audio changed while it was hashed")
         if any(getattr(after, field) != getattr(current, field) for field in stable_fields):
-            raise RetryJobConflictError("retry audio pathname changed while it was hashed")
+            raise RetryInputBusy("retry audio pathname changed while it was hashed")
         if not stat.S_ISREG(current.st_mode) or current.st_nlink != 1:
-            raise RetryJobConflictError("retry audio pathname is not a single-link regular file")
+            raise RetryInputUnavailable("retry audio pathname is not a single-link regular file")
 
         return {
             "relative_path": relative_path,
@@ -280,31 +290,26 @@ def _load_audio_evidence(audio_root: Path, relative_path: str) -> dict[str, Any]
             "ctime_ns": int(after.st_ctime_ns),
             "sha256": digest.hexdigest(),
         }
+    except OSError as exc:
+        raise RetryInputBusy(f"retry audio read interrupted: {relative_path}") from exc
     finally:
         if audio_fd is not None:
             os.close(audio_fd)
         os.close(root_fd)
 
 
-def _open_db_guard(path: Path) -> tuple[int, dict[str, int]]:
+def _existing_db_identity(path: Path) -> dict[str, int]:
+    # Opening then closing a raw descriptor would release the process's POSIX
+    # locks, including locks held by another live SQLite connection.
     try:
-        flags = (
-            os.O_RDONLY
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0)
-            | getattr(os, "O_NONBLOCK", 0)
-        )
-        fd = os.open(path, flags)
-        db_stat = os.fstat(fd)
-        if not stat.S_ISREG(db_stat.st_mode):
-            os.close(fd)
-            raise RetryJobConflictError("jobs db must be a regular file")
-        if db_stat.st_nlink != 1:
-            os.close(fd)
-            raise RetryJobConflictError("jobs db must have exactly one hard link")
-        return fd, _db_identity_from_stat_result(db_stat)
+        info = path.lstat()
     except OSError as exc:
         raise RetryJobConflictError(f"jobs db is not safely openable: {path}") from exc
+    if not stat.S_ISREG(info.st_mode):
+        raise RetryJobConflictError("jobs db must be a regular file")
+    if info.st_nlink != 1:
+        raise RetryJobConflictError("jobs db must have exactly one hard link")
+    return _db_identity_from_stat_result(info)
 
 
 def _assert_db_path_identity(path: Path, expected_identity: Mapping[str, Any], *, label: str) -> None:
@@ -337,6 +342,19 @@ def _assert_database_list_main_matches(
     if os.path.realpath(os.fspath(opened_path)) != os.path.realpath(os.fspath(configured_db_path)):
         raise RetryJobConflictError("sqlite main database does not resolve to the configured db path")
     _assert_db_path_identity(opened_path, expected_identity, label="sqlite main database")
+
+
+@contextmanager
+def existing_controller_database(db_path: Path):
+    """Pin the existing database identity while the controller prepares a cycle."""
+    identity = _existing_db_identity(db_path)
+    conn = _readonly_db_connection(db_path)
+    try:
+        _assert_database_list_main_matches(conn, db_path, identity)
+        yield conn, identity
+        _assert_db_path_identity(db_path, identity, label="jobs db path")
+    finally:
+        conn.close()
 
 
 def _readonly_db_connection(db_path: Path) -> sqlite3.Connection:
@@ -512,33 +530,30 @@ def build_retry_job_plan(
     transcript_root = Path(
         _require_string(paths.get("transcript_folder"), "config.paths.transcript_folder")
     )
-    db_guard_fd, db_identity = _open_db_guard(db_path)
-    conn: sqlite3.Connection | None = None
-    try:
-        conn = _readonly_db_connection(db_path)
-        _assert_database_list_main_matches(conn, db_path, db_identity)
+    with existing_controller_database(db_path) as (conn, db_identity):
         row = _select_retry_row(conn, job_id=job_id)
-        row_payload = _retry_row_payload(row)
-    finally:
-        if conn is not None:
-            conn.close()
-        os.close(db_guard_fd)
-    _assert_db_path_identity(db_path, db_identity, label="jobs db path")
-    relative_path = _canonical_audio_relative_path(audio_root, row_payload["canonical_audio_path"])
-    transcript_txt_relative_path = _transcript_relative_path(
-        transcript_root,
-        row_payload["transcript_txt_path"],
-        canonical_base=row_payload["canonical_base"],
-        suffix=".txt",
-        label="retry_job.transcript_txt_relative_path",
-    )
-    transcript_json_relative_path = _transcript_relative_path(
-        transcript_root,
-        row_payload["transcript_json_path"],
-        canonical_base=row_payload["canonical_base"],
-        suffix=".json",
-        label="retry_job.transcript_json_relative_path",
-    )
+        try:
+            row_payload = _retry_row_payload(row)
+        except RetryJobContractError as exc:
+            raise RetryInputUnavailable(str(exc)) from exc
+    try:
+        relative_path = _canonical_audio_relative_path(audio_root, row_payload["canonical_audio_path"])
+        transcript_txt_relative_path = _transcript_relative_path(
+            transcript_root,
+            row_payload["transcript_txt_path"],
+            canonical_base=row_payload["canonical_base"],
+            suffix=".txt",
+            label="retry_job.transcript_txt_relative_path",
+        )
+        transcript_json_relative_path = _transcript_relative_path(
+            transcript_root,
+            row_payload["transcript_json_path"],
+            canonical_base=row_payload["canonical_base"],
+            suffix=".json",
+            label="retry_job.transcript_json_relative_path",
+        )
+    except RetryJobContractError as exc:
+        raise RetryInputUnavailable(str(exc)) from exc
     retry_job = {
         "job_id": row_payload["job_id"],
         "status": row_payload["status"],
@@ -570,17 +585,8 @@ def build_retry_job_plan(
 def build_next_retry_job_plan(config: Mapping[str, Any]) -> dict[str, Any]:
     paths = _require_mapping(config.get("paths"), "config.paths")
     db_path = Path(_require_string(paths.get("db_path"), "config.paths.db_path"))
-    db_guard_fd, db_identity = _open_db_guard(db_path)
-    conn: sqlite3.Connection | None = None
-    try:
-        conn = _readonly_db_connection(db_path)
-        _assert_database_list_main_matches(conn, db_path, db_identity)
+    with existing_controller_database(db_path) as (conn, db_identity):
         job_id = _select_oldest_retry_job_id(conn)
-    finally:
-        if conn is not None:
-            conn.close()
-        os.close(db_guard_fd)
-    _assert_db_path_identity(db_path, db_identity, label="jobs db path")
     if job_id is None:
         return {
             "schema_version": NEXT_PLAN_SCHEMA_VERSION,

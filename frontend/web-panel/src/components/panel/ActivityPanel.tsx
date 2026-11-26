@@ -7,6 +7,7 @@ import { parseLectureFileInfo, parsePanelLogText, type ParsedLogEntry } from "..
 import type { PanelAction, PanelJob } from "../../types"
 
 interface ActivityPanelProps {
+  canControl?: boolean
   jobs: PanelJob[]
   logs: PanelLogState
   error: string | null
@@ -89,8 +90,8 @@ function isEntryForJob(entry: ParsedLogEntry, job: PanelJob | null): boolean {
     return false
   }
 
-  if (entry.jobId === String(job.id)) {
-    return true
+  if (entry.jobId !== null) {
+    return entry.jobId === String(job.id)
   }
 
   const selectedFileInfo = parseLectureFileInfo(job.file_name)
@@ -154,6 +155,7 @@ function shortErrorMessage(message: string): string {
 }
 
 export function ActivityPanel({
+  canControl,
   jobs,
   logs,
   error,
@@ -360,9 +362,10 @@ export function ActivityPanel({
       </details>
 
       <ActionBar
+        canControl={canControl}
         compact
         actions={[
-          { action: "clear_history", label: "완료·오류 이력 정리", tone: "secondary" },
+          { action: "clear_history", label: "완료 이력 정리", tone: "secondary" },
           { action: "exit", label: "패널 종료", tone: "danger" },
         ]}
         pendingAction={pendingAction}

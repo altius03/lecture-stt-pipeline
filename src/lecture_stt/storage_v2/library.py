@@ -684,6 +684,7 @@ def list_recordings(
     normalized_limit, normalized_offset = _validate_limit_offset(limit, offset)
     conn = _open_readonly(db_path)
     try:
+        conn.execute("BEGIN")
         counts = _status_counts_zero()
         for row in conn.execute(
             """
@@ -992,6 +993,7 @@ def read_recording_detail(
     normalized_storage_key = _validate_recording_key(storage_key)
     conn = _open_readonly(db_path)
     try:
+        conn.execute("BEGIN")
         recording = conn.execute(
             """
             SELECT

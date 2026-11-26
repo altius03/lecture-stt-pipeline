@@ -13,6 +13,24 @@ from lecture_stt.stt.quality_gate import evaluate
 
 
 class QualityGateTests(unittest.TestCase):
+    def test_empty_transcript_is_bad_for_short_or_unknown_duration(self) -> None:
+        for duration in (None, 30):
+            with self.subTest(duration=duration):
+                report = evaluate([], "", audio_duration_sec=duration)
+                self.assertEqual((report.health, report.quality_score), ("bad", 0))
+
+    def test_long_gap_preserves_end_coverage_and_reports_merged_interval_bounds(self) -> None:
+        segments = [
+            {"start": 0, "end": 20, "text": "첫 발언"},
+            {"start": 1, "end": 3, "text": "겹치는 발언"},
+            {"start": 250, "end": 290, "text": ""},
+            {"start": 320, "end": 340, "text": "두 번째 발언"},
+        ]
+        result = evaluate(segments, "첫 발언 겹치는 발언 두 번째 발언", audio_duration_sec=340)
+        self.assertEqual(result.coverage_ratio, 1)
+        self.assertEqual(result.to_dict()["long_gaps"], [{"start_sec": 20, "end_sec": 320, "duration_sec": 300}])
+        self.assertIn("20~320초", result.summary)
+
     def test_repetitive_text_is_flagged_as_bad(self) -> None:
         segments = [{"text": "안녕하세요 안녕하세요 안녕하세요"} for _ in range(8)]
         text = "안녕하세요 " * 60

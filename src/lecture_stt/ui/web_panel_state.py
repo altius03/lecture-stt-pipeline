@@ -60,6 +60,7 @@ from lecture_stt.storage_v2.timetable import (
     update_classification_status,
 )
 from lecture_stt.storage_v2.unified_review import read_unified_review_feed
+import psutil
 import yaml
 
 
@@ -133,11 +134,12 @@ class ControlState:
 
         self.worker_proc: subprocess.Popen | None = None
         self.controller_proc: subprocess.Popen | None = None
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
+        self._folder_cache_until = 0.0
+        self._folder_cache: dict[str, str] = {}
         self.notice = "대기중"
         self._shutdown_handler = None
         self._poll_boost_until = 0.0
-        self._notification_restart_required = False
 
         self.config_data = self._load_config()
         paths = self.config_data.get("paths", {})
@@ -344,23 +346,15 @@ class ControlState:
             },
         ]
 
-    def _notification_state(self, managed_running: bool, external_pids: list[int]) -> dict[str, object]:
+    def _notification_state(self) -> dict[str, object]:
         selection = self._notification_selection()
-        can_apply_now = self._has_active_runtime(
-            managed_running=managed_running,
-            external_pids=external_pids,
-        )
-        apply_label = (
-            "변경하면 실행 중 워커에 즉시 적용됩니다."
-            if can_apply_now
-            else "다음 시작부터 적용됩니다."
-        )
+        apply_label = "실행 중인 전사를 유지하고 다음 작업부터 반영합니다."
         return {
             "selection": selection,
             "selected_label": self._notification_label(selection),
             "apply_label": apply_label,
-            "restart_required": self._notification_restart_required,
-            "can_apply_now": can_apply_now,
+            "restart_required": False,
+            "can_apply_now": False,
             "options": self._notification_options(),
         }
 
@@ -395,49 +389,9 @@ class ControlState:
         config_data["notification"] = notification_cfg
         directory_synced = self._save_config(config_data)
 
-        if self._has_active_runtime():
-            self._notification_restart_required = True
-            self.notice = "알림 채널이 저장되었습니다. 실행 중 워커에 즉시 적용합니다."
-        else:
-            self._notification_restart_required = False
-            self.notice = "알림 채널이 저장되었습니다. 다음 시작부터 적용됩니다."
+        self.notice = "알림 채널이 저장되었습니다. 다음 작업부터 적용됩니다."
         self._set_poll_boost()
         return directory_synced
-
-    def _wait_for_worker_shutdown(self, timeout_sec: float = 30.0) -> bool:
-        deadline = time.monotonic() + max(0.0, timeout_sec)
-        while time.monotonic() < deadline:
-            if not self._is_managed_running() and not self._find_worker_pids():
-                return True
-            time.sleep(0.5)
-        return not self._is_managed_running() and not self._find_worker_pids()
-
-    def restart_worker_for_notification(self) -> None:
-        if not self._notification_restart_required:
-            self.notice = "재시작이 필요한 알림 변경이 없습니다."
-            self._set_poll_boost()
-            return
-
-        if not self._has_active_runtime():
-            self._notification_restart_required = False
-            self.notice = "알림 채널이 저장되었습니다. 다음 시작부터 적용됩니다."
-            self._set_poll_boost()
-            return
-
-        self.stop()
-        if "실패" in self.notice:
-            return
-        if not self._wait_for_worker_shutdown():
-            # 타임아웃: 전사 중일 수 있음. config는 이미 저장됐으므로
-            # 새 관리 워커는 시작하지 않고 기존 워커 자연 종료를 기다린다.
-            self._notification_restart_required = False
-            self.notice = "알림 채널 저장 완료. 현재 전사가 끝나면 반영됩니다 (워커를 재시작하면 즉시 적용)."
-            self._set_poll_boost()
-            return
-        self.start()
-        if self._has_active_runtime():
-            self._notification_restart_required = False
-            self.notice = "알림 채널 변경을 즉시 적용했습니다."
 
     def _resolve_log_path(self) -> Path:
         logging_cfg = self.config_data.get("logging", {})
@@ -1813,27 +1767,50 @@ class ControlState:
             raise RuntimeError(detail)
         return (result.stdout or "").strip()
 
-    def _find_worker_pids(self) -> list[int]:
-        # 관리 상태 확인을 위해 STT 워커 모듈 PID를 찾는다.
+    def _matches_worker(self, proc: psutil.Process) -> bool:
         try:
-            result = self._run_control_cmd(
-                ["pgrep", "-f", self.worker_module],
-            )
-        except Exception:
-            return []
+            if proc.uids().effective != os.geteuid():
+                return False
+            args = proc.cmdline()
+            if len(args) < 3 or args[1:3] != ["-m", self.worker_module]:
+                return False
+            # Canonical entry points either run in this checkout or use its Python.
+            cwd = Path(proc.cwd())
+            if cwd.resolve() != self.repo_root.resolve() and Path(args[0]) != self.repo_root / ".venv/bin/python":
+                return False
+            config_arg = "config/config.yaml"
+            worker_flags = {"--once", "--allow-write", "--enable-single-job", "--enable-retry-job",
+                            "--enable-terminal-error-recovery"}
+            value_options = {"--config", "--watch-folder", "--single-job-manifest",
+                             "--retry-job-manifest", "--terminal-error-recovery-manifest",
+                             "--controller-kill-switch", "--expected-count", "--expected-plan-sha256"}
+            options = iter(args[3:])
+            for arg in options:
+                key, separator, value = arg.partition("=")
+                if not separator and key in worker_flags:
+                    continue
+                if key not in value_options:
+                    return False  # Planning, control, abbreviated or unknown invocation.
+                if not separator:
+                    value = next(options, "")
+                if not value or value.startswith("--"):
+                    return False
+                if key == "--config":
+                    config_arg = value
+            candidate = cwd / config_arg
+            return candidate.resolve() == self.config_path.resolve() and proc.is_running()
+        except (psutil.Error, OSError, RuntimeError, ValueError):
+            return False
 
-        pids: list[int] = []
-        for line in (result.stdout or "").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                pid = int(line)
-            except ValueError:
-                continue
-            if pid != os.getpid():
-                pids.append(pid)
-        return sorted(set(pids))
+    def _worker_processes(self) -> list[psutil.Process]:
+        # psutil.Process binds terminate() to PID and creation time.
+        return [
+            proc for proc in psutil.process_iter(["name"])
+            if (proc.info["name"] or "").lower().startswith("python") and self._matches_worker(proc)
+        ]
+
+    def _find_worker_pids(self) -> list[int]:
+        return [proc.pid for proc in self._worker_processes()]
 
     def _is_managed_running(self) -> bool:
         return self.worker_proc is not None and self.worker_proc.poll() is None
@@ -2200,27 +2177,26 @@ class ControlState:
         except Exception as exc:
             raise RuntimeError(f"일시정지 설정 처리 실패: {exc}") from exc
 
-    def start(self) -> None:
+    def start(self) -> tuple[int, str]:
         with self.lock:
             if self._is_controller_owner():
                 try:
                     if self._is_console_controller():
                         self._start_console_controller()
-                        self._notification_restart_required = False
                         self._set_poll_boost()
-                        return
+                        return 200, self.notice
                     if not self._controller_service_loaded():
                         self.notice = "controller 서비스가 load되지 않아 시작할 수 없습니다."
-                        return
+                        return 409, self.notice
                     self._remove_controller_kill_switch_marker()
                     self._set_paused(False)
-                    self._run_launchctl("kickstart", "-k", self._controller_service_target())
-                    self._notification_restart_required = False
+                    self._run_launchctl("kickstart", self._controller_service_target())
                     self.notice = "controller 실행을 재개했습니다."
                     self._set_poll_boost()
                 except Exception as exc:
                     self.notice = f"시작 실패: {exc}"
-                return
+                    return 500, self.notice
+                return 200, self.notice
 
             if self._is_managed_running():
                 if self._is_paused():
@@ -2228,22 +2204,22 @@ class ControlState:
                         self._set_paused(False)
                     except Exception as exc:
                         self.notice = f"일시정지 해제 실패: {exc}"
-                        return
+                        return 500, self.notice
                     self.notice = "일시정지 해제 후 파이프라인이 재개됩니다."
                 else:
                     self.notice = "이미 실행 중입니다."
                 self._set_poll_boost()
-                return
+                return 200, self.notice
 
             if self._find_worker_pids() and not self._is_managed_running():
                 self.notice = "다른 경로에서 실행 중인 워커가 있어 시작할 수 없습니다."
-                return
+                return 409, self.notice
 
             try:
                 self._set_paused(False)
             except Exception as exc:
                 self.notice = f"시작 전 초기화 실패: {exc}"
-                return
+                return 500, self.notice
             cmd = self._worker_cmd("--config", str(self.config_path))
             try:
                 self.worker_proc = subprocess.Popen(
@@ -2259,50 +2235,55 @@ class ControlState:
                     code = self.worker_proc.returncode
                     self.notice = f"파이프라인 시작 실패: 워커가 즉시 종료되었습니다. (코드={code})"
                     self.worker_proc = None
-                    return
+                    return 500, self.notice
 
-                self._notification_restart_required = False
                 self.notice = "파이프라인이 실행중입니다."
                 self._set_poll_boost()
             except Exception as exc:
                 self.notice = f"시작 실패: {exc}"
+                return 500, self.notice
+            return 200, self.notice
 
-    def pause(self) -> None:
+    def pause(self) -> tuple[int, str]:
         with self.lock:
             if self._is_paused():
                 self.notice = "이미 일시정지 상태입니다."
-                return
+                return 200, self.notice
             try:
                 self._set_paused(True)
                 self.notice = "파이프라인이 일시정지되었습니다."
                 self._set_poll_boost()
             except Exception as exc:
                 self.notice = f"일시정지 처리 실패: {exc}"
+                return 500, self.notice
+            return 200, self.notice
 
-    def resume(self) -> None:
+    def resume(self) -> tuple[int, str]:
         with self.lock:
             if not self._is_paused():
                 self.notice = "일시정지 상태가 아닙니다."
-                return
+                return 409, self.notice
             try:
                 self._set_paused(False)
                 if not self._is_managed_running() and not self._find_worker_pids():
                     self.notice = "재개 요청됨. 워커가 없으면 시작 버튼을 눌러 주세요."
                     self._set_poll_boost()
-                    return
+                    return 200, self.notice
                 self.notice = "파이프라인이 재개되었습니다."
                 self._set_poll_boost()
             except Exception as exc:
                 self.notice = f"재개 처리 실패: {exc}"
+                return 500, self.notice
+            return 200, self.notice
 
-    def stop(self) -> None:
+    def stop(self) -> tuple[int, str]:
         with self.lock:
             if self._is_controller_owner():
                 try:
                     if self._is_console_controller():
                         self._stop_console_controller()
                         self._set_poll_boost()
-                        return
+                        return 200, self.notice
                     self._write_controller_kill_switch_marker()
                     self._run_launchctl("kill", "SIGTERM", self._controller_service_target())
                     self.notice = "controller 중지 요청을 보냈습니다."
@@ -2310,9 +2291,11 @@ class ControlState:
                 except Exception as exc:
                     self.notice = f"중지 실패: {exc}"
                     self._set_poll_boost()
-                return
+                    return 500, self.notice
+                return 200, self.notice
 
             stopped: list[int] = []
+            external_signaled: list[int] = []
             errors: list[str] = []
             pause_clear_failed: str | None = None
             try:
@@ -2335,24 +2318,32 @@ class ControlState:
                     except Exception as kill_exc:
                         errors.append(f"managed pid={pid}: {exc or kill_exc}")
                 finally:
-                    self.worker_proc = None
+                    if self.worker_proc.poll() is not None:
+                        self.worker_proc = None
 
-            for pid in self._find_worker_pids():
+            for proc in self._worker_processes():
                 try:
-                    os.kill(pid, signal.SIGTERM)
-                    stopped.append(pid)
-                except ProcessLookupError:
+                    if not self._matches_worker(proc):
+                        continue
+                    proc.terminate()
+                    external_signaled.append(proc.pid)
+                except psutil.NoSuchProcess:
                     continue
-                except Exception as exc:
-                    errors.append(f"pid={pid}: {exc}")
+                except psutil.Error as exc:
+                    errors.append(f"pid={proc.pid}: {exc}")
 
             if errors:
                 if pause_clear_failed:
                     errors.append(pause_clear_failed)
                 self.notice = "중지 중 일부 실패: " + "; ".join(errors)
                 self._set_poll_boost()
-            elif stopped:
-                base_msg = "중지 완료: PID " + ", ".join(str(pid) for pid in sorted(set(stopped)))
+            elif stopped or external_signaled:
+                notices = []
+                if stopped:
+                    notices.append("중지 완료: PID " + ", ".join(map(str, stopped)))
+                if external_signaled:
+                    notices.append("외부 워커에 중지 신호를 보냈습니다. 서비스 관리자가 재시작할 수 있습니다.")
+                base_msg = " ".join(notices)
                 self.notice = base_msg if pause_clear_failed is None else f"{base_msg}, {pause_clear_failed}"
                 self._set_poll_boost()
             else:
@@ -2361,6 +2352,7 @@ class ControlState:
                 else:
                     self.notice = "실행 중인 워커 없음"
                 self._set_poll_boost()
+            return (500 if errors or pause_clear_failed else 200), self.notice
 
     def set_shutdown_handler(self, callback) -> None:
         self._shutdown_handler = callback
@@ -2523,75 +2515,87 @@ class ControlState:
         except Exception:
             return "오류"
 
-    def _truncate_log(self) -> bool:
-        if not self.log_path.exists():
-            return True
-        try:
-            self.log_path.write_text("", encoding="utf-8")
-            return True
-        except Exception:
-            try:
-                self.log_path.unlink()
-                self.log_path.touch()
-                return True
-            except Exception:
-                return False
+    def _clearable_history_query(self, conn: sqlite3.Connection) -> str:
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        # Retain ERROR rows for terminal error recovery, including legacy records.
+        protected = ["SELECT id FROM jobs WHERE status != 'DONE'"]
+        protected.extend(
+            f"SELECT source_job_id FROM {table} WHERE source_job_id IS NOT NULL"
+            for table in ("deliveries", "transcript_deliveries", "transcript_postprocess_jobs")
+            if table in tables
+        )
+        # The worker can be enabled by edits outside this long-lived panel. Check
+        # the same boolean contract at plan and apply under the DB transaction.
+        from lecture_stt.stt.main import _parse_bool
 
-    def clear_history(self) -> bool:
-        """완료/오류 이력 중 다른 원장에서 참조하지 않는 작업만 정리한다."""
         try:
-            with sqlite3.connect(self.db_path, timeout=3.0) as conn:
-                conn.execute("PRAGMA busy_timeout = 3000")
+            config = self._load_config()
+            paths = config.get("paths")
+            if not isinstance(paths, dict) or not isinstance(paths.get("db_path"), str):
+                raise ValueError("작업 DB 설정이 없습니다.")
+            configured_db = resolve_config_path(paths["db_path"], base_dir=self.repo_root, env=self._runtime_env())
+            if configured_db != self.db_path:
+                raise ValueError("작업 DB 경로가 변경되었습니다.")
+            delivery = config.get("transcript_delivery", {})
+            if not isinstance(delivery, dict):
+                raise ValueError("후처리 설정이 올바르지 않습니다.")
+            delivery_enabled = _parse_bool("transcript_delivery.enabled", delivery.get("enabled", False))
+        except (OSError, ValueError, yaml.YAMLError) as exc:
+            raise ValueError("현재 작업 DB와 후처리 설정을 확인할 수 없어 정리를 중단했습니다.") from exc
+        if delivery_enabled:
+            protected.append("SELECT id FROM jobs WHERE status = 'DONE'")
+        if "deduped_from_job_id" in {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}:
+            protected.append(
+                "SELECT jobs.deduped_from_job_id FROM jobs JOIN protected ON jobs.id = protected.id "
+                "WHERE jobs.deduped_from_job_id IS NOT NULL"
+            )
+        return (
+            "WITH RECURSIVE protected(id) AS (" + " UNION ".join(protected) + ") "
+            "SELECT id FROM jobs WHERE status = 'DONE' AND id NOT IN (SELECT id FROM protected) ORDER BY id"
+        )
+
+    @staticmethod
+    def _history_plan(conn: sqlite3.Connection, query: str) -> dict[str, Any]:
+        digest = hashlib.sha256()
+        count = 0
+        for (job_id,) in conn.execute(query):
+            digest.update(f"{job_id}\n".encode("ascii"))
+            count += 1
+        return {"count": count, "digest": digest.hexdigest()}
+
+    def history_plan(self) -> dict[str, Any]:
+        with sqlite3.connect(self.db_path, timeout=3) as conn:
+            conn.execute("BEGIN")
+            return self._history_plan(conn, self._clearable_history_query(conn))
+
+    def clear_history(self, digest: str) -> tuple[int, str]:
+        try:
+            with sqlite3.connect(self.db_path, timeout=3) as conn:
                 conn.execute("BEGIN IMMEDIATE")
-                tables = {
-                    row[0]
-                    for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
-                }
-                protected = ["SELECT id FROM jobs WHERE status NOT IN ('DONE', 'ERROR')"]
-                protected.extend(
-                    f"SELECT source_job_id FROM {table} WHERE source_job_id IS NOT NULL"
-                    for table in ("deliveries", "transcript_deliveries", "transcript_postprocess_jobs")
-                    if table in tables
-                )
-                delivery_cfg = getattr(self, "config_data", {}).get("transcript_delivery") or {}
-                if delivery_cfg.get("enabled") is True:
-                    # DONE without a queue row is still a reconciliation source.
-                    protected.append("SELECT id FROM jobs WHERE status = 'DONE'")
-                if "deduped_from_job_id" in {
-                    row[1] for row in conn.execute("PRAGMA table_info(jobs)")
-                }:
-                    protected.append(
-                        "SELECT jobs.deduped_from_job_id FROM jobs "
-                        "JOIN protected ON jobs.id = protected.id "
-                        "WHERE jobs.deduped_from_job_id IS NOT NULL"
-                    )
-                query = (
-                    "WITH RECURSIVE protected(id) AS (" + " UNION ".join(protected) + ") "
-                    "DELETE FROM jobs WHERE status IN ('DONE', 'ERROR') "
-                    "AND id NOT IN (SELECT id FROM protected)"
-                )
-                conn.execute(query)
-        except Exception as exc:
-            self.notice = f"이력 초기화 실패: {exc}"
-            return False
-
-        try:
-            log_cleared = self._truncate_log()
-        except OSError:
-            log_cleared = False
-        self.notice = "정리 가능한 완료/오류 이력을 정리했습니다. 확인 필요 항목, 다른 원장이 참조하는 작업, 후처리 재조정 대상은 보존됩니다."
-        if not log_cleared:
-            self.notice += " 로그는 지우지 못했습니다."
+                query = self._clearable_history_query(conn)
+                plan = self._history_plan(conn, query)
+                if plan["digest"] != digest:
+                    return 409, "정리 대상이 바뀌었습니다. 대상 건수를 다시 확인해 주세요."
+                conn.execute(f"DELETE FROM jobs WHERE id IN ({query})")
+        except (ValueError, sqlite3.Error) as exc:
+            self.notice = f"이력 정리 실패: {exc}"
+            return 500, self.notice
+        self.notice = f"미참조 완료 이력 {plan['count']}건을 정리했습니다."
         self._set_poll_boost()
-        return True
+        return 200, self.notice
 
     def _folder_counts(self) -> dict[str, str]:
-        return {
+        now = time.monotonic()
+        if now < self._folder_cache_until:
+            return self._folder_cache.copy()
+        self._folder_cache = {
             "inbox": self._count_files(self.watch_folder),
             "audio": self._count_files(self.audio_folder),
             "transcripts": self._count_transcript_sets(self.transcript_folder),
             "errors": self._count_files(self.error_folder),
         }
+        self._folder_cache_until = time.monotonic() + 5
+        return self._folder_cache.copy()
 
     def _recent_log_text(self) -> str:
         if not self.log_path.exists():
@@ -2710,7 +2714,7 @@ class ControlState:
             "eta_label": ControlState._format_eta(eta_value),
         }
 
-    def snapshot(self, include_log: bool = True) -> dict:
+    def snapshot(self, include_log: bool = False) -> dict:
         with self.lock:
             managed_running = self._is_managed_running()
             pids = self._find_worker_pids()
@@ -2790,7 +2794,7 @@ class ControlState:
             poll_interval_sec = self._poll_interval_sec(bool(processing), bool(managed_running or pids))
             updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             refresh_hint = "활성 구간은 1초, 유휴 구간은 2초로 동기화됩니다. 작업 상태에서 즉시 반영이 필요하면 '상태 동기화'를 눌러주세요."
-            notification_state = self._notification_state(managed_running=managed_running, external_pids=pids)
+            notification_state = self._notification_state()
 
             return {
                 "schema_version": 2,

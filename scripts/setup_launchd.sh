@@ -133,18 +133,16 @@ else
   exit 1
 fi
 
-# ── 4. Whisper 모델 다운로드 ─────────────────────────────────
-print_step "Whisper 모델 확인 (large-v3, 처음이면 수분 소요)"
-"$REPO/.venv/bin/python" "$REPO/scripts/download_model.py"
-print_ok "모델 준비 완료"
+# 설치에 실패하면 기존 서비스는 계속 동작하도록 등록 변경 전에 준비한다.
+print_step "웹 패널 빌드"
+(
+  cd "$REPO/frontend/web-panel"
+  npm ci --no-audit --no-fund
+  npm run build
+)
 
-# ── 5. iCloud 폴더 생성 ──────────────────────────────────────
-print_step "iCloud 녹음 폴더 생성"
-ICLOUD_BASE="$HOME/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings"
-for dir in 00_inbox 01_audio 02_transcripts 03_correction 04_summarize 99_errors; do
-  mkdir -p "$ICLOUD_BASE/$dir"
-  print_ok "$dir"
-done
+print_step "설정된 녹음 폴더와 Whisper 모델 준비"
+"$REPO/.venv/bin/python" "$REPO/scripts/download_model.py" --config "$CONFIG_PATH" --create-folders
 
 # ── 6. 로그 폴더 생성 ────────────────────────────────────────
 print_step "로그 폴더 확인"
@@ -171,7 +169,6 @@ for label in "${PLISTS[@]}"; do
 
   render_plist "$src" "$dst"
   launchctl bootstrap "gui/$uid" "$dst"
-  launchctl kickstart -k "gui/$uid/$label"
   print_ok "$label 등록 완료"
 done
 
@@ -182,22 +179,22 @@ echo ""
 printf "  %-50s %s\n" "서비스" "PID"
 printf "  %-50s %s\n" "──────────────────────────────────────────────────" "────"
 for label in "${PLISTS[@]}"; do
-  pid=$(launchctl list "$label" 2>/dev/null | awk '/PID/{print $3}' || echo "-")
-  if [ "$pid" != "-" ] && [ "$pid" != "0" ]; then
+  pid=$(launchctl print "gui/$uid/$label" 2>/dev/null | awk '$1 == "pid" && $2 == "=" {print $3}' || true)
+  if [[ "$pid" =~ ^[1-9][0-9]*$ ]]; then
     printf "  %-50s %s ✅\n" "$label" "$pid"
   else
-    printf "  %-50s %s ❌\n" "$label" "(미실행)"
+    printf "  %-50s %s\n" "$label" "(현재 실행 중인 PID 없음)"
   fi
 done
 
 # ── 9. 웹 콘솔 응답 확인 ─────────────────────────────────────
 print_step "웹 콘솔 응답 확인"
 sleep 3
-if curl -s --max-time 5 http://127.0.0.1:8765 | grep -q "."; then
+if "$REPO/.venv/bin/python" "$REPO/scripts/verify_web_panel.py"; then
   print_ok "웹 콘솔 정상 → http://127.0.0.1:8765"
 else
-  echo "  ⚠️  웹 콘솔 아직 미응답 (기동 중일 수 있음)"
-  echo "     잠시 후 브라우저에서 http://127.0.0.1:8765 확인하세요"
+  print_fail "웹 콘솔의 빌드와 상태 응답을 확인하지 못했습니다. webpanel.err.log를 확인하세요."
+  exit 1
 fi
 
 # ── 10. Tailscale IP 출력 ────────────────────────────────────

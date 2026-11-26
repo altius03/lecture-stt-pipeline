@@ -4,6 +4,8 @@ import io
 import json
 import logging
 import os
+import shutil
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -1493,6 +1495,238 @@ class SttPipelineBehaviorTests(unittest.TestCase):
         self.assertEqual((self.watch_dir / "sample.m4a").read_bytes(), b"new-audio")
         self.assertEqual(old_audio.read_bytes(), b"old-audio")
         self.assertFalse(staged_path.exists())
+
+    @unittest.skipUnless(shutil.which("go"), "Go controller toolchain is required")
+    def test_real_controller_cycle_recovers_idle_input_and_quarantines_missing_retry(self) -> None:
+        # Seed recent results in the isolated fixture. The child processes must
+        # reuse the existing reviewed result without running a real speech model.
+        original = self._write_stable_source("original.m4a", b"reviewed audio")
+        with mock.patch.object(stt_main, "quality_evaluate", return_value=_BadQualityReport()):
+            self.pipeline.process_job(original)
+        _, bad_id, missing = self._plan_retry_after_transient_failure("missing.m4a")
+        missing.unlink()
+        staged = self.pipeline.staging_dir / "copy.m4a"
+        staged.write_bytes(b"reviewed audio")
+        self.assertEqual(list(self.watch_dir.iterdir()), [])
+
+        config = dict(self.config)
+        config["app"] = {**self.config["app"], "polling_interval_sec": 1}
+        config["ffmpeg"] = {"binary_path": "/usr/bin/false"}
+        config_file = self.root / "test.yaml"
+        config_file.write_text(stt_main.yaml.safe_dump(config))
+        controller_state = self.root / "controller"
+        controller_state.mkdir(mode=0o700)
+        result = subprocess.run(
+            ["go", "run", "./cmd/lecture-stt-controller", "--once", "--enable-execution", "--allow-write",
+             "--python-bin", sys.executable, "--repo-root", str(REPO_ROOT), "--config", str(config_file),
+             "--kill-switch", str(self._controller_kill_switch()), "--state-dir", str(controller_state)],
+            cwd=REPO_ROOT / "controller", capture_output=True, text=True, timeout=90,
+            env={**os.environ, "HF_HUB_OFFLINE": "1"},
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["executions"], [{"kind": "single", "status": "needs_review"}])
+        self.assertEqual(stt_main.db.get_job(self.pipeline.conn, bad_id)["status"], stt_main.STATUS_NEEDS_REVIEW)
+        copied = self.pipeline.conn.execute("SELECT status, is_deduped FROM jobs WHERE orig_name='copy.m4a'").fetchone()
+        self.assertEqual(tuple(copied), (stt_main.STATUS_NEEDS_REVIEW, 1))
+        self.assertFalse(staged.exists())
+        self.assertEqual(self.pipeline.conn.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+
+    def test_controller_recovers_unreadable_utf8_pairs_and_admits_independent_audio(self) -> None:
+        for status in (stt_main.STATUS_PENDING, stt_main.STATUS_PROCESSING):
+            for suffix in (".txt", ".json"):
+                name = f"interrupted-{status}-{suffix[1:]}"
+                original = self._write_stable_source(name + ".m4a", name.encode())
+                result = self.pipeline.process_job(original)
+                stt_main.db.set_status(self.pipeline.conn, result["job_id"], status)
+                incomplete = self.transcript_dir / (name + suffix)
+                incomplete.write_bytes(b"valid text\n" * 8192 + bytes([0xe2]))
+        self.assertEqual(self.pipeline.prepare_controller_cycle(self._controller_kill_switch())["status"], "empty")
+        self.assertEqual(len(list(self.watch_dir.glob("*.m4a"))), 4)
+        fresh = self._write_stable_source("independent.m4a", b"new audio")
+        self.assertEqual(self.pipeline.process_job(fresh)["status"], "completed")
+        for item in self.watch_dir.glob("*.m4a"):
+            self.assertEqual(self.pipeline.process_job(item)["status"], "completed")
+
+    def test_controller_cli_prepares_without_contacting_notification_providers_or_idle_info(self) -> None:
+        config_file = self.root / "prepare.yaml"
+        config_file.write_text(stt_main.yaml.safe_dump(self.config))
+        self.pipeline.staging_dir.mkdir(exist_ok=True)
+        (self.pipeline.staging_dir / "interrupted.m4a").write_bytes(b"staged")
+        logger = mock.Mock()
+        args = ["worker", "--config", str(config_file), "--prepare-controller-cycle", "--allow-write",
+                "--controller-kill-switch", str(self._controller_kill_switch())]
+        with mock.patch.object(stt_main.sys, "argv", args), mock.patch.object(
+            stt_main, "setup_logging", return_value=logger
+        ), mock.patch.object(stt_main, "build_notifier") as build, redirect_stdout(io.StringIO()):
+            stt_main.main()
+            logger.info.assert_not_called()
+            build.assert_not_called()
+            logger.reset_mock()
+            stt_main.main()
+            logger.info.assert_not_called()
+            logger.log.assert_not_called()
+            build.assert_not_called()
+
+    def test_controller_preparation_recovers_interrupted_move_without_new_input(self) -> None:
+        source = self._write_stable_source("recover-me.m4a", b"recording")
+        move = stt_main.utils.safe_move_file
+
+        def interrupt_after_move(src, dst):
+            move(src, dst)
+            if Path(dst).parent == self.audio_dir:
+                raise KeyboardInterrupt
+
+        with mock.patch.object(stt_main.utils, "safe_move_file", side_effect=interrupt_after_move):
+            with self.assertRaises(KeyboardInterrupt):
+                self.pipeline.process_job(source)
+        self.assertFalse(source.exists())
+        result = self.pipeline.prepare_controller_cycle(self._controller_kill_switch())
+        self.assertEqual(result["status"], "empty")
+        self.assertEqual(source.read_bytes(), b"recording")
+        self.assertEqual(self.pipeline.conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0], 0)
+        self.assertEqual(self.pipeline.process_job(source)["status"], "completed")
+
+    def test_recovery_preserves_replaced_canonical_file_for_review(self) -> None:
+        source = self._write_stable_source("replaced.m4a", b"first")
+        move = stt_main.utils.safe_move_file
+
+        def interrupt_after_move(src, dst):
+            move(src, dst)
+            if Path(dst).parent == self.audio_dir:
+                Path(dst).write_bytes(b"different audio")
+                raise KeyboardInterrupt
+
+        with mock.patch.object(stt_main.utils, "safe_move_file", side_effect=interrupt_after_move):
+            with self.assertRaises(KeyboardInterrupt):
+                self.pipeline.process_job(source)
+        self.pipeline.startup_recovery()
+        row = self.pipeline.conn.execute("SELECT status FROM jobs").fetchone()
+        self.assertEqual(row["status"], stt_main.STATUS_NEEDS_REVIEW)
+        self.assertFalse(source.exists())
+        self.assertEqual((self.audio_dir / source.name).read_bytes(), b"different audio")
+
+    def test_controller_quarantines_missing_retry_and_plans_following_job(self) -> None:
+        _, first_id, first_audio = self._plan_retry_after_transient_failure("first.m4a")
+        _, second_id, _ = self._plan_retry_after_transient_failure("second.m4a")
+        first_audio.unlink()
+        prepared = self.pipeline.prepare_controller_cycle(self._controller_kill_switch())
+        self.assertEqual(prepared["plan"]["retry_job"]["job_id"], second_id)
+        quarantined = stt_main.db.get_job(self.pipeline.conn, first_id)
+        self.assertEqual(quarantined["status"], stt_main.STATUS_NEEDS_REVIEW)
+        self.assertTrue(quarantined["error_message"])
+        result = self.pipeline.process_retry_job_plan(prepared["plan"], kill_switch_path=self._controller_kill_switch())
+        self.assertEqual(result["status"], "completed")
+
+    def test_once_observes_stability_and_pause_preserves_the_next_file(self) -> None:
+        first = self._write_stable_source("first.m4a", b"first")
+        second = self._write_stable_source("second.m4a", b"second")
+        with mock.patch.object(stt_main.utils, "now", side_effect=[100, 102]), mock.patch("time.sleep"):
+            self.pipeline.run(run_once=True)
+        self.assertFalse(first.exists())
+        self.assertTrue(second.exists())
+        stt_main.utils.set_paused(True, self.pipeline.config)
+        self.assertEqual(self.pipeline.process_job(second)["status"], "busy")
+        self.assertTrue(second.exists())
+
+    def test_pause_during_fresh_batch_defers_the_next_recording(self) -> None:
+        first = self._write_stable_source("first.m4a", b"first")
+        second = self._write_stable_source("second.m4a", b"second")
+        transcribe = self.pipeline.worker.transcribe_file
+        def pause_and_transcribe(*args, **kwargs):
+            stt_main.utils.set_paused(True, self.pipeline.config)
+            return transcribe(*args, **kwargs)
+
+        with mock.patch.object(self.pipeline.worker, "transcribe_file", side_effect=pause_and_transcribe), mock.patch.object(
+            self.pipeline.watcher, "scan_stable_files", return_value=[first, second]
+        ), mock.patch.object(stt_main.time, "sleep", side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
+            self.pipeline.run()
+        self.assertTrue(second.exists())
+        self.assertFalse(first.exists())
+        self.assertEqual(self.pipeline.conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0], 1)
+
+    def test_pause_during_first_retry_preserves_remaining_retry_rows(self) -> None:
+        _, first_id, _ = self._plan_retry_after_transient_failure("first.m4a")
+        _, second_id, _ = self._plan_retry_after_transient_failure("second.m4a")
+        real_transcribe = self.pipeline.worker.transcribe_file
+
+        def pause_and_transcribe(*args, **kwargs):
+            stt_main.utils.set_paused(True, self.pipeline.config)
+            return real_transcribe(*args, **kwargs)
+
+        with mock.patch.object(self.pipeline.worker, "transcribe_file", side_effect=pause_and_transcribe):
+            self.assertEqual(self.pipeline.process_retryable_jobs(), 1)
+        self.assertEqual(stt_main.db.get_job(self.pipeline.conn, first_id)["status"], stt_main.STATUS_DONE)
+        self.assertEqual(stt_main.db.get_job(self.pipeline.conn, second_id)["status"], stt_main.STATUS_PENDING)
+
+    def test_empty_transcript_requires_review_including_replay_and_recovery(self) -> None:
+        source = self._write_stable_source("silent.m4a", b"silent")
+        empty_output = ([], "", 0.1, 0.2, self.tmp_dir / "missing-duration.wav")
+        notifier = _RecordingNotifier()
+        self.pipeline.notifier = notifier
+        with mock.patch.object(self.pipeline.worker, "transcribe_file", return_value=empty_output):
+            result = self.pipeline.process_job(source)
+            duplicate = self._write_stable_source("duplicate.m4a", b"silent")
+            replay = self.pipeline.process_job(duplicate)
+        for outcome in (result, replay):
+            self.assertEqual(outcome["status"], "needs_review")
+            self.assertEqual(stt_main.db.get_job(self.pipeline.conn, outcome["job_id"])["status"], stt_main.STATUS_NEEDS_REVIEW)
+        self.assertEqual(notifier.successes, [])
+        self.assertEqual(len(notifier.reviews), 2)
+        stt_main.db.set_status(self.pipeline.conn, result["job_id"], stt_main.STATUS_PROCESSING)
+        self.assertEqual(stt_main.db.recover_processing_jobs(self.pipeline.conn)["needs_review"], 1)
+
+    def test_notification_channel_changes_only_at_the_next_job_boundary(self) -> None:
+        config_path = self.root / "config.yaml"
+        self.pipeline.config_path = str(config_path)
+        config_path.write_text(stt_main.yaml.safe_dump(self.config))
+        current = _RecordingNotifier()
+        next_channel = _RecordingNotifier()
+        self.pipeline.notifier = current
+        real_transcribe = self.pipeline.worker.transcribe_file
+
+        def change_channel(*args, **kwargs):
+            config_path.write_text("notification: {enabled: false, provider: noop}")
+            return real_transcribe(*args, **kwargs)
+
+        with mock.patch.object(self.pipeline.worker, "transcribe_file", side_effect=change_channel), mock.patch.object(
+            stt_main, "build_notifier", return_value=next_channel
+        ) as rebuild:
+            first = self.pipeline.process_job(self._write_stable_source("one.m4a", b"one"))
+            rebuild.assert_not_called()
+            self.assertEqual(current.successes[0]["job_id"], first["job_id"])
+            second = self.pipeline.process_job(self._write_stable_source("two.m4a", b"two"))
+            rebuild.assert_called_once()
+            self.assertEqual(next_channel.successes[0]["job_id"], second["job_id"])
+
+    def test_rotated_dotenv_credentials_apply_to_next_job_with_process_env_precedence(self) -> None:
+        config_path = self.root / "config.yaml"
+        config_path.write_text("notification: {enabled: true, provider: telegram}")
+        self.pipeline.config_path = str(config_path)
+        self.pipeline.notification_overrides = {"TELEGRAM_CHAT_ID": "from-process"}
+        local_env = self.root / ".env"
+        local_env.write_text("TELEGRAM_CHAT_ID=from-file\nTELEGRAM_BOT_TOKEN=sample-first\n")
+        channels = [_RecordingNotifier(), _RecordingNotifier()]
+        real_transcribe = self.pipeline.worker.transcribe_file
+
+        def rotate(*args, **kwargs):
+            local_env.write_text("TELEGRAM_CHAT_ID=from-file\nTELEGRAM_BOT_TOKEN=sample-second\n")
+            return real_transcribe(*args, **kwargs)
+
+        with mock.patch.object(stt_main, "env_file", return_value=local_env), mock.patch.object(
+            self.pipeline.worker, "transcribe_file", side_effect=rotate
+        ), mock.patch.object(stt_main, "build_notifier", side_effect=channels) as rebuild:
+            first = self.pipeline.process_job(self._write_stable_source("one.m4a", b"one"))
+            second = self.pipeline.process_job(self._write_stable_source("two.m4a", b"two"))
+            self.assertEqual([call.kwargs["env"]["TELEGRAM_BOT_TOKEN"] for call in rebuild.call_args_list],
+                             ["sample-first", "sample-second"])
+            self.assertTrue(all(call.kwargs["env"]["TELEGRAM_CHAT_ID"] == "from-process" for call in rebuild.call_args_list))
+            self.assertEqual(channels[0].successes[0]["job_id"], first["job_id"])
+            self.assertEqual(channels[1].successes[0]["job_id"], second["job_id"])
+            with mock.patch.object(stt_main, "runtime_env", side_effect=OSError("read error")):
+                third = self.pipeline.process_job(self._write_stable_source("three.m4a", b"three"))
+            self.assertEqual(channels[1].successes[-1]["job_id"], third["job_id"])
+            self.assertEqual(rebuild.call_count, 2)
 
     def test_startup_recovery_preserves_claim_when_staging_file_is_missing(self) -> None:
         staged_path = self.pipeline.staging_dir / "orphan.m4a"

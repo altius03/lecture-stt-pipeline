@@ -5,6 +5,7 @@ import inspect
 import logging
 import os
 import subprocess
+import tempfile
 import time
 import wave
 from dataclasses import dataclass
@@ -111,8 +112,14 @@ class STTWorker:
             raise FileNotFoundError(f"ffmpeg not found at {self.ffmpeg_path}")
 
         wav_path = self.tmp_dir / f"{canonical_base}.wav"
-        if wav_path.exists():
-            wav_path.unlink()
+        try:
+            # Keep the usual name for retention reporting, but never overwrite
+            # a pre-existing file (including a WAV source in a shared folder).
+            fd = os.open(wav_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            fd, unique_path = tempfile.mkstemp(dir=self.tmp_dir, prefix="stt-", suffix=".wav")
+            wav_path = Path(unique_path)
+        os.close(fd)
 
         cmd = [
             self.ffmpeg_path,
@@ -134,20 +141,24 @@ class STTWorker:
             str(wav_path),
         ]
         logger.info("Preprocessing audio %s -> %s", src_audio, wav_path)
-        result = subprocess.run(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=False,
-        )
-        if result.returncode != 0:
-            error_output = (result.stderr or "").strip()
-            if len(error_output) > 2000:
-                error_output = error_output[-2000:]
-            raise RuntimeError(
-                f"ffmpeg preprocessing failed (exit={result.returncode}): {error_output or 'unknown error'}"
+        try:
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
             )
+            if result.returncode != 0:
+                error_output = (result.stderr or "").strip()
+                if len(error_output) > 2000:
+                    error_output = error_output[-2000:]
+                raise RuntimeError(
+                    f"ffmpeg preprocessing failed (exit={result.returncode}): {error_output or 'unknown error'}"
+                )
+        except BaseException:
+            self.cleanup_tmp(wav_path)
+            raise
         return wav_path
 
     @staticmethod
@@ -256,7 +267,11 @@ class STTWorker:
         preprocess_sec = time.perf_counter() - preprocess_started
 
         transcribe_started = time.perf_counter()
-        segments, transcript_text = self.transcribe(wav_path, progress_callback=progress_callback)
+        try:
+            segments, transcript_text = self.transcribe(wav_path, progress_callback=progress_callback)
+        except BaseException:
+            self.cleanup_tmp(wav_path)
+            raise
         transcribe_sec = time.perf_counter() - transcribe_started
 
         return segments, transcript_text, preprocess_sec, transcribe_sec, wav_path

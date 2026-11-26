@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import time
 from typing import Dict, List
 
 from lecture_stt.shared import utils
@@ -22,6 +23,13 @@ class PollingWatcher:
         self.stable_for_sec = stable_for_sec
         self.polling_interval_sec = polling_interval_sec
         self._states: Dict[str, _FileState] = {}
+
+    def scan_once(self) -> List[Path]:
+        ready = self.scan_stable_files()
+        if ready or not self._states:
+            return ready
+        time.sleep(self.stable_for_sec)
+        return self.scan_stable_files()
 
     # 파일을 스캔해 완성으로 판단되는 항목만 정렬해 반환한다.
     def scan_stable_files(self) -> List[Path]:

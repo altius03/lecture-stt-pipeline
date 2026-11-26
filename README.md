@@ -48,7 +48,7 @@ CI: `.github/workflows/ci.yml`에서 Python unittest/compileall, Go 컨트롤러
 │   ├── run_distribute.sh             # downstream worker 상시 실행
 │   ├── distribute_once.sh            # downstream worker 1회 실행
 │   ├── distribute_status.sh          # downstream 상태 확인
-│   ├── cleanup.py                    # audio/transcript/tmp cleanup helper; 기본 dry-run
+│   ├── cleanup.py                    # 보존 기간을 넘긴 임시 WAV 정리. 기본 dry-run
 │   ├── import_storage_v2.py          # legacy read-only plan / 명시적 v2 copy importer
 │   └── rotate_logs.py                # launchd plain log rotation helper; 기본 dry-run
 ├── docs/

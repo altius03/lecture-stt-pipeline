@@ -45,7 +45,7 @@ class WebPanelRequestHandlerTests(unittest.TestCase):
         web_panel.STATE = self.prev_state
 
     def test_main_allows_loopback_and_configured_proxy_hosts(self) -> None:
-        server = mock.Mock(server_port=8765)
+        server = mock.Mock(server_port=8765, server_address=("127.0.0.1", 8765))
         server.serve_forever.side_effect = KeyboardInterrupt
         with mock.patch.object(web_panel, "ThreadingHTTPServer", return_value=server), mock.patch.object(
             web_panel, "ControlState"
@@ -146,7 +146,8 @@ class WebPanelRequestHandlerTests(unittest.TestCase):
         handler._api_error = mock.Mock()
         handler._write_json = mock.Mock()
         state = mock.Mock()
-        state.clear_history.return_value = False
+        handler._read_form_fields = mock.Mock(return_value={"digest": "a" * 64})
+        state.clear_history.return_value = (500, "이력 초기화 실패")
         state.notice = "이력 초기화 실패"
         web_panel.STATE = state
 
@@ -171,6 +172,69 @@ class WebPanelRequestHandlerTests(unittest.TestCase):
         handler._action_notification_update.assert_not_called()
         handler._api_error.assert_called_once_with(400, "Form request body is too large")
         self.assertEqual(handler.rfile.tell(), 0)
+
+    def test_control_failures_use_http_error_and_return_specific_notice(self) -> None:
+        handler = object.__new__(web_panel.RequestHandler)
+        handler._api_error = mock.Mock()
+        state = mock.Mock()
+        web_panel.STATE = state
+        for action in ("start", "stop", "pause", "resume"):
+            getattr(state, action).return_value = (409, "거부")
+            getattr(handler, "_action_" + action)()
+            handler._api_error.assert_called_with(409, "거부")
+
+    def test_shared_ingress_requires_authenticated_loopback_proxy_for_control(self) -> None:
+        handler = object.__new__(web_panel.RequestHandler)
+        handler.path = "/api/stop"
+        handler.headers = {"Host": "panel.example"}
+        handler.server = mock.Mock(allowed_hosts={"panel.example"}, loopback_listener=True,
+                                   shared_mode=True, control_token="operator-test")
+        handler.client_address = ("127.0.0.1", 3011)
+        handler._api_error = mock.Mock()
+        handler._action_stop = mock.Mock()
+        handler.do_POST()
+        handler._action_stop.assert_not_called()
+        self.assertEqual(handler._api_error.call_args.args[0], 403)
+        handler.headers["Authorization"] = "Bearer operator-test"
+        handler.do_POST()
+        handler._action_stop.assert_called_once()
+        handler._action_stop.reset_mock()
+        handler.client_address = ("192.0.2.1", 1234)
+        handler.do_POST()
+        handler._action_stop.assert_not_called()
+        handler.client_address = ("127.0.0.1", 3011)
+        handler.server.shared_mode = False
+        del handler.headers["Authorization"]
+        handler.do_POST()
+        handler._action_stop.assert_called_once()
+
+    def test_viewer_metadata_and_read_only_plans_match_authority(self) -> None:
+        handler = object.__new__(web_panel.RequestHandler)
+        handler.path = "/api/refresh"
+        handler.headers = {"Host": "panel.example"}
+        handler.server = mock.Mock(allowed_hosts={"panel.example"}, loopback_listener=True,
+                                   shared_mode=True, control_token="")
+        handler.client_address = ("127.0.0.1", 3011)
+        handler._write = mock.Mock()
+        handler.do_POST()
+        self.assertEqual(handler._write.call_args.args[0], 200)
+        state = mock.Mock()
+        state.snapshot.return_value = {"actions": {}}
+        web_panel.STATE = state
+        self.assertFalse(handler._client_snapshot()["actions"]["can_control"])
+        handler._write_json(200, {"capabilities": {"status_writes_enabled": True, "transcript_preview": True}})
+        self.assertEqual(json.loads(handler._write.call_args.args[1])["capabilities"],
+                         {"status_writes_enabled": False, "transcript_preview": True})
+
+    def test_state_get_does_not_read_logs(self) -> None:
+        handler = object.__new__(web_panel.RequestHandler)
+        handler.path = "/api/state"
+        handler._write_json = mock.Mock()
+        state = mock.Mock()
+        state.snapshot.return_value = {"actions": {}}
+        web_panel.STATE = state
+        handler.do_GET()
+        state.snapshot.assert_called_once_with(include_log=False)
 
     def test_api_post_rejects_cross_origin_request(self) -> None:
         handler = object.__new__(web_panel.RequestHandler)
@@ -1163,12 +1227,11 @@ class WebPanelRequestHandlerTests(unittest.TestCase):
         state = mock.Mock()
         state.notice = "저장됨"
         state.update_notification_selection.return_value = False
-        state.restart_worker_for_notification.side_effect = lambda: setattr(state, "notice", "적용됨")
         web_panel.STATE = state
 
         handler._action_notification_update("both", apply_now=True)
 
-        state.restart_worker_for_notification.assert_called_once_with()
+        state.restart_worker_for_notification.assert_not_called()
         payload = handler._write_json.call_args.args[1]
         self.assertTrue(payload["ok"])
         self.assertIn("디렉터리 동기화를 확인하지 못해", payload["notice"])
@@ -1471,7 +1534,7 @@ class WebPanelRequestHandlerTests(unittest.TestCase):
         state._log_stream_delta.assert_not_called()
         state.transcription_analytics.assert_not_called()
         self.assertNotIn("analytics", snapshot)
-        handler._write_sse_event.assert_called_once_with("state", snapshot)
+        handler._write_sse_event.assert_called_once_with("state", {**snapshot, "actions": {"can_control": True}})
         handler._write_sse_comment.assert_not_called()
 
     def test_timetable_list_detail_and_confirmation_routes(self) -> None:

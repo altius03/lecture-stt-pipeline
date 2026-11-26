@@ -412,8 +412,8 @@ flowchart LR
   `operational_install_supported=false`, `python_polling_authority=true`를
   고정한다. 이 모듈에는 subprocess, LaunchAgents/launchctl, 운영 DB/root,
   worker 제어 경로가 없다.
-- scheduled cleanup은 `tmp/`를 정리하되 `tmp/inbox_staging`은 보존해 복구 대기 중인 claimed input을 삭제하지 않는다.
-- scheduled cleanup은 DB의 미해결 `NEEDS_REVIEW` canonical stem을 먼저 읽어 해당 원본·전사·quality 세트를 보존한다. 이 보호 목록을 읽을 수 없으면 apply를 거부한다.
+- 예약 정리는 기본 dry-run이다. 수동 적용 시 STT 워커와 같은 잠금, SQLite 쓰기 트랜잭션 안에서 기간이 지난 임시 WAV만 정리한다. 정본 오디오 SHA-256, 작업 완료와 후처리 상태, 이름의 유일성을 확인한다.
+- 원음, 원전사 TXT·JSON, 품질 기록과 staging은 보존한다. DB가 없거나 워커가 가동 중이면 정리를 적용할 수 없다.
 - 설치된 scheduled cleanup은 인자 없는 기본 dry-run으로만 실행된다. 보존 기간 경과만으로는 “미사용”을 증명하지 못하므로 운영 apply 근거로 사용하지 않는다. Legacy 파일을 정리하려면 Storage v2와 archive-evidence verifier issue 0, active/problem/postprocess row 0, 각 파일의 single-link regular metadata와 SHA-256 보존 사본을 함께 확인해야 한다.
 - 2026-08-09에는 위 별도 검증으로 Storage v2에 exact copy가 있고 운영 파일 참조가 없는 과거 audio 41개, summary 97개와 disposable metadata 5개, 합계 143개만 iCloud 휴지통으로 이동했다. `DONE`/`NEEDS_REVIEW` job의 legacy transcript TXT/JSON 경로는 같은 SHA 입력의 dedupe replay가 직접 읽으므로 Storage v2 사본이 있어도 활성 의존성이다. 이 경로가 Storage v2 read로 전환되기 전에는 transcript와 같은 stem의 quality sidecar를 cleanup하지 않는다. 같은 bytes여도 실패 원위치나 historical filename provenance가 다른 자료도 중복으로 취급하지 않는다. Active v1 디렉터리는 새 입력·전사·Codex staging을 위해 그대로 유지하며, 검증 사본이 없는 transcript/correction/prompt/recovery/manual-review 자료는 보존한다.
 
@@ -438,8 +438,8 @@ flowchart LR
 - 웹 패널의 시각 시스템은 루트 `DESIGN.md`와 `frontend/web-panel/tokens.css`를 정본으로 사용한다. 모든 화면은 같은 Pretendard/telemetry-mono 역할, cool cobalt light/dark palette, 4px spacing scale, focus/motion token을 공유하며 화면별 CSS에서 별도 palette나 font를 만들지 않는다.
 - 운영 shell은 장식적 번호 index가 아니라 hash route와 실제 대기 건수를 표시하는 command rail, 현재 화면·런타임·갱신·연결 상태를 묶은 상단 runtime strip, 화면별 workbench로 구성한다. 이 구조는 기존 API/DTO, TanStack Query, SSE/polling, guarded mutation 계약과 독립인 표시 계층이다.
 - panel state 조회와 action 이후 refetch/invalidation은 TanStack Query가 담당한다.
-- 상단 알림 토글은 `.env` secret 존재 여부를 기준으로 선택 가능한 알림 채널만 순환 표시하고, 선택 시 `/api/notification`으로 `config.yaml`을 갱신한다.
-- 실행 중 워커가 있으면 알림 채널 저장 요청이 같은 API 호출 안에서 워커 재시작까지 이어져 즉시 반영된다.
+- 운영자는 패널에서 알림 채널을 직접 선택한다. 설정 저장 후 워커는 다음 작업을 선점할 때 바뀐 채널을 읽으며 현재 전사를 계속한다.
+- Python 워커 제어는 같은 사용자, 실행 경로, 설정 및 프로세스 신원을 확인한다. 이력 정리는 대상 완료 행의 건수와 지문을 확인한 뒤 적용하며 오류 복구 행과 활동 로그를 보존한다.
 - 실시간 갱신은 `GET /api/events` SSE를 우선 사용하며, 서버는 `state`, `log_chunk`, `log_reset` 이벤트를 스트리밍한다.
 - 클라이언트는 SSE가 연결되어 있는 동안 polling을 멈추고, 스트림이 실패하거나 브라우저가 `EventSource`를 지원하지 않으면 기존 `/api/state`, `/api/logs` polling으로 fallback 한다.
 - `/api/events`의 bare 요청은 기존처럼 state+logs를 함께 제공한다. 화면별 절전 경계에서는 `?streams=state`를 사용하며, 이 연결은 서버에서 `_log_stream_delta()`를 호출하지 않는다. `streams`는 `state`, `logs` 또는 둘의 쉼표 조합만 허용하고 빈 값·중복·알 수 없는 값은 400으로 거부한다.
@@ -511,7 +511,7 @@ flowchart LR
 - `scripts/distribute_status.sh`: postprocess 상태 CLI 래퍼
 - `scripts/benchmark_models.py`: baseline/current model과 승인된 후보 STT 모델을 비교하는 benchmark CLI 초안
 - `scripts/setup_launchd.sh`: venv, 의존성, 모델, 폴더, launchd를 한 번에 설정
-- `scripts/cleanup.py`: 오래된 audio/transcript/tmp 정리. 중첩 transcript는 상대 parent+stem 단위로 묶어 서로 다른 과목의 동명 stem을 합치지 않는다.
+- `scripts/cleanup.py`는 완료한 작업의 임시 WAV를 확인하고 수동 적용 시 정리한다.
 - `python -m lecture_stt.downstream.semester`: 학기 manifest plan/apply activation CLI
 - `launchd/com.geonha.lecture-stt.plist`: 메인 워커 상시 실행
 - `launchd/com.geonha.lecture-stt-webpanel.plist`: 웹 제어판 상시 실행
@@ -590,7 +590,7 @@ flowchart LR
 - iCloud 이벤트는 controller가 소유하는 bounded polling + Python canonical
   안정화 창 + 기존 로컬 staging 흐름이 정본이다. 향후 파일 이벤트는 즉시
   깨우는 힌트로만 사용하고 주기적 reconcile을 유지한다.
-- 웹 패널 백엔드는 localhost bind를 기본으로 한다. GET/POST는 로컬 Host(`127.0.0.1`·`localhost`와 서버 포트) 또는 `.env`의 쉼표 구분 `WEB_PANEL_ALLOWED_HOSTS`에 명시한 Host만 받는다. Tailscale Serve가 외부 Host를 보존한다면 재개 전에 해당 도메인을 허용 목록에 추가해야 한다. POST는 `Origin`과 `Sec-Fetch-Site`도 검사한다. 애플리케이션 자체의 사용자별 인증은 없으므로 허용된 tailnet 접속자는 preview opt-in이 켜진 동안 전사 본문을 읽을 수 있다. 공개 인터넷 노출 전에는 identity 검증과 mutating API audit가 필요하다.
+- 웹 패널은 기본 loopback에서 Host와 브라우저 출처를 확인한다. 공유 호스트 허용, 운영자 토큰 설정, 외부 인터페이스 바인딩 중 하나라도 해당하면 공유 모드가 된다. 공유 모드의 변경 요청은 loopback 리스너에서 인증 프록시가 제시한 운영자 토큰을 확인한 경우에만 허용한다. 운영자와 읽기 전용 사용자의 전사 미리보기 접근은 기존 opt-in 설정을 따른다. [공유 운영 설정](OPERATIONS.md#웹-패널을-공유할-때)
 
 ## 테스트 범위
 - 현재 자동 테스트는 STT pipeline, 학기 activation/direct transcript delivery, legacy archive compatibility, web panel state/backend, script entrypoints, cleanup/log retention을 함께 검증한다.

@@ -1434,77 +1434,27 @@ button:disabled {
 }
 
 .panel-command-bar,
-.hero-actions,
-.notification-inline-controls {
+.hero-actions {
   display: flex;
   align-items: center;
   justify-content: flex-end;
   gap: 8px;
 }
 
-.notification-chip,
-.notification-apply-chip {
+.notification-channel {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.notification-channel select {
   min-height: 44px;
-  padding: 0.58rem 0.76rem;
+  font: inherit;
+  padding: 0 8px;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
   border-radius: 6px;
-}
-
-.notification-chip {
-  min-width: 46px;
-}
-
-.notification-chip-icons {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.notification-chip-icons.dual {
-  gap: 4px;
-}
-
-.notification-brand,
-.notification-chip-fallback {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 18px;
-  height: 18px;
-  color: var(--muted-strong);
-}
-
-.notification-brand svg {
-  width: 18px;
-  height: 18px;
-}
-
-.notification-brand.disabled,
-.notification-chip-fallback {
-  color: var(--muted);
-}
-
-.notification-chip-fallback,
-.notification-chip-status {
-  font-size: 0.94rem;
-  font-weight: 800;
-  line-height: 1;
-}
-
-.notification-chip-sr {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  padding: 0;
-  margin: -1px;
-  overflow: hidden;
-  clip: rect(0, 0, 0, 0);
-  white-space: nowrap;
-  border: 0;
-}
-
-.notification-chip.is-attention {
-  border-color: var(--border-strong);
-  background: var(--surface-strong);
 }
 
 .theme-switch {

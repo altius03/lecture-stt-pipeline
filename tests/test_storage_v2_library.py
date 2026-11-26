@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import sqlite3
 import tempfile
 import unicodedata
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import sys
@@ -13,6 +15,7 @@ SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
+from lecture_stt.storage_v2 import library
 from lecture_stt.storage_v2.library import (
     RecordingLibraryConflictError,
     RecordingLibraryNotFoundError,
@@ -35,6 +38,50 @@ class StorageV2LibraryTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.conn.close()
         self.temp_dir.cleanup()
+
+    def test_list_reads_counts_and_page_from_one_snapshot(self) -> None:
+        reader = library._open_readonly(self.db_path)
+        inserted = False
+
+        def insert_before_page(query: str) -> None:
+            nonlocal inserted
+            if "WITH current_jobs AS" in query:
+                self._insert_recording("rec-demo-001")
+                self.conn.commit()
+                inserted = True
+
+        reader.set_trace_callback(insert_before_page)
+        with mock.patch.object(library, "_open_readonly", return_value=reader):
+            result = list_recordings(self.db_path)
+        self.assertTrue(inserted)
+        self.assertEqual((result["total"], result["summaries"]), (0, []))
+        self.assertEqual(list_recordings(self.db_path)["total"], 1)
+
+    def test_detail_snapshot_excludes_a_review_committed_between_queries(self) -> None:
+        recording_id = self._insert_recording("snapshot")
+        self.conn.commit()
+        reader = library._open_readonly(self.db_path)
+
+        def review_before_rows(query: str) -> None:
+            if "FROM review_items AS review" in query:
+                self._insert_review(recording_id)
+                self.conn.commit()
+
+        reader.set_trace_callback(review_before_rows)
+        with mock.patch.object(library, "_open_readonly", return_value=reader):
+            payload = read_recording_detail(self.db_path, "snapshot")
+        self.assertEqual((payload["counts"]["reviews"], payload["reviews"]), (0, []))
+        self.assertEqual(read_recording_detail(self.db_path, "snapshot")["counts"]["reviews"], 1)
+
+    def test_failed_detail_closes_its_snapshot(self) -> None:
+        reader = library._open_readonly(self.db_path)
+        with (
+            mock.patch.object(library, "_open_readonly", return_value=reader),
+            self.assertRaises(RecordingLibraryNotFoundError),
+        ):
+            read_recording_detail(self.db_path, "missing")
+        with self.assertRaises(sqlite3.ProgrammingError):
+            reader.execute("SELECT 1")
 
     def _insert_recording(
         self,

@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack, closing
 from datetime import datetime
+import fcntl
 from pathlib import Path
-import shutil
 import sqlite3
 import sys
+import unicodedata
 
 import yaml
 from dotenv import load_dotenv
@@ -17,7 +19,8 @@ SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from lecture_stt.shared.paths import env_file, resolve_config_path
+from lecture_stt.shared.paths import default_tmp_dir, env_file, resolve_config_path
+from lecture_stt.shared.utils import compute_sha256
 
 
 def _load_config(config_path: str = str(REPO_ROOT / "config" / "config.yaml")) -> dict:
@@ -33,196 +36,79 @@ def _ensure_config_defaults(config: dict) -> dict:
     # 누락 값은 기본값으로 채워 정리 작업이 중단되지 않게 한다.
     defaults = {
         "paths": {
-            "tmp_dir": str(REPO_ROOT / "tmp"),
+            "tmp_dir": str(default_tmp_dir()),
             "db_path": str(REPO_ROOT / "state" / "jobs.sqlite3"),
         },
         "cleanup": {
             "retain_days": 7,
-            "retain_min_transcripts": 5,
         },
     }
 
-    merged = defaults.copy()
+    merged = dict(config)
     for section, values in defaults.items():
         merged[section] = {**values, **(config.get(section, {}) or {})}
     return merged
 
 
-def _assert_under_base(candidate: Path, base: Path) -> None:
-    # 삭제 대상이 루트 디렉터리 밖이면 즉시 중단한다.
-    candidate = candidate.resolve()
-    base = base.resolve()
-    if not candidate.is_relative_to(base):
-        raise ValueError(f"Refusing to delete outside base directory: {candidate} not under {base}")
-
-
-def _delete_path(path: Path, dry_run: bool) -> bool:
-    # dry-run이면 실제 삭제 없이 대상만 출력한다.
-    if dry_run:
-        print(f"[dry-run] would remove: {path}")
-        return False
-    if path.is_file():
-        path.unlink()
-        return True
-    if path.is_dir():
-        shutil.rmtree(path)
-        return True
-    return False
-
-
-def _cleanup_audio(
-    audio_dir: Path,
-    cutoff_ts: float,
-    dry_run: bool,
-    protected_stems: set[str] | None = None,
-) -> tuple[int, int]:
-    # 컷오프 이전의 오디오 파일만 제거한다.
-    if not audio_dir.exists():
-        print(f"audio folder missing: {audio_dir}")
-        return 0, 0
-
-    if not audio_dir.is_dir():
-        raise ValueError(f"Audio path is not a directory: {audio_dir}")
-
-    deleted = 0
-    kept = 0
-    protected = protected_stems or set()
-    for item in audio_dir.iterdir():
-        _assert_under_base(item, audio_dir)
-        if not item.is_file():
-            continue
-        if item.stem in protected:
-            kept += 1
-            continue
-        if item.stat().st_mtime < cutoff_ts:
-            if _delete_path(item, dry_run):
-                deleted += 1
-        else:
-            kept += 1
-
-    return deleted, kept
-
-
-def _is_quality_scorecard(path: Path) -> bool:
-    return path.name.endswith(".quality.json")
-
-
-def _is_primary_transcript_artifact(path: Path) -> bool:
-    return not _is_quality_scorecard(path) and path.suffix in {".txt", ".json"}
-
-
-def _transcript_artifact_stem(path: Path) -> str:
-    # 품질 scorecard는 <stem>.quality.json 형식이라 Path.stem만 쓰면 stem이 달라진다.
-    if _is_quality_scorecard(path):
-        return path.name[: -len(".quality.json")]
-    return path.stem
-
-
-def _cleanup_transcripts(
-    transcript_dir: Path,
-    cutoff_ts: float,
-    dry_run: bool,
-    min_keep: int,
-    protected_stems: set[str] | None = None,
-) -> tuple[int, int]:
-    # 유지할 최소 전사 세트 수를 제외하고 오래된 트랜스크립트 세트(txt/json/quality)를 정리한다.
-    if not transcript_dir.exists():
-        return 0, 0
-    if not transcript_dir.is_dir():
-        raise ValueError(f"Transcript path is not a directory: {transcript_dir}")
-
-    # New lecture outputs are stored below
-    # <semester>/<course_dir>/ while historical artifacts may still be direct
-    # children.  Keep the relative parent in the grouping key so identical
-    # stems in different courses never share one cleanup decision.
-    grouped: dict[tuple[Path, str], list[Path]] = {}
-    for entry in transcript_dir.rglob("*"):
-        if entry.is_symlink():
-            raise ValueError(f"Refusing to inspect symlinked transcript path: {entry}")
-        if not entry.is_file():
-            continue
-        _assert_under_base(entry, transcript_dir)
-        relative_parent = entry.parent.relative_to(transcript_dir)
-        key = (relative_parent, _transcript_artifact_stem(entry))
-        grouped.setdefault(key, []).append(entry)
-
-    groups = sorted(
-        grouped.values(),
-        key=lambda group: max(item.stat().st_mtime for item in group),
-        reverse=True,
+def _retired_wavs(
+    conn: sqlite3.Connection, delivery_enabled: bool
+) -> dict[str, tuple[str, Path, str]]:
+    """Return inactive temp WAV names with their canonical source and digest."""
+    tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    conditions = ["j.status = 'DONE'"]
+    for table in ("transcript_postprocess_jobs", "transcript_deliveries"):
+        if table in tables:
+            conditions.append(
+                f"NOT EXISTS (SELECT 1 FROM {table} d WHERE d.source_job_id=j.id "
+                "AND d.status IS NOT 'DELIVERED')"
+            )
+    if "deliveries" in tables:
+        conditions.append(
+            "NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.source_job_id=j.id AND d.completed_at IS NULL)"
+        )
+    if delivery_enabled:
+        if "transcript_postprocess_jobs" not in tables:
+            return {}
+        conditions.append("EXISTS (SELECT 1 FROM transcript_postprocess_jobs d WHERE d.source_job_id=j.id)")
+    rows = conn.execute(
+        "SELECT canonical_base, canonical_audio_path, sha256, "
+        + " AND ".join(conditions) + " FROM jobs j"
     )
-    primary_groups = [
-        group for group in groups if any(_is_primary_transcript_artifact(item) for item in group)
-    ]
-    keep_groups = primary_groups[:min_keep] if min_keep > 0 else []
-    keep_paths = {item for group in keep_groups for item in group}
-
-    deleted = 0
-    kept = len(keep_paths)
-    protected = protected_stems or set()
-    for group in groups:
-        group_stem = _transcript_artifact_stem(group[0])
-        if group_stem in protected:
-            kept += sum(1 for item in group if item not in keep_paths)
+    candidates: dict[str, tuple[str, Path, str]] = {}
+    seen: set[str] = set()
+    for stem, audio, digest, retired in rows:
+        if not stem or Path(stem).name != stem:
             continue
-        group_mtime = max(item.stat().st_mtime for item in group)
-        for item in group:
-            if item in keep_paths:
-                continue
-            if group_mtime < cutoff_ts:
-                if _delete_path(item, dry_run):
-                    deleted += 1
-                continue
-            kept += 1
-
-    return deleted, kept
+        name = unicodedata.normalize("NFC", f"{stem}.wav").casefold()
+        if name in seen:
+            candidates.pop(name, None)
+        elif retired and audio and digest:
+            candidates[name] = (f"{stem}.wav", Path(audio), digest)
+        seen.add(name)
+    return candidates
 
 
-def _needs_review_stems(db_path: Path) -> set[str]:
-    """Return immutable cleanup exclusions for unresolved review jobs."""
-    if not db_path.exists():
-        return set()
-    try:
-        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=3.0) as conn:
-            rows = conn.execute(
-                "SELECT canonical_base FROM jobs "
-                "WHERE status = 'NEEDS_REVIEW' AND canonical_base IS NOT NULL"
-            ).fetchall()
-    except sqlite3.Error as exc:
-        raise RuntimeError(
-            f"Refusing cleanup because NEEDS_REVIEW exclusions could not be loaded: {db_path}"
-        ) from exc
-    return {
-        str(row[0]).strip()
-        for row in rows
-        if row and isinstance(row[0], str) and str(row[0]).strip()
-    }
-
-
-def _cleanup_tmp(tmp_dir: Path, dry_run: bool) -> int:
-    # 임시 파일/폴더 잔여물을 정리한다.
-    if not tmp_dir.exists():
-        return 0
-    if not tmp_dir.is_dir():
-        raise ValueError(f"Tmp path is not a directory: {tmp_dir}")
-
+def _cleanup_tmp(tmp_dir: Path, audio_dir: Path, candidates: dict[str, tuple[str, Path, str]],
+                 cutoff_ts: float, dry_run: bool) -> int:
     deleted = 0
-    preserved_dirs = {"inbox_staging"}
-    for item in tmp_dir.iterdir():
-        _assert_under_base(item, tmp_dir)
-        if item.is_file() and _delete_path(item, dry_run):
+    for item in tmp_dir.glob("*.wav"):
+        name = unicodedata.normalize("NFC", item.name).casefold()
+        if name not in candidates or item.is_symlink() or not item.is_file():
+            continue
+        if item.stat().st_mtime >= cutoff_ts:
+            continue
+        expected_name, source, digest = candidates[name]
+        expected = tmp_dir / expected_name
+        if not expected.exists() or not item.samefile(expected):
+            continue
+        if (source.is_symlink() or not source.is_file() or source.parent.resolve() != audio_dir.resolve()
+                or source.samefile(item) or compute_sha256(source) != digest):
+            continue
+        if dry_run:
+            print(f"[dry-run] would remove: {item}")
+        else:
+            item.unlink()
             deleted += 1
-        elif item.is_dir():
-            if item.name in preserved_dirs:
-                print(f"preserved tmp directory: {item}")
-                continue
-            if not dry_run:
-                shutil.rmtree(item)
-                print(f"removed directory: {item}")
-                deleted += 1
-            else:
-                print(f"[dry-run] would remove directory: {item}")
-
     return deleted
 
 
@@ -234,19 +120,19 @@ def main() -> None:
         default=str(REPO_ROOT / "config" / "config.yaml"),
         help="Path to config.yaml",
     )
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--dry-run",
         action="store_true",
-        default=True,
         help=(
             "Preview deletions without removing anything. "
             "Use --apply to perform deletions."
         ),
     )
-    parser.add_argument("--apply", action="store_true", help="Perform cleanup instead of dry-run")
+    mode.add_argument("--apply", action="store_true", help="Perform cleanup instead of dry-run")
     args = parser.parse_args()
 
-    dry_run = args.dry_run and not args.apply
+    dry_run = not args.apply
 
     load_dotenv(str(env_file(REPO_ROOT)), override=False)
     cfg = _ensure_config_defaults(_load_config(args.config))
@@ -262,33 +148,38 @@ def main() -> None:
     tmp_dir = resolve_config_path(str(paths_cfg["tmp_dir"]), base_dir=REPO_ROOT)
     db_path = resolve_config_path(str(paths_cfg["db_path"]), base_dir=REPO_ROOT)
     retain_days = int(cfg["cleanup"]["retain_days"])
-    min_transcripts = int(cfg.get("cleanup", {}).get("retain_min_transcripts", 5))
-    protected_stems = _needs_review_stems(db_path)
+    for protected in (audio_dir, transcript_dir):
+        if tmp_dir.resolve().is_relative_to(protected.resolve()) or protected.resolve().is_relative_to(tmp_dir.resolve()):
+            parser.error("tmp_dir must be separate from the audio and transcript roots")
+    if retain_days < 0:
+        parser.error("retention settings must be non-negative")
+    print(f"dry_run={dry_run}")
+    if not db_path.is_file():
+        if dry_run:
+            print("No jobs database; retaining all files.")
+            return
+        parser.exit(1, "Cannot apply cleanup without the jobs database.\n")
 
     cutoff_ts = datetime.now().timestamp() - (retain_days * 24 * 3600)
-
-    print(f"dry_run={dry_run}")
-    print(f"protected review sets={len(protected_stems)}")
-    removed_audio, kept_audio = _cleanup_audio(
-        audio_dir,
-        cutoff_ts,
-        dry_run,
-        protected_stems=protected_stems,
-    )
-    removed_tmp = _cleanup_tmp(tmp_dir, dry_run)
-    removed_transcript, kept_transcript = _cleanup_transcripts(
-        transcript_dir,
-        cutoff_ts,
-        dry_run,
-        min_keep=min_transcripts,
-        protected_stems=protected_stems,
-    )
-
-    print(
-        f"audio removed={removed_audio}, kept={kept_audio}, "
-        f"tmp removed={removed_tmp}, transcript files removed={removed_transcript}, "
-        f"transcript files kept(min_sets={min_transcripts})={kept_transcript}",
-    )
+    with ExitStack() as stack:
+        if not dry_run:
+            # All STT owners take this lock before moving or processing a recording.
+            lock = stack.enter_context((db_path.parent / "stt.lock").open("a+"))
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                parser.exit(1, "Cleanup deferred: the STT worker is active.\n")
+        access = "ro" if dry_run else "rw"
+        conn = stack.enter_context(closing(sqlite3.connect(
+            f"{db_path.resolve().as_uri()}?mode={access}", uri=True, timeout=3
+        )))
+        # Keep downstream queue transitions and cleanup decisions in one snapshot.
+        conn.execute("BEGIN" if dry_run else "BEGIN IMMEDIATE")
+        delivery = (cfg.get("transcript_delivery") or {}).get("enabled", False)
+        enabled = str(delivery).strip().lower() not in {"false", "0", "no", "off"}
+        candidates = _retired_wavs(conn, enabled)
+        removed_tmp = _cleanup_tmp(tmp_dir, audio_dir, candidates, cutoff_ts, dry_run)
+    print(f"tmp removed={removed_tmp}. Canonical audio and transcript sets are retained.")
 
 
 if __name__ == "__main__":

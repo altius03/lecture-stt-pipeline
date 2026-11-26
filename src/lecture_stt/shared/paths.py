@@ -63,7 +63,7 @@ def runtime_env(
         for key, value in loaded.items():
             if key and value is not None:
                 env[key] = str(value)
-    for key, value in (base or os.environ).items():
+    for key, value in (base if base is not None else os.environ).items():
         env[key] = value
     return env
 

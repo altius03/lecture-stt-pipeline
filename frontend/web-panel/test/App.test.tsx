@@ -211,6 +211,16 @@ describe("App", () => {
     expect(scope.getByText("4")).toBeTruthy()
   })
 
+  it("explains how to request control when opening a read-only connection", () => {
+    const hookState = usePanelStateMock()
+    const state = createState()
+    state.actions.can_control = false
+    usePanelStateMock.mockReturnValue({ ...hookState, state })
+    setHash("processing")
+    render(<App />)
+    expect(screen.getByText(/이 접속은 읽기 전용입니다/)).toBeTruthy()
+  })
+
   it("keeps logs disabled on home and mounts only the home analytics panel", () => {
     setHash("home")
     render(<App />)

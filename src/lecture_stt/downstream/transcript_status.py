@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import sqlite3
+import sys
+from contextlib import closing
 from pathlib import Path
 from typing import Sequence
 
@@ -9,6 +11,8 @@ import yaml
 
 from lecture_stt.shared.paths import env_file, repo_root, resolve_config_path, runtime_env
 from lecture_stt.downstream.semester import inspect_unqueued_done_since, load_active_semester
+from lecture_stt.downstream.transcript_delivery import TranscriptDeliveryError, requeue_confirmed_job
+from lecture_stt.downstream.worker import load_transcript_worker_config
 
 
 PROBLEM_STATUSES = {"UNROUTED", "CONFLICT", "NEEDS_REVIEW", "ERROR"}
@@ -31,6 +35,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     show = subparsers.add_parser("show", help="Show one transcript postprocess row")
     show.add_argument("source_job_id", type=int)
+    requeue = subparsers.add_parser("requeue", help="확인한 원전사 한 건을 지정한 과목의 후처리 대기열에 넣습니다.")
+    requeue.add_argument("source_job_id", type=int)
+    requeue.add_argument("--course-code", required=True)
+    requeue.add_argument("--source-txt-sha256", required=True)
+    requeue.add_argument("--source-json-sha256", required=True)
     return parser.parse_args(argv)
 
 
@@ -224,6 +233,31 @@ def show_row(conn: sqlite3.Connection, source_job_id: int) -> int:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.command == "requeue":
+        try:
+            config = load_transcript_worker_config(args.config)
+            if not config.enabled or config.postprocess_settings is None:
+                raise TranscriptDeliveryError("후처리 설정을 활성화한 뒤 재등록하세요.")
+            if args.db_path and Path(args.db_path).expanduser().resolve() != config.db_path.resolve():
+                raise TranscriptDeliveryError("재등록에는 설정에 지정된 작업 DB를 사용하세요.")
+            if args.active_path and Path(args.active_path).expanduser().resolve() != config.active_semester_path.resolve():
+                raise TranscriptDeliveryError("재등록에는 설정에 지정된 활성 학기를 사용하세요.")
+            uri = config.db_path.absolute().as_uri() + "?mode=rw"
+            with closing(sqlite3.connect(uri, uri=True)) as conn:
+                conn.row_factory = sqlite3.Row
+                status = requeue_confirmed_job(
+                    conn,
+                    source_job_id=args.source_job_id,
+                    course_code=args.course_code,
+                    source_txt_sha256=args.source_txt_sha256,
+                    source_json_sha256=args.source_json_sha256,
+                    settings=config.postprocess_settings,
+                )
+            print(f"job {args.source_job_id} {args.course_code} {status}")
+            return 0
+        except (OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
+            print(f"재등록 실패: {exc}", file=sys.stderr)
+            return 1
     db_path = resolve_db_path(args)
     with connect_read_only(db_path) as conn:
         if not _table_exists(conn):

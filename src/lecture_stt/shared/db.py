@@ -849,6 +849,15 @@ def get_status_counts(conn: sqlite3.Connection) -> dict[str, int]:
     return counts
 
 
+def _transcript_contains_text(path: Path) -> bool:
+    has_text = False
+    with path.open(encoding="utf-8") as handle:
+        for chunk in iter(lambda: handle.read(64 * 1024), ""):
+            if not has_text and chunk.strip():
+                has_text = True
+    return has_text
+
+
 # txt/json 결과가 둘 다 존재하고 세그먼트 배열이 있으면 완료된 결과로 본다.
 def _has_complete_transcripts(txt_path: str | None, json_path: str | None) -> bool:
     if not txt_path or not json_path:
@@ -856,13 +865,14 @@ def _has_complete_transcripts(txt_path: str | None, json_path: str | None) -> bo
 
     txt_file = Path(txt_path)
     json_file = Path(json_path)
-    if not txt_file.exists() or not json_file.exists():
+    if not txt_file.is_file() or not json_file.is_file():
         return False
 
     try:
+        _transcript_contains_text(txt_file)
         with json_file.open("r", encoding="utf-8") as handle:
             payload = json.load(handle)
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeError, json.JSONDecodeError):
         return False
 
     if not isinstance(payload, dict):
@@ -932,21 +942,31 @@ def _validate_recovered_quality_scorecard(
     return None
 
 
-def _completed_transcript_quality(json_path: str | None) -> tuple[str | None, str | None, str | None]:
+def _completed_transcript_quality(json_path: str | None, txt_path: str) -> tuple[str | None, str | None, str | None]:
     """Read the persisted quality verdict used during interrupted-job recovery."""
     if not json_path:
         return None, None, None
     try:
         with Path(json_path).open("r", encoding="utf-8") as handle:
             payload = json.load(handle)
-    except (OSError, json.JSONDecodeError):
-        return None, None, None
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None, None, "복구된 전사 JSON을 읽을 수 없음"
     if not isinstance(payload, dict):
-        return None, None, None
+        return None, None, "복구된 전사 JSON 형식 확인 필요"
     metadata = payload.get("metadata")
     if not isinstance(metadata, dict):
-        return None, None, None
+        metadata = {}
     scorecard_error = _validate_recovered_quality_scorecard(json_path, metadata)
+    try:
+        has_text = _transcript_contains_text(Path(txt_path))
+    except (OSError, UnicodeError):
+        return None, None, "복구된 전사 TXT를 읽을 수 없음"
+    segments = payload.get("segments")
+    if not has_text or not isinstance(segments, list) or not any(
+        isinstance(segment, dict) and str(segment.get("text") or "").strip()
+        for segment in segments
+    ):
+        return "bad", "인식된 발화 없음", scorecard_error
     quality = metadata.get("quality")
     if not isinstance(quality, dict):
         return None, None, scorecard_error
@@ -976,7 +996,7 @@ def recover_processing_jobs(conn: sqlite3.Connection, stale_processing_hours: in
         # 오래된 상태인지는 메타 데이터로만 기록해 추적한다.
         transcript_ready = _has_complete_transcripts(txt, json_path)
         if transcript_ready:
-            quality_health, quality_summary, scorecard_error = _completed_transcript_quality(json_path)
+            quality_health, quality_summary, scorecard_error = _completed_transcript_quality(json_path, txt)
             if scorecard_error:
                 set_status(
                     conn,

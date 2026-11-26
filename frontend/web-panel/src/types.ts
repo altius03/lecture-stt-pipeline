@@ -75,6 +75,7 @@ export interface PanelEndpoints {
 }
 
 export interface ActionSummary {
+  can_control?: boolean
   pause_action: "pause" | "resume"
   pause_label: string
   endpoints: PanelEndpoints
