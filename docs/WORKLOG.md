@@ -5,6 +5,8 @@
 
 ## 2026-11-27
 
+- [이슈 #7](https://github.com/altius03/lecture-stt-pipeline/issues/7) · [시스템·운영 이력 인수인계](work-log/007-system-handoff.md)
+
 - [이슈 #4](https://github.com/altius03/lecture-stt-pipeline/issues/4) · [이슈별 작업 기록과 PR 검증 절차](work-log/004-issue-pr-workflow.md) · [main PR #5](https://github.com/altius03/lecture-stt-pipeline/pull/5) · [dev PR #6](https://github.com/altius03/lecture-stt-pipeline/pull/6)
 
 ## 2026-09-28
@@ -91,32 +93,6 @@
   26개 pair는 최초 311-file inventory에도 없던 선행 결손이며 이번 정리가 새로
   만든 누락은 0개다.
 
-### 전역 Hermes runtime 영구 폐기
-- 사용자 launchd domain에서 실행 중이던 `ai.hermes.webui`,
-  `ai.hermes.gateway-club-bot`, `ai.hermes.gateway`와 재시도 대기 중이던
-  `ai.hermes.dashboard.remote`를 bootout했다. 메인 gateway의 자식
-  `ouroboros mcp serve`를 포함해 관련 프로세스가 모두 종료된 뒤 자동 시작
-  plist를 활성 경로에서 제거했다.
-- 전용 `~/.hermes` 9.6GB, `DEV/hermes-webui` 117MB clone,
-  `~/.local/bin/{hermes,club-bot,node,npm,npx}`, lock state와 Hermes app
-  support/cache/WebKit/preferences/recent-document 상태를 macOS 휴지통으로
-  이동했다. 직접 삭제 명령은 실행 환경의 안전 정책상 사용하지 않았으며,
-  휴지통을 비우기 전에는 복구할 수 있지만 기존 경로에서는 실행되지 않는다.
-- `.zshrc`와 `.zprofile`에서 Hermes가 추가한 중복 PATH block만 제거했다.
-  새 login shell에서 `hermes`/`club-bot`은 해석되지 않고 `node`, `npm`,
-  `npx`는 `/opt/homebrew/bin`으로 해석된다. 후처리 설정이 고정한
-  `/Users/geonha/.local/bin/codex`도 계속 실행 가능하며 `codex-cli 0.146.1`을
-  확인했다.
-- 비활성 혼합 사용자 자료인 `/Users/geonha/DEV/hermes-lab` 18GB,
-  lecture_stt의 과거 폐기 report/worklog와 Tirith 감사 로그는 실행 경로가
-  아니므로 보존했다. STT 원본, 교정·요약, 시간표, Obsidian vault, 운영 DB와
-  lecture_stt LaunchAgent는 제거 범위에 포함하지 않았다.
-- 후속 확인에서 네 `ai.hermes.*` launchd label과 Hermes/Ouroboros 프로세스,
-  모든 확인 대상 활성 경로가 부재했다. lecture_stt downstream은 계속
-  running이며 status는 2026-2 7과목, active/problem/pending/unqueued/invalid
-  전부 0인 `HEALTHY`였다. 상세 metadata-only 증거는 gitignored
-  `state/reports/hermes-system-retirement-20260809/README.md`에 남겼다.
-
 ### 학기 전환 단일 기준과 운영 상태 보완
 - 수동으로 맞추던 `transcript_delivery.activation_cutoff`를 제거하고 active semester
   snapshot의 timezone-aware `activated_at`을 raw route와 postprocess backlog
@@ -199,9 +175,7 @@
   시간표의 exact code/name 집합을 확인하며 폴더를 자동 생성하지 않는다.
 
 ### Codex CLI 교정·요약 자동화로 후속 교체
-- Hermes와 Hermes cron/operator는 영구 폐기 상태를 유지했다. 직접 LLM API,
-  API key adapter, 운영 fake backend는 추가하지 않았다. 새
-  `src/lecture_stt/downstream/postprocess.py`는 저장된 ChatGPT 로그인 세션으로
+- 새 `src/lecture_stt/downstream/postprocess.py`는 저장된 ChatGPT 로그인 세션으로
   `codex exec`를 실행하고, 격리 temp directory와 `--ephemeral`, read-only
   sandbox, user config/rules 무시, JSON output schema를 강제한다. Shell,
   unified-exec, apps/plugins, browser/computer, multi-agent feature도 끈다.
@@ -258,12 +232,6 @@
   prospective route를 계산하며 DB/table/row, lock, JSONL, 목적 파일을
   만들거나 갱신하지 않는다. Hardlink 미지원 fallback도
   `O_CREAT|O_EXCL`로만 생성해 race 중 기존 파일을 덮어쓸 수 없게 했다.
-- 외부 AI 교정·요약 operator는 영구 폐기했다. 저장소의 operator 코드,
-  prompt/runbook, CI job, 테스트, 활성 runtime 경로를 제거했고 기존 운영
-  state는 삭제하지 않고
-  `state/reports/retired-ai-postprocess-20260807`로 이동해 증거를 보존했다.
-  과거 correction/summary 원장 247개 row와 관련 archive evidence는 역사
-  자료로만 유지하며 새 worker가 읽거나 갱신하지 않는다.
 
 ### 초기 직접 전달 구현 당시 검증과 운영 적용
 - 변경 전 `config/config.yaml`과 `state/jobs.sqlite3`를
@@ -857,8 +825,7 @@
 
 ### GitHub Actions 교차 플랫폼 저장소 검증 보강
 - 첫 공개 커밋 뒤 Ubuntu CI에서 SQLite가 read-only/writable reopen 중 quiescent `-wal`/`-journal`과 coordination-only `-shm`을 재생성하는 동작을 writable target 변조로 오인하는 것을 확인했다. 메인 DB inode·metadata·SHA-256과 sidecar regular-file/single-link 검증은 그대로 유지하고 durable WAL/journal SHA-256도 snapshot에 추가했다. Absent/0-byte identity churn, content·identity·size·mtime이 같은 active WAL/journal의 ctime-only churn, WAL identity churn에 수반되는 SHM 재생성만 reopen 경계에서 허용한다. SHM 단독 identity churn과 durable sidecar content/mtime 변경은 계속 fail-closed한다.
-- 별도 dependency를 설치하지 않는 macOS smoke에서 테스트 본문이 PyYAML을 import하던 문제도 제거했다. Dependency-free fake YAML module이 sanitizer의 nested payload와 exact serialized config를 함께 검증하며 인증·secret allowlist와 runtime isolation 검증은 바꾸지 않았다.
-- 격리 Linux Python 3.12에서 Storage v2 283개, dependency-free Python 3.12에서 Hermes smoke 54개, 로컬 전체 Python 563개가 통과했다. `compileall`, `git diff --check`, 운영 read-only verifier의 recordings 132/artifacts 540/issue 0과 운영 DB snapshot 복사본의 writable reopen 2회 canary도 통과했다.
+- 격리 Linux Python 3.12에서 Storage v2 283개, 로컬 전체 Python 563개가 통과했다. `compileall`, `git diff --check`, 운영 read-only verifier의 recordings 132/artifacts 540/issue 0과 운영 DB snapshot 복사본의 writable reopen 2회 canary도 통과했다.
 
 ### Storage v2 운영 반영 preflight
 - Git 공개와 운영용 Storage v2 환경 구축을 시작하기 전 `origin/main`, 누적 dirty worktree, 운영 설정과 importer root 분리 계약을 다시 대조했다.
@@ -1047,8 +1014,6 @@
 - 품질 점검에서 `bad`지만 산출물은 유효한 전사 결과를 `ERROR` 대신 `NEEDS_REVIEW`로 기록하고 실패 알림과 분리된 review 알림을 추가했다. 현행 웹 패널도 `확인 필요`를 오류와 분리해 집계·표시한다.
 - 산출물 저장 직후 프로세스가 중단된 복구 경로와 과거 `DONE`/`NEEDS_REVIEW` dedupe 재사용 경로도 persisted `quality.health=bad`를 다시 `DONE` 성공으로 바꾸지 않고 `NEEDS_REVIEW`로 보존하도록 보강했다. Transcript metadata는 있으나 scorecard만 기록되지 않은 crash window에서는 metadata-only sidecar를 재생성해 검증하고, malformed sidecar는 산출물을 삭제하지 않은 채 검토 상태로 격리한다.
 - cleanup apply는 미해결 `NEEDS_REVIEW`의 원본·전사·quality 세트를 보존하고, 보호 목록을 DB에서 읽을 수 없으면 정리를 거부한다. 웹 패널의 이력 정리는 검토 항목을 삭제하지 않는 정책을 유지하면서 버튼·안내 문구를 `완료/오류` 범위로 명확히 했다.
-- Hermes picker와 실제 cron `operator.select_candidate()`가 모두 `02_transcripts/*.quality.json`의 `health=bad` 후보를 선택하지 않도록 차단하고, malformed/invalid scorecard는 해당 stem만 fail-closed로 건너뛰되 다음 정상 후보 처리는 계속하도록 보강했다.
-- Hermes child는 terminal/MCP를 제공하지 않고 `file,no_mcp`로 제한했다. 부모 환경과 repo `.env`를 복제하지 않으며 활성 provider 변수만 allowlist하고, 격리 `HERMES_HOME`에는 해당 provider의 OAuth credential entry만 포함한 권한 `0600`의 최소 `auth.json` snapshot을 전달한다. 실제 설치된 Hermes file tool로 repo `.env`와 child `auth.json` 읽기가 모두 거부되는 것도 확인했다.
 - 복잡한 종류별 폴더를 대체할 record-centric storage v2 foundation을 추가했다. `records/<storage_key>/` 하나가 원본과 job별 전사·교정·요약 revision을 소유하고 제목/과목/날짜는 metadata로 분리한다. `migrations/v2/0001_recording_store.sql`은 운영 DB에 적용하지 않고 임시 SQLite에서만 immutable key, 상대경로, JSON, partial unique, composite FK와 재적용 idempotency를 검증했다. 기존 `jobs` 또는 `deliveries` DB에 잘못 적용하면 persistent DDL 전에 중단하며, review/job/artifact가 서로 다른 소속으로 연결되는 것도 FK로 차단한다.
 - 최종 검증은 `PYTHONPATH=src:. .venv/bin/python -m unittest discover -s tests` 232개, 프론트엔드 Vitest 24개, `npm run build`, Python `compileall`을 통과했다. UNIX socket 파일 유형 테스트 때문에 Python 전체 검증만 샌드박스 밖에서 실행했다.
 - 이 단계에서는 실행 중 launchd 서비스 재시작, 운영 DB schema migration, 실제 녹음 canary, Git commit/push를 수행하지 않았다.
@@ -1061,44 +1026,15 @@
 - 검증: `PYTHONPATH=src .venv/bin/python -m py_compile src/lecture_stt/shared/utils.py`, monkeypatched errno 11 fallback smoke test, DB row `DONE`, txt/json 존재 및 non-empty, JSON segment count `515`, Telegram 전송 API 응답 `ok=true`.
 - 사용자의 직접 요청에 따라 전사 본문은 Telegram chat `1074160202`로 3개 chunk(message_id `288`, `289`, `290`)로 전송했다.
 
-## 2026-05-25
-
-### Hermes postprocess cron timeout alignment
-- Investigated repeated `lecture_stt_postprocess_operator` cron failures where Hermes scheduler killed the repo wrapper after the scheduler default 120s script timeout while the child Hermes correction/summary process was still running, leaving `cron-lecture-stt-postprocess` child processes orphaned under PID 1.
-- Updated the active Hermes default profile config to `cron.script_timeout_seconds=1800` and restarted the default Hermes gateway so the scheduler loads the new value. The active machine-local cron shim now passes `--child-timeout-sec 1500`, leaving a 5 minute parent-owned validation/promotion margin before the scheduler script timeout.
-- Reaped the stale orphaned child process that was still running for a postprocess candidate. No final iCloud artifacts were modified by this cleanup step.
-- Verification passed with active shim `py_compile`, `python3 -m compileall -q scripts tests`, `python3 -m unittest tests.test_hermes_postprocess_hardening -q` (`52` tests), `PYTHONPATH=src:. python3 -m unittest discover -s tests -q` (`191` tests), `git diff --check`, `hermes cron status`, and repo-local metadata-only operator `status`.
-- Current cron job `last_status` can still show the pre-restart 120s timeout until the next scheduled run overwrites it; new scheduler processes resolve `script_timeout_seconds` as `1800`.
-
-## 2026-05-21
-
-### Hermes postprocess operator live canary, sandbox/runtime hardening, scheduler closeout
-- Completed a one-stem live postprocess canary for `260504DS_1` under the approved operator boundary. Final iCloud artifacts now exist at `03_correction/260504DS_1.txt`, `03_correction/260504DS_1.json`, and `04_summarize/260504DS_1.md`; staged/final SHA-256 values matched in the metadata-only promote verification. Raw transcript/generated bodies were not copied into this worklog or closeout report.
-- Fixed the activation blocker where a later child run could see stale staged artifacts after an earlier failed/timeout attempt by resetting `state/hermes_postprocess/staging/{stem}` before each parent-owned candidate/manifest write. Added regression coverage that a successful child exit with missing fresh artifacts fails as `unsafe_staging_artifact` and does not promote stale bodies.
-- Hardened the child Hermes execution envelope by using a per-attempt isolated `HERMES_HOME` under staging, cleaning it after the child exits, and extending the macOS sandbox profile with required Hermes/Python runtime read paths plus explicit `/dev/null` write allowance while keeping final artifact writes parent-owned.
-- Resumed the existing script-only Hermes cron job `lecture_stt_postprocess_operator` (`job_id=977667876027`, `every 30m`, `no_agent=true`, delivery `discord:#운영-보안`) and triggered a no-candidate scheduled run. The direct wrapper no-candidate probe returned exit `0` with stdout/stderr length `0`; the triggered cron run recorded `last_status=ok` with no pending candidates.
-- Closeout evidence was written to gitignored `state/reports/hermes_postprocess/closeout-20260521T141641Z.md`. Verification passed with `python3 -m compileall -q scripts tests`, `python3 -m unittest tests.test_hermes_postprocess_hardening -q` (`52` tests), `PYTHONPATH=src:. python3 -m unittest discover -s tests -q` (`191` tests), and `git diff --check`. Bare unittest discovery without `PYTHONPATH=src:.` is not the valid test invocation because the package lives under `src/`.
-- Not performed: commit, push, tag, release, bulk backlog processing, existing final overwrite, `05_prompt` automatic edits, cleanup/delete/move, or Hermes model/provider/privacy routing changes.
-
 ## 2026-05-20
 
 ### Repository README and structure cleanup
-- Replaced the stale root README with the current `/Users/geonha/DEV/lecture_stt` operating path, remote/branch/CI summary, repository tree, runtime-data boundary, common commands, Hermes postprocess operator entrypoints, documentation priority, and safety rules. The README no longer uses the archived `/Users/geonha/lecture_stt` path for active commands.
+- Replaced the stale root README with the current `/Users/geonha/DEV/lecture_stt` operating path, remote/branch/CI summary, repository tree, runtime-data boundary, common commands, documentation priority, and safety rules. The README no longer uses the archived `/Users/geonha/lecture_stt` path for active commands.
 - Cleaned repository ignore policy by consolidating duplicate `.gitignore` entries and adding explicit root-level ignores for legacy local runtime folders (`/audio/`, `/inbox/`, `/transcripts/`, `/errors/`) plus generated frontend artifacts and `/src/logs/`.
-- Removed the obsolete tracked root `correct_unix.py` one-off hard-coded Unix correction script. Current correction/summary automation lives under `scripts/hermes_postprocess/` with metadata-only staging, validators, explicit promote, and no raw transcript body in reports.
+- Removed the obsolete tracked root `correct_unix.py` one-off hard-coded Unix correction script.
 - Removed local-only ignored clutter from the working tree: `.DS_Store` files, Python `__pycache__/` directories, stale `.bak` files, generated TypeScript build-info/Vite JS artifacts, empty legacy local runtime folders, and stale `src/logs/app.log`. This did not remove `.venv/`, `node_modules/`, `frontend/web-panel/dist/`, `state/`, `models/`, local `config/config.yaml`, or any iCloud/GH archive/Obsidian runtime payload.
-- Updated `docs/ARCHITECTURE.md` to reflect the current 2026-05-20 top-level structure, gitignored runtime boundary, active Hermes operator status, and broadened test coverage.
+- Updated `docs/ARCHITECTURE.md` to reflect the current 2026-05-20 top-level structure, gitignored runtime boundary, and broadened test coverage.
 - Verification passed with static added-line security scan (`0` findings), `git diff --check`, `PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v` (`139` tests), `.venv/bin/python -m compileall -q scripts tests src`, frontend `npm test -- --run` (`21` tests), frontend `npm run build`, and independent pre-commit review with no blockers.
-
-### Hermes postprocess operator Phase 2~4 repo-local implementation
-- Added the repo-local Hermes postprocess helper package under `scripts/hermes_postprocess/` with metadata-only candidate discovery, prompt loading from the existing `05_prompt` surface, canonical path resolution, output contract schemas, correction/summary validators, review-only misrecognition candidate accumulation, metadata-only staging manifest support, and an explicit promote interface that is disabled unless `--allow-promote` is passed. The promote path now also validates candidate destination paths, re-runs deterministic validators before final writes, uses exclusive no-overwrite file creation, and rolls back files created earlier in the same promote attempt after hash verification if a later copy fails.
-- Candidate discovery processes at most one stem per tick and reports only metadata/action-plan fields. It does not print raw transcript bodies or segment arrays. Summary-only candidates can use an existing final correction pair; blocked candidates such as partial final correction output are refused before promote.
-- Added operator docs under `docs/operators/hermes-postprocess/`: README, runbook, correction prompt policy, summary prompt policy, output contract, failure policy, and cron prompt source. The docs keep iCloud `lecture_recordings/05_prompt` as the correction prompt source of truth and keep cron/promote/iCloud final writes behind later approval gates.
-- After later approval in the same session, ran a content staging canary for live stem `260504DS_1`, validated staged correction/summary artifacts, and promoted exactly that one staged candidate to iCloud final paths without overwrite. The metadata-only promote report verified source/final existence, size, and SHA-256 matches for `03_correction/260504DS_1.txt`, `03_correction/260504DS_1.json`, and `04_summarize/260504DS_1.md`; raw transcript and generated bodies were not copied into reports.
-- Registered active Hermes script-only cron job `lecture_stt_postprocess_operator` (`job_id=977667876027`, `every 30m`, `workdir=/Users/geonha/DEV/lecture_stt`, `script=lecture_stt_postprocess_operator.py`, `no_agent=true`, delivery `discord:#운영-보안`). The wrapper records an activation baseline in `state/hermes_postprocess/cron-baseline.json` and skips those backlog stems, processing only future candidates; direct wrapper and scheduled run verification showed no-candidate stdout remains empty.
-- Added fixture-based tests in `tests/test_hermes_postprocess.py` for candidate selection, action planning, path resolution, raw-body leak prevention, prompt loading, staging manifest privacy, review-only misrecognition queue append/dedupe, invalid raw-excerpt rejection without echoing raw values, promote safety, final overwrite prevention, summary-only promote, blocked candidate refusal, candidate destination tamper rejection, stale pass-report revalidation, promote rollback, unresolved `${LECTURE_RECORDINGS_ROOT}` config placeholders, and validator failures such as `segment_metadata_changed`, `correction_non_text_metadata_changed`, and `summary_too_short`.
-- Verification passed with `PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v` (`138` tests), `.venv/bin/python -m unittest tests.test_hermes_postprocess -v` (`20` tests), `.venv/bin/python -m compileall -q scripts tests src`, `git diff --check`, added-line static scan (`0` findings), and explicit read-only iCloud candidate discovery via `PYTHONPATH=src .venv/bin/python -m scripts.hermes_postprocess dry-run --lecture-root "/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings" --repo-root /Users/geonha/DEV/lecture_stt --stable-for-sec 60`. The live dry-run returned candidate stem `260504DS_1` with correction and summary both needed; it wrote no iCloud final artifacts.
-- Not performed: launchd changes, existing-output overwrite, bulk backlog processing, `05_prompt` automatic edits, cleanup/delete/move, Hermes provider/privacy changes, push/tag/release.
 
 ### Approved downstream cleanup, runtime archive cleanup, and CI bootstrap
 - Resumed the approved overnight closeout from live state rather than handoff assumptions: `main` and `origin/main` were both at `6392762`, the worktree was clean before this batch, GitHub Actions runs for `main` were still `[]`, DB `integrity_check` was `ok`, `foreign_key_check` was empty, STT jobs were `DONE=31` / `ERROR=1`, and downstream started at total rows `152` with problem rows `4`.
@@ -1149,7 +1085,6 @@
 - 최종 verification은 `state/reports/verification-unittest-20260519T121554Z.log` 기준 unittest 108개 통과, compileall 통과, `git diff --check` 통과, added-line static scan finding 0건이다. 2차 독립 review도 blocking issue 없이 통과했다.
 
 ### 남은 고도화 사용자 결정 반영
-- 사용자가 지정한 `C/D/R/L/P/B/O` 결정값을 `.hermes/plans/2026-05-19_160615-lecture-stt-remaining-hardening.md`의 `User Decision Snapshot`에 반영했다.
 - 결정 경계는 read-only/dry-run 우선, canary 선행, downstream은 report/manual table만, runtime migration은 canary 이후, log cleanup은 dry-run/manifest만, benchmark 확대는 보류로 정리했다.
 - `P1=2`, `P2=2`, `P3=3`에 따라 `faster-whisper==1.2.1`은 production `.venv` upgrade 후보로 계획/rollback까지 검토하되, 실제 package 변경은 별도 승인 전 금지로 명시했다.
 - canonical STT model은 계속 `large-v3`로 유지하며, DB/file/config/launchd/package/model 변경, local commit, push/tag/release는 수행하지 않았다.
@@ -1204,7 +1139,6 @@
 - 모델은 변경하지 않았고, launchd/운영 DB/iCloud 실제 artifact에는 손대지 않았다.
 
 ### 운영 결정사항 정리와 OPERATIONS runbook 추가
-- 남은 고도화 workstream의 사용자 결정사항을 `.hermes/plans/2026-05-19_160615-lecture-stt-remaining-hardening.md`에 반영했다.
 - `docs/OPERATIONS.md`를 현재 운영 기준 문서로 추가했다. quick checklist와 상세 runbook을 함께 두고, downstream conflict, retry/failure, log retention, runtime path, model/package, canary 기준을 분리해 정리했다.
 - README 상단에 `docs/OPERATIONS.md` 링크와 legacy 경로 주의 문구를 추가했다.
 - 코드, DB, launchd, production `.venv`는 변경하지 않았다.

@@ -11,7 +11,6 @@
 - runtime package: production `.venv`와 `requirements.txt`는 `faster-whisper==1.2.1`로 정렬되어 있다. 이는 package-only 변경이며 canonical STT model 변경이 아니다.
 - runtime path migration: 적용 완료. STT tmp는 `~/Library/Caches/lecture_stt/tmp`, app/downstream/launchd logs는 `~/Library/Logs/lecture_stt`, DB는 repo `state/jobs.sqlite3`에 유지한다.
 - installed LaunchAgents stdout/stderr: `~/Library/Logs/lecture_stt/*.out.log`, `~/Library/Logs/lecture_stt/*.err.log` 기준으로 확인됐다.
-- Hermes 교정·요약 operator와 cron: 영구 폐기. 2026-08-09 사용자 영역의 `ai.hermes.*` LaunchAgent 4개와 전용 runtime/Web UI/wrapper/app state까지 활성 경로에서 제거했으며 해당 runtime·CI 경로는 다시 활성화하지 않는다. 과거 감사 자료와 비활성 lab은 실행 경로가 아니다.
 - transcript postprocess worker: `DONE` 전사를 저장된 ChatGPT 로그인 기반 Codex CLI로 교정·요약한 뒤 활성 학기 course route로 전달한다. 별도 LLM API 키나 직접 API adapter는 사용하지 않는다.
 - latest real lecture canary: `260504DS_2` job `203` reached `DONE` under launchd. Operationally pass, but quality metadata is `warn` with score `61/100` due to high repetition ratio.
 - quality scorecard sidecar: new jobs with quality metadata write `02_transcripts/<stem>.quality.json`. The sidecar is metadata-only and must not include transcript body or segment arrays. `260504DS_2.quality.json` was later backfilled and validated as metadata-only.
@@ -258,7 +257,6 @@ Launchd stdout/stderr rotation dry-run:
 - app log는 `~/Library/Logs/lecture_stt/app.log` 사용.
 - transcript-delivery JSONL은 `~/Library/Logs/lecture_stt/transcript-delivery.jsonl` 사용.
 - 활성 학기 snapshot은 repo-local `state/active-semester.json` 사용.
-- 폐기한 AI 후처리 operator의 runtime state는 `state/reports/retired-ai-postprocess-20260807`로 이동해 과거 감사 증거만 보존한다.
 - installed LaunchAgents stdout/stderr는 `~/Library/Logs/lecture_stt/*.out.log`, `~/Library/Logs/lecture_stt/*.err.log` 기준으로 확인됐다.
 - legacy `/Users/geonha/lecture_stt`는 2026-05-20 cleanup에서 삭제하지 않고 `~/Library/Application Support/lecture_stt/cleanup_archives/cleanup-20260520T014307Z/legacy_root`로 이동 보존했다.
 - repo 안 empty runtime folders는 placeholder로 유지한다.
