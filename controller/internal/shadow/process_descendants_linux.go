@@ -6,6 +6,4 @@ import "os"
 
 // Linux children inherit the explicitly created process group. The group kill
 // remains the closed cleanup boundary on that platform.
-func quiesceProcessGroup(_ *os.Process) {}
-
-func killSubprocessDescendants(_ int) {}
+func drainProcessGroup(_ *os.Process) {}

@@ -71,6 +71,10 @@ func TestMainSIGTERMEmitsInterruptedReportAndReapsDescendants(t *testing.T) {
 	}
 	command := exec.Command(testBinary, args...)
 	command.Env = append(os.Environ(), "GO_WANT_SHADOW_MAIN_HELPER=1")
+	detachedPIDPath := filepath.Join(t.TempDir(), "detached.pid")
+	if runtime.GOOS == "darwin" {
+		command.Env = append(command.Env, "SHADOW_FIXTURE_BINARY="+testBinary, "SHADOW_DETACHED_PID="+detachedPIDPath)
+	}
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	command.Stdout = &stdout
@@ -82,6 +86,9 @@ func TestMainSIGTERMEmitsInterruptedReportAndReapsDescendants(t *testing.T) {
 	waitForPIDFile(t, parentPIDPath)
 	waitForPIDFile(t, childPIDPath)
 	waitForPIDFile(t, grandchildPIDPath)
+	if runtime.GOOS == "darwin" {
+		waitForPIDFile(t, detachedPIDPath)
+	}
 
 	cleanupStarted := time.Now()
 	if _, err := gate.WriteString("fork\n"); err != nil {
@@ -113,26 +120,105 @@ func TestMainSIGTERMEmitsInterruptedReportAndReapsDescendants(t *testing.T) {
 		t.Fatalf("unexpected command report after SIGTERM: %#v", report)
 	}
 
-	// The late-forked sleep processes may already have been reparented. A
-	// vanished shell PID alone cannot prove that its child releases the pipes.
-	groupID := readPIDFile(t, parentPIDPath)
+	leader := readPIDFile(t, parentPIDPath)
+	known := map[int]bool{
+		leader: true, readPIDFile(t, childPIDPath): true, readPIDFile(t, grandchildPIDPath): true,
+	}
+	if runtime.GOOS == "darwin" {
+		known[readPIDFile(t, detachedPIDPath)] = true
+	}
 	for {
-		err := syscall.Kill(-groupID, 0)
-		if errors.Is(err, syscall.ESRCH) {
+		members := fixtureProcessStates(t, leader, known)
+		if !hasLiveFixtureMember(members) {
+			// The helper owns and must reap the direct child. Orphaned
+			// grandchildren are reaped asynchronously by the system.
+			for _, member := range members {
+				if member.pid == leader {
+					t.Fatalf("direct helper was not reaped: %+v", member)
+				}
+			}
+			if len(members) > 0 {
+				t.Logf("exited fixture descendants awaiting OS reaping: %+v", members)
+			}
 			break
 		}
-		if err != nil || time.Since(cleanupStarted) >= 2*time.Second {
-			t.Fatalf("fixture process group survived cancellation: pgid=%d err=%v", groupID, err)
+		if time.Since(cleanupStarted) >= 2*time.Second {
+			t.Fatalf("live fixture descendants survived cancellation: pgid=%d members=%+v", leader, members)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+type fixtureProcessState struct {
+	pid, parent, group int
+	state              string
+}
+
+func fixtureProcessStates(t *testing.T, group int, known map[int]bool) []fixtureProcessState {
+	t.Helper()
+	// Use an independent observer. Only report numeric identities and state
+	// for this fixture, never other process arguments or environment data.
+	output, err := exec.Command("ps", "-ax", "-o", "pid=,ppid=,pgid=,state=").Output()
+	if err != nil {
+		t.Fatalf("inspect fixture processes: %v", err)
+	}
+	var result []fixtureProcessState
+	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+		var process fixtureProcessState
+		if _, err := fmt.Sscan(line, &process.pid, &process.parent, &process.group, &process.state); err != nil {
+			t.Fatalf("could not decode process state: %v", err)
+		}
+		if process.group == group || known[process.pid] {
+			result = append(result, process)
+		}
+	}
+	return result
+}
+
+func hasLiveFixtureMember(members []fixtureProcessState) bool {
+	for _, member := range members {
+		if !strings.HasPrefix(member.state, "Z") {
+			return true
+		}
+	}
+	return false
+}
+
+func TestExitedButUnreapedFixtureMemberIsNotLive(t *testing.T) {
+	// Keep an actual exited process waitable so the zombie observation does
+	// not depend on how quickly the host reaps adopted grandchildren.
+	cmd := exec.Command("sh", "-c", "exit 0")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer cmd.Wait()
+	pid := cmd.Process.Pid
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		members := fixtureProcessStates(t, pid, nil)
+		if len(members) == 1 && members[0].pid == pid && !hasLiveFixtureMember(members) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("could not observe the fixture as a zombie: %+v", members)
 		}
 		time.Sleep(time.Millisecond)
 	}
+}
 
-	for _, pidPath := range []string{parentPIDPath, childPIDPath, grandchildPIDPath} {
-		pid := readPIDFile(t, pidPath)
-		if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
-			t.Fatalf("fixture descendant still exists after SIGTERM cleanup: pid=%d err=%v", pid, err)
-		}
+func TestShadowDetachedFixtureProcess(t *testing.T) {
+	path := os.Getenv("SHADOW_DETACHED_PID")
+	if path == "" {
+		return
 	}
+	if err := syscall.Setpgid(0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(5 * time.Second)
 }
 
 func TestShadowMainHelperProcess(t *testing.T) {
@@ -196,6 +282,9 @@ JSON
     exit 0
   fi
   if [ "$3" = "lockstep-scan" ]; then
+    if [ -n "${SHADOW_DETACHED_PID:-}" ]; then
+      "$SHADOW_FIXTURE_BINARY" -test.run='^TestShadowDetachedFixtureProcess$' &
+    fi
     echo $$ > %q
     %q child %q %q %q &
     while [ ! -s %q ] || [ ! -s %q ]; do

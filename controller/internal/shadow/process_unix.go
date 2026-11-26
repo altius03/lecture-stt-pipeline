@@ -26,11 +26,7 @@ func terminateSubprocess(command *exec.Cmd) {
 	pid := leader.Pid
 	if group, err := syscall.Getpgid(pid); err == nil && group == pid && leader.Signal(syscall.Signal(0)) == nil {
 		_ = syscall.Kill(-pid, syscall.SIGSTOP)
-		quiesceProcessGroup(leader)
-		if leader.Signal(syscall.Signal(0)) != nil {
-			return
-		}
-		killSubprocessDescendants(pid)
+		drainProcessGroup(leader)
 		// The stopped leader anchors the PGID until the final group signal.
 		if leader.Signal(syscall.Signal(0)) == nil {
 			_ = syscall.Kill(-pid, syscall.SIGKILL)

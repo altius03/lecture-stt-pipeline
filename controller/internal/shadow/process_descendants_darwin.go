@@ -9,80 +9,129 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const maxDescendantProcesses = 4096
+const (
+	// P_stat values from Darwin sys/proc.h.
+	processStopped = 4
+	processZombie  = 5
+)
 
-// Darwin can fork a child into a process group during a group signal. Wait
-// for the stopped group to reach a state where no member can still fork.
-func quiesceProcessGroup(leader *os.Process) {
-	pgid := leader.Pid
-	// Process states from Darwin sys/proc.h.
-	const stopped, zombie = 4, 5
-	deadline := time.Now().Add(200 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		members, err := unix.SysctlKinfoProcSlice("kern.proc.pgrp", pgid)
-		if err != nil || len(members) == 0 {
-			return
+func groupHasLeader(members []unix.KinfoProc, pgid int) bool {
+	for _, member := range members {
+		if int(member.Proc.P_pid) == pgid && int(member.Eproc.Pgid) == pgid {
+			return true
 		}
-		quiescent := true
-		for _, member := range members {
-			if state := member.Proc.P_stat; state != stopped && state != zombie {
-				quiescent = false
-				break
+	}
+	return false
+}
+
+// Some Darwin environments omit members from the filtered sysctl. Confirm
+// that the leader is visible, otherwise independently filter the process table.
+func processGroupMembers(pgid int) ([]unix.KinfoProc, bool) {
+	members, err := unix.SysctlKinfoProcSlice("kern.proc.pgrp", pgid)
+	if err == nil && groupHasLeader(members, pgid) {
+		return members, true
+	}
+	all, err := unix.SysctlKinfoProcSlice("kern.proc.all")
+	if err != nil {
+		return nil, false
+	}
+	members = nil
+	for _, process := range all {
+		if int(process.Eproc.Pgid) == pgid {
+			members = append(members, process)
+		}
+	}
+	return members, groupHasLeader(members, pgid)
+}
+
+// Capture the proven subtree while its leader and in-group parents are still
+// stopped. Detached descendants must be visited before their parents exit.
+func killDetachedDescendants(leader *os.Process) {
+	all, err := unix.SysctlKinfoProcSlice("kern.proc.all")
+	if err != nil || !groupHasLeader(all, leader.Pid) {
+		return
+	}
+	byPID := make(map[int]unix.KinfoProc, len(all))
+	children := make(map[int][]int)
+	for _, member := range all {
+		pid, parent := int(member.Proc.P_pid), int(member.Eproc.Ppid)
+		if pid > 1 && parent > 0 {
+			byPID[pid] = member
+			children[parent] = append(children[parent], pid)
+		}
+	}
+	// A process can exit or reparent after the snapshot. Verify every parent
+	// edge and birth time up to the live leader before signaling a detached PID.
+	stillOwned := func(pid int) bool {
+		for depth := 0; depth <= len(byPID); depth++ {
+			saved, ok := byPID[pid]
+			if !ok {
+				return false
 			}
+			current, err := unix.SysctlKinfoProc("kern.proc.pid", pid)
+			if err != nil || current.Proc.P_pid != saved.Proc.P_pid ||
+				current.Proc.P_starttime != saved.Proc.P_starttime {
+				return false
+			}
+			if pid == leader.Pid {
+				return current.Eproc.Pgid == int32(pid) && leader.Signal(unix.Signal(0)) == nil
+			}
+			if current.Eproc.Ppid != saved.Eproc.Ppid {
+				return false
+			}
+			pid = int(current.Eproc.Ppid)
 		}
-		if quiescent || leader.Signal(unix.Signal(0)) != nil {
-			return
+		return false
+	}
+	order := []int{leader.Pid}
+	for i := 0; i < len(order); i++ {
+		order = append(order, children[order[i]]...)
+	}
+	for i := len(order) - 1; i > 0; i-- {
+		pid := order[i]
+		member := byPID[pid]
+		if int(member.Eproc.Pgid) != leader.Pid && member.Proc.P_stat != processZombie && stillOwned(pid) {
+			_ = unix.Kill(pid, unix.SIGKILL)
 		}
-		// Catch a new member that missed the first stop while forking.
-		_ = unix.Kill(-pgid, unix.SIGSTOP)
-		time.Sleep(time.Millisecond)
 	}
 }
 
-func killSubprocessDescendants(rootPID int) {
-	processes, err := unix.SysctlKinfoProcSlice("kern.proc.all")
-	if err != nil {
-		return
-	}
-	children := make(map[int][]unix.KinfoProc)
-	for _, process := range processes {
-		pid := int(process.Proc.P_pid)
-		parentPID := int(process.Eproc.Ppid)
-		if pid <= 1 || parentPID <= 0 || pid == rootPID {
-			continue
-		}
-		children[parentPID] = append(children[parentPID], process)
-	}
-
-	result := make([]unix.KinfoProc, 0)
-	seen := map[int]struct{}{rootPID: {}}
-	var collect func(int)
-	collect = func(parentPID int) {
-		if len(result) >= maxDescendantProcesses {
+func drainProcessGroup(leader *os.Process) {
+	// Keep the leader stopped while late forks finish and group members exit.
+	// The final group kill and Wait then reap our direct child. Orphaned zombies
+	// have already released their descriptors and await the system reaper.
+	killDetachedDescendants(leader)
+	pgid := leader.Pid
+	deadline := time.Now().Add(250 * time.Millisecond)
+	for time.Now().Before(deadline) && leader.Signal(unix.Signal(0)) == nil {
+		members, ok := processGroupMembers(pgid)
+		if !ok {
 			return
 		}
-		for _, child := range children[parentPID] {
-			childPID := int(child.Proc.P_pid)
-			if _, exists := seen[childPID]; exists {
+		drained := true
+		for _, member := range members {
+			pid := int(member.Proc.P_pid)
+			if int(member.Eproc.Pgid) != pgid || member.Proc.P_stat == processZombie {
 				continue
 			}
-			seen[childPID] = struct{}{}
-			collect(childPID)
-			if len(result) >= maxDescendantProcesses {
-				return
+			if pid == pgid {
+				if member.Proc.P_stat != processStopped {
+					drained = false
+				}
+				continue
 			}
-			result = append(result, child)
+			drained = false
+			// A process may change group or exit between observations. Only
+			// signal the same group member with the captured birth time.
+			current, err := unix.SysctlKinfoProc("kern.proc.pid", pid)
+			if err == nil && current.Proc.P_pid == member.Proc.P_pid &&
+				int(current.Eproc.Pgid) == pgid && current.Proc.P_starttime == member.Proc.P_starttime {
+				_ = unix.Kill(pid, unix.SIGKILL)
+			}
 		}
-	}
-	collect(rootPID)
-	for _, child := range result {
-		if int(child.Eproc.Pgid) == rootPID {
-			continue // The entire stopped group receives the final kill.
+		if drained {
+			return
 		}
-		pid := int(child.Proc.P_pid)
-		current, err := unix.SysctlKinfoProc("kern.proc.pid", pid)
-		if err == nil && current.Proc.P_pid == child.Proc.P_pid && current.Proc.P_starttime == child.Proc.P_starttime {
-			_ = unix.Kill(pid, unix.SIGKILL)
-		}
+		time.Sleep(time.Millisecond)
 	}
 }
