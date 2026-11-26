@@ -102,7 +102,7 @@ flowchart LR
 - `launchd/`: macOS launchd 서비스 정의 템플릿
 - `config/`: YAML 설정 템플릿과 학기별 manifest. 운영 `config.yaml`은 gitignore 대상이다.
 - `tests/`: Python unittest suite
-- `docs/`: 운영 runbook, architecture, worklog, model/operator 문서
+- `docs/`: 운영 runbook, architecture, worklog, 모델 문서
 - `migrations/v2/`: 운영 DB와 분리해 검증하는 additive storage/DB v2 SQL migration
 - `.github/workflows/`: GitHub Actions CI
 - `.codex/agents/`: project-local Codex subagent 설정
@@ -484,7 +484,7 @@ flowchart LR
 - React 홈은 Grafana식 기간·분포·추이 요약과 Falcon식 attention triage를 결합한 관제 화면으로 구성한다. 전사량·완료율·검토/오류·평균 품질 KPI, 처리량 추이, 품질 histogram, 상태/확정 분류 분포, 데이터 coverage/freshness, 최근 확인 항목을 표시한다. Attention 행은 같은 `storage_key`의 recording library detail로 명시적으로 연결하고, detail이 목록 첫 페이지 밖에 있어도 별도 read-only query로 유지한다. 새 chart/runtime 의존성이나 웹 업로드 UI는 추가하지 않고 기존 React+TypeScript, TanStack Query, semantic table/CSS bar 경계를 유지한다.
 
 ## 학기 manifest와 전사 자동 후처리
-- Hermes, Hermes cron과 과거 외부 operator는 영구 폐기했다. 사용자 영역의 `ai.hermes.*` LaunchAgent, `~/.hermes`, Web UI clone, 실행 wrapper와 앱 상태도 활성 경로에서 제거했으며 shell startup에는 Hermes 전용 PATH 설정이 없다. 과거 worklog·감사 report와 비활성 `hermes-lab`은 역사 자료일 뿐 runtime dependency가 아니다. 현재 generator는 저장된 ChatGPT 로그인 세션의 `codex exec`만 사용하며 별도 LLM API 키나 직접 HTTP API 경로가 없다. 다만 교정·요약 입력인 전사 내용은 Codex 서비스로 전송된다.
+- 현재 generator는 저장된 ChatGPT 로그인 세션의 `codex exec`만 사용하며 별도 LLM API 키나 직접 HTTP API 경로가 없다. 다만 교정·요약 입력인 전사 내용은 Codex 서비스로 전송된다.
 - STT가 생성한 `02_transcripts/<semester>/<course_dir>/{stem}.txt`, `{stem}.json`, `{stem}.quality.json` 중 job 상태가 `DONE`인 TXT/JSON pair만 후보가 된다. 기존 root 직속 경로도 DB에 pin된 절대경로로 계속 읽는다. `NEEDS_REVIEW`와 `ERROR`는 자동 후처리하지 않는다.
 - `config/semesters/<semester>.yaml`은 semester, vault/current-semester root, Storage v2 timetable DB, 교정·요약 목적 subdirectory, 과목 코드·이름·폴더·파일명 alias를 선언한다. `state/active-semester.json`은 plan/apply로 검증·활성화한 `@2` machine-local snapshot이다.
 - activation plan은 vault의 `.obsidian`, vault→semester root containment, 모든 경로 component의 symlink 부재, 각 course의 `06_lecture_notes/02_origin`과 `06_lecture_notes/01_summarize` 선존재, course dir 중복 부재, 선택된 Storage v2 timetable의 학기·과목 집합 일치를 확인한다. Course code·course name·alias는 정규화된 전역 routing token namespace 하나에서 충돌을 검사하므로 서로 다른 종류의 token이 겹쳐도 활성화를 거부한다. 폴더는 자동 생성하지 않는다.

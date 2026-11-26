@@ -386,7 +386,7 @@ manifest는 recording 루트 안에서만 자기 파일을 참조해야 한다. 
 - v1의 active downstream은 `DONE` transcript를 학기 manifest에 고정하고 Codex CLI 교정·요약 뒤 Obsidian course route로 전달한다
 - v2 import adapter가 완료된 recording만 병행 적재
 - web panel / dashboard는 v1+v2를 동시에 읽는 호환 레이어를 둔다
-- Hermes operator와 cron은 영구 폐기했다. 현재 Codex postprocess 원장과 staging은 v1 runtime 경계이며, 과거 `deliveries` correction/summary 원장은 legacy archive evidence로만 읽는다
+- 현재 Codex postprocess 원장과 staging은 v1 runtime 경계이며, 과거 `deliveries` correction/summary 원장은 legacy archive evidence로만 읽는다
 
 v1 DB의 `jobs.transcript_txt_path`와 `jobs.transcript_json_path`는 평면/중첩 여부와 무관하게 각 정본의 절대경로를 계속 소유한다. Storage v2 importer는 이 DB 경로를 기준으로 원본을 찾고 quality sidecar도 transcript JSON과 같은 parent에서 찾는다. 새 staging은 `03_correction/<semester>/<course_dir>`와 `04_summarize/<semester>/<course_dir>`에 생성하지만, 기존 평면 파일과 이미 경로가 고정된 queue row를 재배치하거나 자동 이관하지 않는다.
 

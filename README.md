@@ -1,5 +1,7 @@
 # Lecture STT Pipeline
 
+처음 참여하는 사람과 AI 도구는 [시스템·운영 이력 인수인계서](docs/SYSTEM_HANDOFF.md)에서 처리 흐름, 주요 결정, 운영 확인 순서를 볼 수 있습니다.
+
 현재 기준: `/Users/geonha/DEV/lecture_stt`가 운영 저장소입니다. 예전 `/Users/geonha/lecture_stt` 경로는 2026-05-20 runtime cleanup에서 archive로 보존된 legacy root이며 새 작업 기준이 아닙니다.
 
 Remote: `https://github.com/altius03/lecture-stt-pipeline.git`
@@ -18,7 +20,7 @@ CI: `.github/workflows/ci.yml`에서 Python unittest/compileall과 web-panel tes
 6. downstream worker가 저장된 ChatGPT 로그인으로 `codex exec`를 호출해 교정 TXT/JSON과 요약 Markdown을 생성합니다.
 7. 교정본은 과목의 `06_lecture_notes/02_origin`, 요약본은 `06_lecture_notes/01_summarize`로 무덮어쓰기 전달합니다.
 
-Hermes와 그 cron/operator 경로는 영구 폐기했습니다. 2026-08-09에는 사용자 영역의 `ai.hermes.*` LaunchAgent 4개, `~/.hermes`, Web UI clone, 실행 wrapper와 앱 상태도 활성 경로에서 제거했습니다. 과거 worklog·감사 report·비활성 lab 자료에 남은 Hermes 문자열은 실행 경로가 아닙니다. 현재 후처리는 별도 LLM API 키나 직접 API 호출 없이 Codex CLI를 사용하지만, 교정·요약을 위해 전사 내용은 Codex 서비스로 전송됩니다. STT 원본은 정본으로 보존하며, 후처리 실패가 전사 완료 상태를 되돌리지 않도록 별도 SQLite 큐와 launchd worker를 사용합니다.
+현재 후처리는 별도 LLM API 키나 직접 API 호출 없이 Codex CLI를 사용하지만, 교정·요약을 위해 전사 내용은 Codex 서비스로 전송됩니다. STT 원본은 정본으로 보존하며, 후처리 실패가 전사 완료 상태를 되돌리지 않도록 별도 SQLite 큐와 launchd worker를 사용합니다.
 
 ## 2. 저장소 구조
 
@@ -90,7 +92,7 @@ Gitignore 대상 로컬 runtime/build artifact:
 - STT tmp/cache: `~/Library/Caches/lecture_stt/tmp`
 - app/transcript-delivery/launchd logs: `~/Library/Logs/lecture_stt/`
 
-`02_transcripts`, `03_correction`, `04_summarize`의 새 강의 artifact는 active semester의 `semester/course_dir` 아래에 함께 정렬됩니다. 기존 루트 직속 파일과 이미 pin된 queue row는 이동하지 않고 계속 읽습니다. 과목을 확정할 수 없는 원본은 루트에 보존하고 `UNROUTED`로 격리하며, 기존 파일은 어느 단계에서도 덮어쓰지 않습니다. 과거 `05_prompt`와 Hermes 상태는 감사용 역사 자료일 뿐 현재 런타임에서 사용하지 않습니다.
+`02_transcripts`, `03_correction`, `04_summarize`의 새 강의 artifact는 active semester의 `semester/course_dir` 아래에 함께 정렬됩니다. 기존 루트 직속 파일과 이미 pin된 queue row는 이동하지 않고 계속 읽습니다. 과목을 확정할 수 없는 원본은 루트에 보존하고 `UNROUTED`로 격리하며, 기존 파일은 어느 단계에서도 덮어쓰지 않습니다.
 
 ## 4. 처음 설정
 
