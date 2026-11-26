@@ -1,0 +1,33 @@
+name: work-log check
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  pull-requests: read
+
+jobs:
+  work-log:
+    name: 이슈별 작업 기록 확인
+    runs-on: ubuntu-latest
+    steps:
+      - name: 상세 기록 또는 예외 라벨 확인
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            if (pr.labels.some(label => label.name === 'skip-changelog')) {
+              core.info('skip-changelog 라벨로 작업 기록 검사를 건너뜁니다.');
+              return;
+            }
+
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              ...context.repo,
+              pull_number: pr.number,
+              per_page: 100,
+            });
+            const record = /^docs\/work-log\/\d{3,}-[a-z0-9]+(?:-[a-z0-9]+)*\.md$/;
+            if (!files.some(file => file.status !== 'removed' && record.test(file.filename))) {
+              core.setFailed('docs/work-log/에 이슈별 상세 기록을 추가하거나 수정하세요. 예외 기준은 docs/work-log/README.md에 있습니다.');
+            }

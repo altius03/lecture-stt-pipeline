@@ -3,6 +3,10 @@
 이 파일은 저장소에 반영된 변경을 날짜순으로 누적 기록한다.
 최신 항목을 위에 추가한다.
 
+## 2026-11-27
+
+- [이슈 #4](https://github.com/altius03/lecture-stt-pipeline/issues/4) · [이슈별 작업 기록과 PR 검증 절차](work-log/004-issue-pr-workflow.md) · [main PR #5](https://github.com/altius03/lecture-stt-pipeline/pull/5) · [dev PR #6](https://github.com/altius03/lecture-stt-pipeline/pull/6)
+
 ## 2026-09-28
 
 ### 기존 자료 압축 보관 및 운영 상태 초기화
