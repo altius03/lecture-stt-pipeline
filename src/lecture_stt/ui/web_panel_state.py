@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+import ctypes
+import hashlib
+import json
+import math
 import os
+import re
 import signal
 import sqlite3
+import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections import deque
@@ -14,10 +21,97 @@ from typing import Any
 
 from lecture_stt.shared import db
 from lecture_stt.shared.paths import env_file, package_env, resolve_config_path, runtime_env, venv_python
+from lecture_stt.storage_v2.analytics import (
+    disabled_transcription_analytics,
+    read_transcription_analytics,
+)
+from lecture_stt.storage_v2.archive_review import (
+    ArchiveReviewWriteDisabledError,
+    apply_archive_review_promotion,
+    list_archive_review_cases,
+    plan_archive_review_promotion,
+    read_archive_review_case,
+    update_archive_review_status,
+)
+from lecture_stt.storage_v2.library import (
+    DEFAULT_TRANSCRIPT_PREVIEW_MAX_BYTES,
+    MAX_TRANSCRIPT_PREVIEW_MAX_BYTES,
+    RecordingLibraryDisabledError,
+    disabled_recording_library_list,
+    list_recordings,
+    read_recording_detail,
+    read_recording_transcript_preview,
+)
+from lecture_stt.storage_v2.title_suggestions import (
+    TitleSuggestionWriteDisabledError,
+    apply_title_suggestion_confirmation,
+    list_title_suggestions,
+    plan_title_suggestion_confirmation,
+    read_title_suggestion,
+    reject_title_suggestion,
+)
+from lecture_stt.storage_v2.timetable import (
+    TimetableWriteDisabledError,
+    apply_classification_confirmation,
+    list_classification_proposals,
+    list_timetable_entries,
+    plan_classification_confirmation,
+    read_classification_proposal,
+    update_classification_status,
+)
+from lecture_stt.storage_v2.unified_review import read_unified_review_feed
 import yaml
 
 
 NOTIFICATION_SELECTIONS = ("telegram", "discord", "both", "disabled")
+DEFAULT_CONTROLLER_LABEL = "com.geonha.lecture-stt-controller"
+CONTROLLER_LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+CONTROLLER_PID_SCHEMA = "lecture-stt/controller-pid@2"
+
+
+class _DarwinProcBsdInfo(ctypes.Structure):
+    _fields_ = [
+        ("pbi_flags", ctypes.c_uint32),
+        ("pbi_status", ctypes.c_uint32),
+        ("pbi_xstatus", ctypes.c_uint32),
+        ("pbi_pid", ctypes.c_uint32),
+        ("pbi_ppid", ctypes.c_uint32),
+        ("pbi_uid", ctypes.c_uint32),
+        ("pbi_gid", ctypes.c_uint32),
+        ("pbi_ruid", ctypes.c_uint32),
+        ("pbi_rgid", ctypes.c_uint32),
+        ("pbi_svuid", ctypes.c_uint32),
+        ("pbi_svgid", ctypes.c_uint32),
+        ("rfu_1", ctypes.c_uint32),
+        ("pbi_comm", ctypes.c_char * 16),
+        ("pbi_name", ctypes.c_char * 32),
+        ("pbi_nfiles", ctypes.c_uint32),
+        ("pbi_pgid", ctypes.c_uint32),
+        ("pbi_pjobc", ctypes.c_uint32),
+        ("e_tdev", ctypes.c_uint32),
+        ("e_tpgid", ctypes.c_uint32),
+        ("pbi_nice", ctypes.c_int32),
+        ("pbi_start_tvsec", ctypes.c_uint64),
+        ("pbi_start_tvusec", ctypes.c_uint64),
+    ]
+
+
+def _prometheus_escape_label(value: str) -> str:
+    return (
+        value.replace("\\", "\\\\")
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace('"', '\\"')
+    )
+
+
+def _prometheus_labels(labels: dict[str, str]) -> str:
+    if not labels:
+        return ""
+    payload = ",".join(
+        f'{key}="{_prometheus_escape_label(value)}"' for key, value in labels.items()
+    )
+    return f"{{{payload}}}"
 
 
 class ControlState:
@@ -27,6 +121,7 @@ class ControlState:
     IDLE_POLL_INTERVAL_SEC = 2
     LOG_READ_BYTES = 65536
     RECENT_JOB_LIMIT = 20
+    SUBPROCESS_TIMEOUT_SEC = 8.0
 
     def __init__(self, repo_root: Path):
         self.repo_root = repo_root
@@ -37,6 +132,7 @@ class ControlState:
             self.python_bin = Path(sys.executable)
 
         self.worker_proc: subprocess.Popen | None = None
+        self.controller_proc: subprocess.Popen | None = None
         self.lock = threading.Lock()
         self.notice = "대기중"
         self._shutdown_handler = None
@@ -118,10 +214,32 @@ class ControlState:
             raise ValueError(f"Invalid config format: {self.config_path}")
         return loaded
 
-    def _save_config(self, config_data: dict[str, Any]) -> None:
-        with self.config_path.open("w", encoding="utf-8") as handle:
-            yaml.safe_dump(config_data, handle, allow_unicode=True, sort_keys=False)
-        self.config_data = config_data
+    def _save_config(self, config_data: dict[str, Any]) -> bool:
+        payload = yaml.safe_dump(config_data, allow_unicode=True, sort_keys=False)
+        mode = stat.S_IMODE(self.config_path.stat().st_mode)
+        fd, temporary = tempfile.mkstemp(
+            prefix=f".{self.config_path.name}.", dir=self.config_path.parent
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fchmod(handle.fileno(), mode)
+                os.fsync(handle.fileno())
+            os.replace(temporary, self.config_path)
+            self.config_data = config_data
+            try:
+                directory_fd = os.open(self.config_path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            except OSError:
+                return False  # The replacement succeeded, but rename durability is unconfirmed.
+            return True
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
 
     def _runtime_env(self) -> dict[str, str]:
         return runtime_env(dotenv_path=env_file(self.repo_root))
@@ -133,6 +251,7 @@ class ControlState:
             "enabled": True,
             "send_start": True,
             "send_success": True,
+            "send_review": True,
             "send_failure": True,
             "dual_send_providers": [],
         }
@@ -227,7 +346,10 @@ class ControlState:
 
     def _notification_state(self, managed_running: bool, external_pids: list[int]) -> dict[str, object]:
         selection = self._notification_selection()
-        can_apply_now = bool(managed_running or external_pids)
+        can_apply_now = self._has_active_runtime(
+            managed_running=managed_running,
+            external_pids=external_pids,
+        )
         apply_label = (
             "변경하면 실행 중 워커에 즉시 적용됩니다."
             if can_apply_now
@@ -242,7 +364,7 @@ class ControlState:
             "options": self._notification_options(),
         }
 
-    def update_notification_selection(self, selection: str) -> None:
+    def update_notification_selection(self, selection: str) -> bool:
         normalized = str(selection or "").strip().lower()
         if normalized not in NOTIFICATION_SELECTIONS:
             raise RuntimeError("지원하지 않는 알림 채널 선택입니다.")
@@ -271,15 +393,16 @@ class ControlState:
             notification_cfg.update({"provider": "noop", "enabled": False, "dual_send_providers": []})
 
         config_data["notification"] = notification_cfg
-        self._save_config(config_data)
+        directory_synced = self._save_config(config_data)
 
-        if self._is_managed_running() or self._find_worker_pids():
+        if self._has_active_runtime():
             self._notification_restart_required = True
             self.notice = "알림 채널이 저장되었습니다. 실행 중 워커에 즉시 적용합니다."
         else:
             self._notification_restart_required = False
             self.notice = "알림 채널이 저장되었습니다. 다음 시작부터 적용됩니다."
         self._set_poll_boost()
+        return directory_synced
 
     def _wait_for_worker_shutdown(self, timeout_sec: float = 30.0) -> bool:
         deadline = time.monotonic() + max(0.0, timeout_sec)
@@ -295,7 +418,7 @@ class ControlState:
             self._set_poll_boost()
             return
 
-        if not (self._is_managed_running() or self._find_worker_pids()):
+        if not self._has_active_runtime():
             self._notification_restart_required = False
             self.notice = "알림 채널이 저장되었습니다. 다음 시작부터 적용됩니다."
             self._set_poll_boost()
@@ -312,7 +435,7 @@ class ControlState:
             self._set_poll_boost()
             return
         self.start()
-        if self._is_managed_running():
+        if self._has_active_runtime():
             self._notification_restart_required = False
             self.notice = "알림 채널 변경을 즉시 적용했습니다."
 
@@ -326,10 +449,1353 @@ class ControlState:
             return Path()
         return resolve_config_path(configured, base_dir=self.repo_root, env=self._runtime_env())
 
+    def _transcription_analytics_settings(self) -> dict[str, Any]:
+        storage_config = self.config_data.get("storage_v2")
+        if not isinstance(storage_config, dict):
+            storage_config = {}
+        analytics_config = storage_config.get("analytics")
+        if not isinstance(analytics_config, dict):
+            analytics_config = {}
+        enabled = analytics_config.get("enabled") is True
+        if not enabled:
+            return {"enabled": False}
+
+        configured_records_root = storage_config.get("records_root")
+        if (
+            not isinstance(configured_records_root, str)
+            or not configured_records_root.strip()
+        ):
+            raise RuntimeError(
+                "storage_v2.records_root must be configured when transcription analytics is enabled"
+            )
+        configured_db_path = storage_config.get(
+            "db_path",
+            "state/storage-v2.sqlite3",
+        )
+        return {
+            "enabled": True,
+            "db_path": resolve_config_path(
+                str(configured_db_path),
+                base_dir=self.repo_root,
+                env=self._runtime_env(),
+            ),
+            "records_root": resolve_config_path(
+                configured_records_root,
+                base_dir=self.repo_root,
+                env=self._runtime_env(),
+            ),
+        }
+
+    def transcription_analytics(
+        self,
+        *,
+        period: str = "week",
+    ) -> dict[str, Any]:
+        settings = self._transcription_analytics_settings()
+        if not settings["enabled"]:
+            return disabled_transcription_analytics(period)
+        return read_transcription_analytics(
+            settings["db_path"],
+            settings["records_root"],
+            period=period,
+        )
+
+    def transcription_analytics_prometheus(self, *, period: str = "week") -> str:
+        payload = self.transcription_analytics(period=period)
+        period_label = str(payload.get("period", period))
+        available_label = (
+            "true"
+            if payload.get("available") is True
+            else "false"
+        )
+        lines: list[str] = []
+        emitted_families: set[str] = set()
+
+        def push_metric(
+            name: str,
+            doc: str,
+            value: float | int | None,
+            labels: dict[str, str],
+            metric_type: str = "gauge",
+        ) -> None:
+            if value is None:
+                return
+            safe_value = float(value)
+            if not math.isfinite(safe_value):
+                return
+            if name not in emitted_families:
+                lines.append(f"# HELP {name} {doc}")
+                lines.append(f"# TYPE {name} {metric_type}")
+                emitted_families.add(name)
+            rendered_value = (
+                str(int(safe_value))
+                if safe_value.is_integer()
+                else format(safe_value, ".15g")
+            )
+            lines.append(f"{name}{_prometheus_labels(labels)} {rendered_value}")
+
+        base_labels = {
+            "period": period_label,
+            "available": available_label,
+        }
+
+        coverage = payload.get("coverage", {})
+        totals = payload.get("totals", {})
+        status_distribution = payload.get("status_distribution", [])
+        quality_distribution = payload.get("quality_distribution", [])
+        classification_distribution = payload.get("classification_distribution", [])
+        freshness = payload.get("freshness", {})
+        window = payload.get("window", {})
+
+        for row in status_distribution:
+            status = str(row.get("status", "unknown"))
+            count = row.get("count", 0)
+            push_metric(
+                "lecture_stt_transcriptions_jobs_in_window",
+                "분석 윈도우의 상태별 전사 작업 수",
+                int(count),
+                {**base_labels, "status": status},
+            )
+
+        for row in quality_distribution:
+            band = str(row.get("band", "unscored"))
+            count = row.get("count", 0)
+            push_metric(
+                "lecture_stt_transcriptions_quality_band_jobs",
+                "분석 윈도우의 품질 점수 구간별 전사 작업 수",
+                int(count),
+                {**base_labels, "band": band},
+            )
+
+        for row in classification_distribution:
+            context_type = row.get("context_type")
+            source = row.get("source")
+            count = row.get("count", 0)
+            push_metric(
+                "lecture_stt_transcriptions_classification_jobs",
+                "분석 윈도우의 분류별 전사 작업 수",
+                int(count),
+                {
+                    **base_labels,
+                    "context_type": (
+                        "미분류"
+                        if context_type is None
+                        else str(context_type)
+                    ),
+                    "source": "미분류" if source is None else str(source),
+                },
+            )
+
+        push_metric(
+            "lecture_stt_transcriptions_average_quality_score",
+            "전사 품질 점수 평균",
+            None
+            if totals.get("average_quality_score") is None
+            else float(totals["average_quality_score"]),
+            base_labels,
+        )
+        push_metric(
+            "lecture_stt_transcriptions_audio_duration_seconds",
+            "전사 오디오 시간 총합(초)",
+            None if totals.get("audio_duration_sec") is None else float(totals["audio_duration_sec"]),
+            base_labels,
+        )
+        push_metric(
+            "lecture_stt_transcriptions_processing_seconds",
+            "전사 처리 시간 총합(초)",
+            None
+            if totals.get("total_processing_sec") is None
+            else float(totals["total_processing_sec"]),
+            base_labels,
+        )
+
+        push_metric(
+            "lecture_stt_transcriptions_jobs_in_window_overall",
+            "분석 윈도우의 전체 전사 작업 수",
+            int(totals.get("jobs", 0)),
+            base_labels,
+            metric_type="gauge",
+        )
+
+        push_metric(
+            "lecture_stt_transcriptions_quality_missing_jobs",
+            "분석 윈도우의 품질 점수 누락 작업 수",
+            int(coverage.get("quality_missing", 0)),
+            base_labels,
+        )
+        push_metric(
+            "lecture_stt_transcriptions_quality_invalid_jobs",
+            "분석 윈도우의 품질 점수 무효 작업 수",
+            int(coverage.get("quality_invalid", 0)),
+            base_labels,
+        )
+        push_metric(
+            "lecture_stt_transcriptions_quality_scored_jobs",
+            "분석 윈도우의 품질 점수 보유 작업 수",
+            int(coverage.get("quality_scored", 0)),
+            base_labels,
+        )
+
+        generated_at = freshness.get("generated_at")
+        latest_event_at = freshness.get("latest_event_at")
+        if isinstance(generated_at, str):
+            try:
+                generated_unix = datetime.fromisoformat(generated_at).timestamp()
+                push_metric(
+                    "lecture_stt_transcriptions_generated_epoch_seconds",
+                    "분석 데이터 생성 시각(UNIX epoch)",
+                    float(generated_unix),
+                    base_labels,
+                    metric_type="gauge",
+                )
+            except ValueError:
+                pass
+        if isinstance(latest_event_at, str):
+            try:
+                latest_event_unix = datetime.fromisoformat(latest_event_at).timestamp()
+                push_metric(
+                    "lecture_stt_transcriptions_latest_event_epoch_seconds",
+                    "최신 이벤트 시각(UNIX epoch)",
+                    float(latest_event_unix),
+                    base_labels,
+                    metric_type="gauge",
+                )
+            except ValueError:
+                pass
+
+        start_at = window.get("start_at")
+        end_at = window.get("end_at")
+        if isinstance(start_at, str):
+            try:
+                start_unix = datetime.fromisoformat(start_at).timestamp()
+                push_metric(
+                    "lecture_stt_transcriptions_window_start_epoch_seconds",
+                    "분석 윈도우 시작 시각(UNIX epoch)",
+                    float(start_unix),
+                    base_labels,
+                    metric_type="gauge",
+                )
+            except ValueError:
+                pass
+        if isinstance(end_at, str):
+            try:
+                end_unix = datetime.fromisoformat(end_at).timestamp()
+                push_metric(
+                    "lecture_stt_transcriptions_window_end_epoch_seconds",
+                    "분석 윈도우 종료 시각(UNIX epoch)",
+                    float(end_unix),
+                    base_labels,
+                    metric_type="gauge",
+                )
+            except ValueError:
+                pass
+
+        return "\n".join(lines) + "\n"
+
+    def _recording_library_settings(self) -> dict[str, Any]:
+        storage_config = self.config_data.get("storage_v2")
+        if not isinstance(storage_config, dict):
+            storage_config = {}
+        library_config = storage_config.get("library")
+        if not isinstance(library_config, dict):
+            library_config = {}
+        configured_db_path = storage_config.get(
+            "db_path",
+            "state/storage-v2.sqlite3",
+        )
+        return {
+            "enabled": library_config.get("enabled") is True,
+            "db_path": resolve_config_path(
+                str(configured_db_path),
+                base_dir=self.repo_root,
+                env=self._runtime_env(),
+            ),
+        }
+
+    def recording_library_list(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        settings = self._recording_library_settings()
+        if not settings["enabled"]:
+            return disabled_recording_library_list(
+                limit=limit,
+                offset=offset,
+            )
+        payload = list_recordings(
+            settings["db_path"],
+            limit=limit,
+            offset=offset,
+        )
+        storage_config = self.config_data.get("storage_v2")
+        if not isinstance(storage_config, dict):
+            storage_config = {}
+        library_config = storage_config.get("library")
+        if not isinstance(library_config, dict):
+            library_config = {}
+        payload["capabilities"] = {
+            "transcript_preview": (
+                library_config.get("transcript_preview_enabled")
+                is True
+            ),
+        }
+        return payload
+
+    def recording_library_detail(
+        self,
+        storage_key: str,
+    ) -> dict[str, Any]:
+        settings = self._recording_library_settings()
+        if not settings["enabled"]:
+            raise RecordingLibraryDisabledError(
+                "Recording library API is disabled"
+            )
+        return read_recording_detail(
+            settings["db_path"],
+            storage_key,
+        )
+
+    def _recording_library_preview_settings(self) -> dict[str, Any]:
+        settings = self._recording_library_settings()
+        storage_config = self.config_data.get("storage_v2")
+        if not isinstance(storage_config, dict):
+            storage_config = {}
+        library_config = storage_config.get("library")
+        if not isinstance(library_config, dict):
+            library_config = {}
+        preview_enabled = (
+            library_config.get("transcript_preview_enabled") is True
+        )
+        if not settings["enabled"] or not preview_enabled:
+            return {
+                "enabled": False,
+                "db_path": settings["db_path"],
+            }
+
+        configured_records_root = storage_config.get("records_root")
+        if (
+            not isinstance(configured_records_root, str)
+            or not configured_records_root.strip()
+        ):
+            raise RuntimeError(
+                "storage_v2.records_root must be configured when recording transcript preview is enabled"
+            )
+        configured_max_bytes = library_config.get(
+            "transcript_preview_max_bytes",
+            DEFAULT_TRANSCRIPT_PREVIEW_MAX_BYTES,
+        )
+        if (
+            isinstance(configured_max_bytes, bool)
+            or not isinstance(configured_max_bytes, int)
+            or not 1
+            <= configured_max_bytes
+            <= MAX_TRANSCRIPT_PREVIEW_MAX_BYTES
+        ):
+            raise RuntimeError(
+                "storage_v2.library.transcript_preview_max_bytes must be an integer "
+                f"between 1 and {MAX_TRANSCRIPT_PREVIEW_MAX_BYTES}"
+            )
+        return {
+            "enabled": True,
+            "db_path": settings["db_path"],
+            "records_root": resolve_config_path(
+                configured_records_root,
+                base_dir=self.repo_root,
+                env=self._runtime_env(),
+            ),
+            "max_bytes": int(configured_max_bytes),
+        }
+
+    def recording_library_transcript_preview(
+        self,
+        storage_key: str,
+    ) -> dict[str, Any]:
+        settings = self._recording_library_settings()
+        if not settings["enabled"]:
+            raise RecordingLibraryDisabledError(
+                "Recording library API is disabled"
+            )
+        preview_settings = self._recording_library_preview_settings()
+        if not preview_settings["enabled"]:
+            raise RecordingLibraryDisabledError(
+                "Recording transcript preview API is disabled"
+            )
+        return read_recording_transcript_preview(
+            preview_settings["db_path"],
+            preview_settings["records_root"],
+            storage_key,
+            max_bytes=preview_settings["max_bytes"],
+        )
+
+    def unified_review_feed(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        archive_settings = self._archive_review_settings()
+        timetable_settings = self._timetable_settings()
+        title_settings = self._title_review_settings()
+        recording_settings = self._recording_library_settings()
+        return read_unified_review_feed(
+            archive_settings["db_path"],
+            archive_enabled=bool(archive_settings["enabled"]),
+            timetable_enabled=bool(timetable_settings["enabled"]),
+            title_enabled=bool(title_settings["enabled"]),
+            recording_enabled=bool(recording_settings["enabled"]),
+            limit=limit,
+            offset=offset,
+        )
+
+    def _title_review_settings(self) -> dict[str, Any]:
+        storage_config = self.config_data.get("storage_v2")
+        if not isinstance(storage_config, dict):
+            storage_config = {}
+        title_config = storage_config.get("title_review")
+        if not isinstance(title_config, dict):
+            title_config = {}
+        configured_db_path = storage_config.get(
+            "db_path",
+            "state/storage-v2.sqlite3",
+        )
+        configured_records_root = storage_config.get("records_root")
+        enabled = title_config.get("enabled") is True
+        return {
+            "enabled": enabled,
+            "confirmations_enabled": (
+                title_config.get("confirmations_enabled") is True
+            ),
+            "status_writes_enabled": (
+                title_config.get("status_writes_enabled") is True
+            ),
+            "db_path": (
+                resolve_config_path(
+                    str(configured_db_path),
+                    base_dir=self.repo_root,
+                    env=self._runtime_env(),
+                )
+                if enabled
+                else None
+            ),
+            "records_root_value": configured_records_root,
+        }
+
+    @staticmethod
+    def _disabled_title_review_list(
+        *,
+        status: str | None,
+        limit: int,
+        offset: int,
+    ) -> dict[str, Any]:
+        return {
+            "schema_version": "storage-v2/title-suggestion-list@1",
+            "available": False,
+            "disabled_reason": "title_review_disabled",
+            "counts": {
+                "suggested": 0,
+                "confirmed": 0,
+                "rejected": 0,
+            },
+            "total": 0,
+            "proposals": [],
+            "capabilities": {
+                "confirmations_enabled": False,
+                "status_writes_enabled": False,
+            },
+        }
+
+    def _require_title_review_records_root(
+        self,
+        settings: dict[str, Any],
+    ) -> Path:
+        records_root_value = settings.get("records_root_value")
+        if records_root_value is None:
+            raise ValueError("Title review requires storage_v2.records_root")
+        if not isinstance(records_root_value, str):
+            records_root_value = str(records_root_value)
+        return resolve_config_path(
+            records_root_value,
+            base_dir=self.repo_root,
+            env=self._runtime_env(),
+        )
+
+    def title_review_list(
+        self,
+        *,
+        status: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        settings = self._title_review_settings()
+        if not settings["enabled"]:
+            return self._disabled_title_review_list(
+                status=status,
+                limit=limit,
+                offset=offset,
+            )
+        payload = list_title_suggestions(
+            settings["db_path"],
+            status=status,
+            limit=limit,
+            offset=offset,
+        )
+        if not payload.get("available", False):
+            payload["disabled_reason"] = "storage_v2_db_unavailable"
+            payload["capabilities"] = {
+                "confirmations_enabled": False,
+                "status_writes_enabled": False,
+            }
+            return payload
+        payload["capabilities"] = {
+            "confirmations_enabled": settings["confirmations_enabled"],
+            "status_writes_enabled": settings["status_writes_enabled"],
+        }
+        return payload
+
+    def title_review_detail(
+        self,
+        proposal_id: int,
+    ) -> dict[str, Any]:
+        settings = self._title_review_settings()
+        if not settings["enabled"]:
+            raise TitleSuggestionWriteDisabledError(
+                "Title review API is disabled"
+            )
+        payload = read_title_suggestion(
+            settings["db_path"],
+            proposal_id,
+        )
+        payload["capabilities"] = {
+            "confirmations_enabled": settings["confirmations_enabled"],
+            "status_writes_enabled": settings["status_writes_enabled"],
+        }
+        return payload
+
+    def title_review_status_update(
+        self,
+        proposal_id: int,
+        *,
+        status: str,
+        allow_write: bool = False,
+    ) -> dict[str, Any]:
+        settings = self._title_review_settings()
+        if not settings["enabled"]:
+            raise TitleSuggestionWriteDisabledError(
+                "Title review API is disabled"
+            )
+        normalized_status = str(status or "").strip().lower()
+        if normalized_status != "rejected":
+            raise ValueError("status must be rejected")
+        return reject_title_suggestion(
+            settings["db_path"],
+            proposal_id,
+            status_writes_enabled=bool(
+                settings["status_writes_enabled"]
+            ),
+            allow_write=allow_write,
+        )
+
+    def title_review_confirmation_plan(
+        self,
+        proposal_id: int,
+    ) -> dict[str, Any]:
+        settings = self._title_review_settings()
+        if not settings["enabled"]:
+            raise TitleSuggestionWriteDisabledError(
+                "Title review API is disabled"
+            )
+        return plan_title_suggestion_confirmation(
+            settings["db_path"],
+            self._require_title_review_records_root(settings),
+            proposal_id,
+        )
+
+    def title_review_confirmation_apply(
+        self,
+        proposal_id: int,
+        *,
+        expected_count: int,
+        expected_plan_sha256: str,
+        allow_write: bool = False,
+    ) -> dict[str, Any]:
+        settings = self._title_review_settings()
+        if not settings["enabled"]:
+            raise TitleSuggestionWriteDisabledError(
+                "Title review API is disabled"
+            )
+        return apply_title_suggestion_confirmation(
+            settings["db_path"],
+            self._require_title_review_records_root(settings),
+            proposal_id,
+            expected_count=expected_count,
+            expected_plan_sha256=expected_plan_sha256,
+            confirmations_enabled=bool(
+                settings["confirmations_enabled"]
+            ),
+            allow_write=allow_write,
+        )
+
+    def _archive_review_settings(self) -> dict[str, Any]:
+        storage_config = self.config_data.get("storage_v2")
+        if not isinstance(storage_config, dict):
+            storage_config = {}
+        review_config = storage_config.get("archive_review")
+        if not isinstance(review_config, dict):
+            review_config = {}
+        configured_db_path = storage_config.get(
+            "db_path",
+            "state/storage-v2.sqlite3",
+        )
+        return {
+            # Only a YAML boolean true enables these gates. Strings such as
+            # "true" or "false" remain fail-closed.
+            "enabled": review_config.get("enabled") is True,
+            "status_writes_enabled": (
+                review_config.get("status_writes_enabled") is True
+            ),
+            "promotions_enabled": (
+                review_config.get("promotions_enabled") is True
+            ),
+            "db_path": resolve_config_path(
+                str(configured_db_path),
+                base_dir=self.repo_root,
+                env=self._runtime_env(),
+            ),
+        }
+
+    @staticmethod
+    def _disabled_archive_review_list(
+        *,
+        review_status: str | None,
+        limit: int,
+        offset: int,
+    ) -> dict[str, Any]:
+        return {
+            "schema_version": "storage-v2/archive-review-list@1",
+            "available": False,
+            "disabled_reason": "archive_review_disabled",
+            "filters": {
+                "review_status": review_status,
+                "limit": limit,
+                "offset": offset,
+            },
+            "counts": {
+                "open": 0,
+                "triaged": 0,
+                "resolved": 0,
+                "dismissed": 0,
+            },
+            "total": 0,
+            "cases": [],
+            "capabilities": {
+                "status_writes_enabled": False,
+                "promotions_enabled": False,
+            },
+        }
+
+    def archive_review_list(
+        self,
+        *,
+        review_status: str | None = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        settings = self._archive_review_settings()
+        if not settings["enabled"]:
+            return self._disabled_archive_review_list(
+                review_status=review_status,
+                limit=limit,
+                offset=offset,
+            )
+        payload = list_archive_review_cases(
+            settings["db_path"],
+            review_status=review_status,
+            limit=limit,
+            offset=offset,
+        )
+        payload["capabilities"] = {
+            "status_writes_enabled": settings["status_writes_enabled"],
+            "promotions_enabled": settings["promotions_enabled"],
+        }
+        return payload
+
+    def archive_review_detail(self, case_key: str) -> dict[str, Any]:
+        settings = self._archive_review_settings()
+        if not settings["enabled"]:
+            raise ArchiveReviewWriteDisabledError(
+                "Archive evidence review API is disabled"
+            )
+        payload = read_archive_review_case(settings["db_path"], case_key)
+        payload["capabilities"] = {
+            "status_writes_enabled": settings["status_writes_enabled"],
+            "promotions_enabled": settings["promotions_enabled"],
+        }
+        return payload
+
+    def archive_review_update_status(
+        self,
+        case_key: str,
+        review_status: str,
+        *,
+        allow_write: bool = False,
+    ) -> dict[str, Any]:
+        settings = self._archive_review_settings()
+        if not settings["enabled"]:
+            raise ArchiveReviewWriteDisabledError(
+                "Archive evidence review API is disabled"
+            )
+        return update_archive_review_status(
+            settings["db_path"],
+            case_key,
+            review_status,
+            allow_write=bool(
+                settings["status_writes_enabled"] and allow_write
+            ),
+        )
+
+    def archive_review_plan_promotion(
+        self,
+        case_key: str,
+        *,
+        target_storage_key: str,
+        selected_revisions: dict[str, int],
+    ) -> dict[str, Any]:
+        settings = self._archive_review_settings()
+        if not settings["enabled"]:
+            raise ArchiveReviewWriteDisabledError(
+                "Archive evidence review API is disabled"
+            )
+        return plan_archive_review_promotion(
+            settings["db_path"],
+            case_key,
+            target_storage_key=target_storage_key,
+            selected_revisions=selected_revisions,
+        )
+
+    def archive_review_apply_promotion(
+        self,
+        case_key: str,
+        *,
+        target_storage_key: str,
+        selected_revisions: dict[str, int],
+        expected_count: int,
+        expected_plan_sha256: str,
+        allow_write: bool = False,
+    ) -> dict[str, Any]:
+        settings = self._archive_review_settings()
+        if not settings["enabled"]:
+            raise ArchiveReviewWriteDisabledError(
+                "Archive evidence review API is disabled"
+            )
+        return apply_archive_review_promotion(
+            settings["db_path"],
+            case_key,
+            target_storage_key=target_storage_key,
+            selected_revisions=selected_revisions,
+            expected_count=expected_count,
+            expected_plan_sha256=expected_plan_sha256,
+            promotions_enabled=bool(settings["promotions_enabled"]),
+            allow_write=allow_write,
+        )
+
+    def _timetable_settings(self) -> dict[str, Any]:
+        storage_config = self.config_data.get("storage_v2")
+        if not isinstance(storage_config, dict):
+            storage_config = {}
+        timetable_config = storage_config.get("timetable")
+        if not isinstance(timetable_config, dict):
+            timetable_config = {}
+        configured_db_path = storage_config.get(
+            "db_path",
+            "state/storage-v2.sqlite3",
+        )
+        return {
+            "enabled": timetable_config.get("enabled") is True,
+            "confirmations_enabled": (
+                timetable_config.get("confirmations_enabled") is True
+            ),
+            "status_writes_enabled": (
+                timetable_config.get("status_writes_enabled") is True
+            ),
+            "db_path": resolve_config_path(
+                str(configured_db_path),
+                base_dir=self.repo_root,
+                env=self._runtime_env(),
+            ),
+        }
+
+    def timetable_list(
+        self,
+        *,
+        semester: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        settings = self._timetable_settings()
+        if not settings["enabled"]:
+            return {
+                "schema_version": "storage-v2/timetable-list@1",
+                "available": False,
+                "disabled_reason": "timetable_api_disabled",
+                "semester": semester,
+                "total": 0,
+                "entries": [],
+                "capabilities": {
+                    "confirmations_enabled": False,
+                    "status_writes_enabled": False,
+                },
+            }
+        payload = list_timetable_entries(
+            settings["db_path"],
+            semester=semester,
+            limit=limit,
+            offset=offset,
+        )
+        payload["capabilities"] = {
+            "confirmations_enabled": settings["confirmations_enabled"],
+            "status_writes_enabled": settings["status_writes_enabled"],
+        }
+        return payload
+
+    def timetable_classification_list(
+        self,
+        *,
+        status: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        settings = self._timetable_settings()
+        if not settings["enabled"]:
+            return {
+                "schema_version": "storage-v2/classification-proposal-list@1",
+                "available": False,
+                "disabled_reason": "timetable_api_disabled",
+                "counts": {
+                    "suggested": 0,
+                    "confirmed": 0,
+                    "rejected": 0,
+                },
+                "total": 0,
+                "proposals": [],
+                "capabilities": {
+                    "confirmations_enabled": False,
+                    "status_writes_enabled": False,
+                },
+            }
+        payload = list_classification_proposals(
+            settings["db_path"],
+            status=status,
+            limit=limit,
+            offset=offset,
+        )
+        payload["capabilities"] = {
+            "confirmations_enabled": settings["confirmations_enabled"],
+            "status_writes_enabled": settings["status_writes_enabled"],
+        }
+        return payload
+
+    def timetable_classification_detail(
+        self,
+        proposal_id: int,
+    ) -> dict[str, Any]:
+        settings = self._timetable_settings()
+        if not settings["enabled"]:
+            raise TimetableWriteDisabledError(
+                "Timetable review API is disabled"
+            )
+        payload = read_classification_proposal(
+            settings["db_path"],
+            proposal_id,
+        )
+        payload["capabilities"] = {
+            "confirmations_enabled": settings["confirmations_enabled"],
+            "status_writes_enabled": settings["status_writes_enabled"],
+        }
+        return payload
+
+    def timetable_classification_status_update(
+        self,
+        proposal_id: int,
+        *,
+        status: str,
+        allow_write: bool = False,
+    ) -> dict[str, Any]:
+        settings = self._timetable_settings()
+        if not settings["enabled"]:
+            raise TimetableWriteDisabledError(
+                "Timetable review API is disabled"
+            )
+        return update_classification_status(
+            settings["db_path"],
+            proposal_id,
+            status=status,
+            status_writes_enabled=bool(
+                settings["status_writes_enabled"]
+            ),
+            allow_write=allow_write,
+        )
+
+    def timetable_confirmation_plan(
+        self,
+        proposal_id: int,
+    ) -> dict[str, Any]:
+        settings = self._timetable_settings()
+        if not settings["enabled"]:
+            raise TimetableWriteDisabledError(
+                "Timetable review API is disabled"
+            )
+        return plan_classification_confirmation(
+            settings["db_path"],
+            proposal_id,
+        )
+
+    def timetable_confirmation_apply(
+        self,
+        proposal_id: int,
+        *,
+        expected_count: int,
+        expected_plan_sha256: str,
+        allow_write: bool = False,
+    ) -> dict[str, Any]:
+        settings = self._timetable_settings()
+        if not settings["enabled"]:
+            raise TimetableWriteDisabledError(
+                "Timetable review API is disabled"
+            )
+        return apply_classification_confirmation(
+            settings["db_path"],
+            proposal_id,
+            expected_count=expected_count,
+            expected_plan_sha256=expected_plan_sha256,
+            confirmations_enabled=bool(settings["confirmations_enabled"]),
+            allow_write=allow_write,
+        )
+
     def _worker_cmd(self, *extra: str) -> list[str]:
         cmd = [str(self.python_bin), "-m", self.worker_module]
         cmd.extend(extra)
         return cmd
+
+    def _app_config(self) -> dict[str, Any]:
+        config_data = self.config_data if isinstance(getattr(self, "config_data", None), dict) else {}
+        app_cfg = config_data.get("app")
+        return app_cfg if isinstance(app_cfg, dict) else {}
+
+    def _execution_owner(self) -> str:
+        owner = str(self._app_config().get("execution_owner", "python") or "python").strip().lower()
+        return "controller" if owner == "controller" else "python"
+
+    def _is_controller_owner(self) -> bool:
+        return self._execution_owner() == "controller"
+
+    def _controller_label(self) -> str:
+        raw = str(self._app_config().get("controller_label") or DEFAULT_CONTROLLER_LABEL).strip()
+        if not raw or not CONTROLLER_LABEL_RE.fullmatch(raw):
+            raise RuntimeError("controller label 구성이 올바르지 않습니다.")
+        return raw
+
+    def _controller_runtime(self) -> str:
+        raw = str(self._app_config().get("controller_runtime", "launchd") or "launchd").strip().lower()
+        if raw not in {"launchd", "console"}:
+            raise RuntimeError("controller runtime 구성이 올바르지 않습니다.")
+        return raw
+
+    def _is_console_controller(self) -> bool:
+        return self._is_controller_owner() and self._controller_runtime() == "console"
+
+    @staticmethod
+    def _console_runtime_supported() -> bool:
+        return sys.platform == "darwin"
+
+    @staticmethod
+    def _configured_absolute_path(value: Any, *, label: str) -> Path:
+        if not isinstance(value, str) or not value.strip():
+            raise RuntimeError(f"{label} 구성이 필요합니다.")
+        expanded = Path(value).expanduser()
+        if not expanded.is_absolute():
+            raise RuntimeError(f"{label}는 절대경로여야 합니다.")
+        return Path(os.path.abspath(os.fspath(expanded)))
+
+    def _console_controller_settings(self) -> dict[str, Path]:
+        if not self._console_runtime_supported():
+            raise RuntimeError("controller console runtime은 Darwin에서만 지원합니다.")
+        app = self._app_config()
+        expected_sha256 = str(app.get("controller_binary_sha256") or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+            raise RuntimeError("controller binary SHA-256 구성이 올바르지 않습니다.")
+        binary = self._configured_absolute_path(
+            app.get("controller_binary"),
+            label="controller binary",
+        )
+        state_dir = self._configured_absolute_path(
+            app.get("controller_state_dir"),
+            label="controller state directory",
+        )
+        pid_path = self._configured_absolute_path(
+            app.get("controller_pid_path"),
+            label="controller PID path",
+        )
+        stdout_path = self._configured_absolute_path(
+            app.get(
+                "controller_stdout_path",
+                "~/Library/Logs/lecture_stt/controller.out.jsonl",
+            ),
+            label="controller stdout",
+        )
+        stderr_path = self._configured_absolute_path(
+            app.get(
+                "controller_stderr_path",
+                "~/Library/Logs/lecture_stt/controller.err.log",
+            ),
+            label="controller stderr",
+        )
+        self._validate_console_binary(binary, expected_sha256)
+        self._validate_console_state_dir(state_dir)
+        self._validate_console_state_dir(pid_path.parent)
+        if pid_path.parent == state_dir:
+            raise RuntimeError(
+                "controller PID path는 recovery state directory 밖에 있어야 합니다."
+            )
+        return {
+            "binary": binary,
+            "state_dir": state_dir,
+            "stdout_path": stdout_path,
+            "stderr_path": stderr_path,
+            "pid_path": pid_path,
+        }
+
+    @staticmethod
+    def _validate_console_binary(path: Path, expected_sha256: str) -> None:
+        if path.parent.name != expected_sha256:
+            raise RuntimeError("controller binary version directory가 올바르지 않습니다.")
+        for directory in (path.parent, path.parent.parent):
+            try:
+                directory_state = directory.lstat()
+            except OSError as exc:
+                raise RuntimeError(
+                    "controller binary version directory를 안전하게 확인할 수 없습니다."
+                ) from exc
+            if (
+                not stat.S_ISDIR(directory_state.st_mode)
+                or stat.S_ISLNK(directory_state.st_mode)
+                or directory_state.st_uid != os.geteuid()
+                or stat.S_IMODE(directory_state.st_mode) != 0o500
+                or not ControlState._console_binary_path_is_immutable(
+                    directory_state
+                )
+            ):
+                raise RuntimeError(
+                    "controller binary version directory 상태가 올바르지 않습니다."
+                )
+        try:
+            observed = path.lstat()
+        except OSError as exc:
+            raise RuntimeError("controller binary를 안전하게 확인할 수 없습니다.") from exc
+        if (
+            not stat.S_ISREG(observed.st_mode)
+            or stat.S_ISLNK(observed.st_mode)
+            or observed.st_nlink != 1
+            or observed.st_uid != os.geteuid()
+            or stat.S_IMODE(observed.st_mode) != 0o500
+            or not ControlState._console_binary_path_is_immutable(observed)
+        ):
+            raise RuntimeError("controller binary 상태가 올바르지 않습니다.")
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            fd = os.open(path, flags)
+        except OSError as exc:
+            raise RuntimeError("controller binary를 안전하게 열 수 없습니다.") from exc
+        try:
+            opened = os.fstat(fd)
+            if (
+                opened.st_dev != observed.st_dev
+                or opened.st_ino != observed.st_ino
+                or opened.st_nlink != 1
+                or opened.st_uid != os.geteuid()
+                or stat.S_IMODE(opened.st_mode) != 0o500
+                or not ControlState._console_binary_path_is_immutable(opened)
+            ):
+                raise RuntimeError("controller binary identity가 변경되었습니다.")
+            digest = hashlib.sha256()
+            while True:
+                chunk = os.read(fd, 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        finally:
+            os.close(fd)
+        if digest.hexdigest() != expected_sha256:
+            raise RuntimeError("controller binary SHA-256이 일치하지 않습니다.")
+
+    @staticmethod
+    def _console_binary_path_is_immutable(observed: os.stat_result) -> bool:
+        if sys.platform != "darwin":
+            return True
+        immutable_flag = getattr(stat, "UF_IMMUTABLE", 0)
+        return bool(immutable_flag and observed.st_flags & immutable_flag)
+
+    @staticmethod
+    def _validate_console_state_dir(path: Path) -> None:
+        try:
+            observed = path.lstat()
+        except OSError as exc:
+            raise RuntimeError("controller state directory를 안전하게 확인할 수 없습니다.") from exc
+        if (
+            not stat.S_ISDIR(observed.st_mode)
+            or stat.S_ISLNK(observed.st_mode)
+            or observed.st_uid != os.geteuid()
+            or stat.S_IMODE(observed.st_mode) != 0o700
+        ):
+            raise RuntimeError("controller state directory 상태가 올바르지 않습니다.")
+
+    def _console_controller_cmd(self, settings: dict[str, Path]) -> list[str]:
+        return [
+            str(settings["binary"]),
+            "--python-bin",
+            str(self.python_bin),
+            "--repo-root",
+            str(self.repo_root),
+            "--config",
+            str(self.config_path),
+            "--kill-switch",
+            str(self._controller_kill_switch_path()),
+            "--state-dir",
+            str(settings["state_dir"]),
+            "--cycle-interval-sec",
+            "10",
+            "--max-fresh-jobs",
+            "1",
+            "--enable-execution",
+            "--allow-write",
+        ]
+
+    @staticmethod
+    def _secure_pid_file_fd(path: Path, *, create: bool) -> int:
+        flags = os.O_RDWR
+        if create:
+            flags |= os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(path, flags, 0o600)
+        observed = os.fstat(fd)
+        if (
+            not stat.S_ISREG(observed.st_mode)
+            or observed.st_nlink != 1
+            or observed.st_uid != os.geteuid()
+            or stat.S_IMODE(observed.st_mode) != 0o600
+        ):
+            os.close(fd)
+            raise RuntimeError("controller PID file 상태가 올바르지 않습니다.")
+        return fd
+
+    def _read_console_controller_identity(
+        self,
+        settings: dict[str, Path],
+    ) -> tuple[int, tuple[int, int]] | None:
+        path = settings["pid_path"]
+        try:
+            fd = self._secure_pid_file_fd(path, create=False)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise RuntimeError("controller PID file을 안전하게 확인할 수 없습니다.") from exc
+        try:
+            payload = os.read(fd, 512)
+            if os.read(fd, 1):
+                raise RuntimeError("controller PID file 내용이 올바르지 않습니다.")
+        finally:
+            os.close(fd)
+        try:
+            decoded = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("controller PID file 내용이 올바르지 않습니다.") from exc
+        if (
+            type(decoded) is not dict
+            or set(decoded) != {"schema_version", "pid", "process_birth"}
+            or decoded.get("schema_version") != CONTROLLER_PID_SCHEMA
+            or type(decoded.get("pid")) is not int
+            or decoded["pid"] <= 1
+            or type(decoded.get("process_birth")) is not dict
+            or set(decoded["process_birth"]) != {"tv_sec", "tv_usec"}
+            or type(decoded["process_birth"].get("tv_sec")) is not int
+            or decoded["process_birth"]["tv_sec"] <= 0
+            or type(decoded["process_birth"].get("tv_usec")) is not int
+            or not 0 <= decoded["process_birth"]["tv_usec"] < 1_000_000
+        ):
+            raise RuntimeError("controller PID file 내용이 올바르지 않습니다.")
+        return decoded["pid"], (
+            decoded["process_birth"]["tv_sec"],
+            decoded["process_birth"]["tv_usec"],
+        )
+
+    @staticmethod
+    def _console_controller_process_identity(
+        pid: int,
+    ) -> tuple[int, int, int] | None:
+        if sys.platform != "darwin":
+            raise RuntimeError(
+                "controller process kernel identity는 Darwin에서만 지원합니다."
+            )
+        try:
+            libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        except OSError as exc:
+            raise RuntimeError(
+                "controller process kernel identity를 확인할 수 없습니다."
+            ) from exc
+        libproc.proc_pidinfo.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint64,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        libproc.proc_pidinfo.restype = ctypes.c_int
+        info = _DarwinProcBsdInfo()
+        result = libproc.proc_pidinfo(
+            pid,
+            3,  # PROC_PIDTBSDINFO
+            0,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+        )
+        if result != ctypes.sizeof(info) or info.pbi_pid != pid:
+            return None
+        if (
+            info.pbi_start_tvsec <= 0
+            or info.pbi_start_tvusec >= 1_000_000
+            or info.pbi_pgid <= 1
+        ):
+            return None
+        return (
+            int(info.pbi_start_tvsec),
+            int(info.pbi_start_tvusec),
+            int(info.pbi_pgid),
+        )
+
+    def _console_controller_process_matches(
+        self,
+        pid: int,
+        process_birth: tuple[int, int],
+        settings: dict[str, Path],
+    ) -> bool:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError as exc:
+            raise RuntimeError("controller process identity를 확인할 수 없습니다.") from exc
+        kernel_identity = self._console_controller_process_identity(pid)
+        if (
+            kernel_identity is None
+            or kernel_identity[:2] != process_birth
+            or kernel_identity[2] != pid
+        ):
+            return False
+        result = self._run_control_cmd(["/bin/ps", "-p", str(pid), "-o", "comm="])
+        if result.returncode != 0:
+            return False
+        if (result.stdout or "").strip() != str(settings["binary"]):
+            return False
+        command_result = self._run_control_cmd(
+            ["/bin/ps", "-ww", "-p", str(pid), "-o", "command="]
+        )
+        if command_result.returncode != 0:
+            return False
+        return (command_result.stdout or "").strip() == " ".join(
+            self._console_controller_cmd(settings)
+        )
+
+    def _console_controller_pid(self, settings: dict[str, Path] | None = None) -> int | None:
+        resolved = self._console_controller_settings() if settings is None else settings
+        identity = self._read_console_controller_identity(resolved)
+        if identity is None:
+            return None
+        pid, process_birth = identity
+        return (
+            pid
+            if self._console_controller_process_matches(
+                pid,
+                process_birth,
+                resolved,
+            )
+            else None
+        )
+
+    def _remove_stale_console_pid_file(self, settings: dict[str, Path]) -> None:
+        identity = self._read_console_controller_identity(settings)
+        if identity is None:
+            return
+        pid, process_birth = identity
+        if self._console_controller_process_matches(
+            pid,
+            process_birth,
+            settings,
+        ):
+            raise RuntimeError("controller가 이미 실행 중입니다.")
+        try:
+            settings["pid_path"].unlink()
+            self._fsync_directory(settings["pid_path"].parent)
+        except OSError as exc:
+            raise RuntimeError("stale controller PID file 정리에 실패했습니다.") from exc
+
+    @staticmethod
+    def _open_console_log(path: Path) -> int:
+        try:
+            parent = path.parent.lstat()
+        except OSError as exc:
+            raise RuntimeError("controller log directory를 확인할 수 없습니다.") from exc
+        if (
+            not stat.S_ISDIR(parent.st_mode)
+            or stat.S_ISLNK(parent.st_mode)
+            or parent.st_uid != os.geteuid()
+            or stat.S_IMODE(parent.st_mode) & 0o022
+        ):
+            raise RuntimeError("controller log directory 상태가 올바르지 않습니다.")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            fd = os.open(path, flags, 0o600)
+        except OSError as exc:
+            raise RuntimeError("controller log file을 열 수 없습니다.") from exc
+        observed = os.fstat(fd)
+        if (
+            not stat.S_ISREG(observed.st_mode)
+            or observed.st_nlink != 1
+            or observed.st_uid != os.geteuid()
+        ):
+            os.close(fd)
+            raise RuntimeError("controller log file 상태가 올바르지 않습니다.")
+        os.fchmod(fd, 0o600)
+        return fd
+
+    def _controller_service_target(self) -> str:
+        return f"gui/{os.getuid()}/{self._controller_label()}"
+
+    def _controller_kill_switch_path(self) -> Path:
+        configured = self._app_config().get("controller_kill_switch")
+        if configured is None or not str(configured).strip():
+            raise RuntimeError("controller kill-switch가 설정되지 않았습니다.")
+        return Path(os.path.abspath(os.fspath(Path(str(configured)).expanduser())))
+
+    def _run_control_cmd(
+        self,
+        cmd: list[str],
+        *,
+        timeout: float | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=self.SUBPROCESS_TIMEOUT_SEC if timeout is None else timeout,
+            cwd=str(self.repo_root),
+        )
 
     def _run_main_cmd(self, *extra: str) -> str:
         cmd = self._worker_cmd(*extra, "--config", str(self.config_path))
@@ -350,11 +1816,8 @@ class ControlState:
     def _find_worker_pids(self) -> list[int]:
         # 관리 상태 확인을 위해 STT 워커 모듈 PID를 찾는다.
         try:
-            result = subprocess.run(
+            result = self._run_control_cmd(
                 ["pgrep", "-f", self.worker_module],
-                capture_output=True,
-                text=True,
-                check=False,
             )
         except Exception:
             return []
@@ -377,6 +1840,324 @@ class ControlState:
 
     def _is_paused(self) -> bool:
         return self.pause_flag.exists()
+
+    def _controller_kill_switch_state(self) -> str:
+        path = self._controller_kill_switch_path()
+        try:
+            observed = path.lstat()
+        except FileNotFoundError:
+            return "absent"
+        except OSError as exc:
+            raise RuntimeError("controller kill-switch marker를 안전하게 확인할 수 없습니다.") from exc
+        if (
+            not stat.S_ISREG(observed.st_mode)
+            or stat.S_ISLNK(observed.st_mode)
+            or observed.st_nlink != 1
+            or observed.st_uid != os.geteuid()
+            or stat.S_IMODE(observed.st_mode) != 0o600
+        ):
+            return "invalid"
+        return "active"
+
+    def _controller_kill_switch_active(self) -> bool:
+        return self._controller_kill_switch_state() == "active"
+
+    def _fsync_directory(self, directory: Path) -> None:
+        flags = os.O_RDONLY
+        if hasattr(os, "O_DIRECTORY"):
+            flags |= os.O_DIRECTORY
+        fd = os.open(directory, flags)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def _remove_controller_kill_switch_marker(self) -> None:
+        path = self._controller_kill_switch_path()
+        state = self._controller_kill_switch_state()
+        if state == "absent":
+            return
+        if state != "active":
+            raise RuntimeError("controller kill-switch marker 상태가 올바르지 않습니다.")
+        try:
+            path.unlink()
+            self._fsync_directory(path.parent)
+        except OSError as exc:
+            raise RuntimeError("controller kill-switch marker 제거에 실패했습니다.") from exc
+
+    def _write_controller_kill_switch_marker(self) -> None:
+        path = self._controller_kill_switch_path()
+        try:
+            parent = path.parent.lstat()
+        except OSError as exc:
+            raise RuntimeError(
+                "controller kill-switch 디렉터리를 안전하게 확인할 수 없습니다."
+            ) from exc
+        if (
+            not stat.S_ISDIR(parent.st_mode)
+            or stat.S_ISLNK(parent.st_mode)
+            or parent.st_uid != os.geteuid()
+            or stat.S_IMODE(parent.st_mode) & 0o022
+        ):
+            raise RuntimeError(
+                "controller kill-switch 디렉터리 상태가 올바르지 않습니다."
+            )
+        state = self._controller_kill_switch_state()
+        if state == "invalid":
+            raise RuntimeError("controller kill-switch marker 상태가 올바르지 않습니다.")
+        if state == "active":
+            return
+        try:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            fd = os.open(path, flags, 0o600)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            observed = path.lstat()
+            if not stat.S_ISREG(observed.st_mode) or stat.S_ISLNK(observed.st_mode) or observed.st_nlink != 1:
+                raise RuntimeError("controller kill-switch marker 상태가 올바르지 않습니다.")
+            self._fsync_directory(path.parent)
+        except FileExistsError:
+            if self._controller_kill_switch_state() != "active":
+                raise RuntimeError(
+                    "controller kill-switch marker 상태가 올바르지 않습니다."
+                )
+        except RuntimeError:
+            raise
+        except OSError as exc:
+            raise RuntimeError("controller kill-switch marker 생성에 실패했습니다.") from exc
+
+    def _controller_service_loaded(self) -> bool:
+        try:
+            result = self._run_control_cmd(["launchctl", "print", self._controller_service_target()])
+        except Exception:
+            return False
+        return result.returncode == 0
+
+    def _run_launchctl(self, *args: str) -> None:
+        result = self._run_control_cmd(["launchctl", *args])
+        if result.returncode != 0:
+            raise RuntimeError("controller 서비스 제어 명령이 실패했습니다.")
+
+    def _cleanup_console_pid_file(self, settings: dict[str, Path]) -> None:
+        path = settings["pid_path"]
+        try:
+            if path.exists():
+                fd = self._secure_pid_file_fd(path, create=False)
+                os.close(fd)
+                path.unlink()
+                self._fsync_directory(settings["pid_path"].parent)
+        except OSError as exc:
+            raise RuntimeError("controller PID file 정리에 실패했습니다.") from exc
+
+    def _start_console_controller(self) -> None:
+        settings = self._console_controller_settings()
+        existing = self._console_controller_pid(settings)
+        if existing is not None:
+            self._remove_controller_kill_switch_marker()
+            self._set_paused(False)
+            self.notice = "controller 실행을 재개했습니다."
+            return
+
+        self._remove_stale_console_pid_file(settings)
+        self._write_controller_kill_switch_marker()
+        pid_fd: int | None = None
+        stdout_fd: int | None = None
+        stderr_fd: int | None = None
+        proc: subprocess.Popen[bytes] | None = None
+        try:
+            pid_fd = self._secure_pid_file_fd(settings["pid_path"], create=True)
+            stdout_fd = self._open_console_log(settings["stdout_path"])
+            stderr_fd = self._open_console_log(settings["stderr_path"])
+            env = package_env()
+            env["PYTHONDONTWRITEBYTECODE"] = "1"
+            self._validate_console_binary(
+                settings["binary"],
+                settings["binary"].parent.name,
+            )
+            proc = subprocess.Popen(
+                self._console_controller_cmd(settings),
+                cwd=str(self.repo_root),
+                env=env,
+                stdout=stdout_fd,
+                stderr=stderr_fd,
+                start_new_session=True,
+            )
+            kernel_identity = self._console_controller_process_identity(proc.pid)
+            if kernel_identity is None or kernel_identity[2] != proc.pid:
+                raise RuntimeError("controller process 시작 identity를 확인할 수 없습니다.")
+            process_birth = kernel_identity[:2]
+            pid_payload = (
+                json.dumps(
+                    {
+                        "schema_version": CONTROLLER_PID_SCHEMA,
+                        "pid": proc.pid,
+                        "process_birth": {
+                            "tv_sec": process_birth[0],
+                            "tv_usec": process_birth[1],
+                        },
+                    },
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                + "\n"
+            ).encode("ascii")
+            if os.write(pid_fd, pid_payload) != len(pid_payload):
+                raise RuntimeError("controller PID file 기록이 완료되지 않았습니다.")
+            os.fsync(pid_fd)
+            self._fsync_directory(settings["pid_path"].parent)
+            time.sleep(0.05)
+            if proc.poll() is not None:
+                raise RuntimeError(
+                    f"controller가 즉시 종료되었습니다. (코드={proc.returncode})"
+                )
+            if not self._console_controller_process_matches(
+                proc.pid,
+                process_birth,
+                settings,
+            ):
+                raise RuntimeError("controller process 실행 identity가 올바르지 않습니다.")
+            self._remove_controller_kill_switch_marker()
+            self._set_paused(False)
+            self.controller_proc = proc
+            self.notice = "controller 실행을 시작했습니다."
+        except Exception:
+            if proc is not None and proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                    proc.wait(timeout=2)
+                except Exception:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except Exception:
+                        pass
+            try:
+                self._write_controller_kill_switch_marker()
+            except Exception:
+                pass
+            try:
+                self._cleanup_console_pid_file(settings)
+            except Exception:
+                pass
+            raise
+        finally:
+            for fd in (pid_fd, stdout_fd, stderr_fd):
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+
+    def _console_process_stopped(
+        self,
+        pid: int,
+        process_birth: tuple[int, int],
+        settings: dict[str, Path],
+    ) -> bool:
+        try:
+            reaped, _ = os.waitpid(pid, os.WNOHANG)
+            if reaped == pid:
+                return True
+        except ChildProcessError:
+            pass
+        return not self._console_controller_process_matches(
+            pid,
+            process_birth,
+            settings,
+        )
+
+    def _stop_console_controller(self) -> None:
+        settings = self._console_controller_settings()
+        self._write_controller_kill_switch_marker()
+        identity = self._read_console_controller_identity(settings)
+        if identity is None:
+            self.notice = "controller kill-switch가 적용되었습니다."
+            return
+        pid, process_birth = identity
+        if not self._console_controller_process_matches(
+            pid,
+            process_birth,
+            settings,
+        ):
+            self._cleanup_console_pid_file(settings)
+            self.notice = "controller kill-switch가 적용되었습니다."
+            return
+        try:
+            if os.getpgid(pid) != pid:
+                raise RuntimeError("controller process group 상태가 올바르지 않습니다.")
+            os.killpg(pid, signal.SIGTERM)
+            deadline = time.monotonic() + 8.0
+            while time.monotonic() < deadline:
+                if self._console_process_stopped(
+                    pid,
+                    process_birth,
+                    settings,
+                ):
+                    break
+                time.sleep(0.1)
+            else:
+                if not self._console_controller_process_matches(
+                    pid,
+                    process_birth,
+                    settings,
+                ):
+                    self._cleanup_console_pid_file(settings)
+                    self.notice = "controller 중지 요청을 완료했습니다."
+                    return
+                os.killpg(pid, signal.SIGKILL)
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline:
+                    if self._console_process_stopped(
+                        pid,
+                        process_birth,
+                        settings,
+                    ):
+                        break
+                    time.sleep(0.1)
+                else:
+                    raise RuntimeError("controller process group을 종료하지 못했습니다.")
+            self._cleanup_console_pid_file(settings)
+            if self.controller_proc is not None and self.controller_proc.pid == pid:
+                try:
+                    self.controller_proc.wait(timeout=0)
+                except Exception:
+                    pass
+                self.controller_proc = None
+            self.notice = "controller 중지 요청을 완료했습니다."
+        except ProcessLookupError:
+            self._cleanup_console_pid_file(settings)
+            self.notice = "controller kill-switch가 적용되었습니다."
+
+    def _controller_runtime_active(self, external_pids: list[int] | None = None) -> bool:
+        if not self._is_controller_owner():
+            return False
+        if self._is_console_controller():
+            return (
+                self._console_controller_pid() is not None
+                and not self._controller_kill_switch_active()
+            )
+        pids = self._find_worker_pids() if external_pids is None else external_pids
+        if pids:
+            return True
+        if not self._controller_service_loaded():
+            return False
+        return not self._controller_kill_switch_active()
+
+    def _has_active_runtime(
+        self,
+        *,
+        managed_running: bool | None = None,
+        external_pids: list[int] | None = None,
+    ) -> bool:
+        running = self._is_managed_running() if managed_running is None else managed_running
+        pids = self._find_worker_pids() if external_pids is None else external_pids
+        if self._is_controller_owner():
+            return running or self._controller_runtime_active(pids)
+        return running or bool(pids)
 
     def _set_poll_boost(self, seconds: float = 6.0) -> None:
         # 사용자 동작 직후에는 빠르게 반영되도록 폴링을 잠깐 촉진한다.
@@ -421,6 +2202,26 @@ class ControlState:
 
     def start(self) -> None:
         with self.lock:
+            if self._is_controller_owner():
+                try:
+                    if self._is_console_controller():
+                        self._start_console_controller()
+                        self._notification_restart_required = False
+                        self._set_poll_boost()
+                        return
+                    if not self._controller_service_loaded():
+                        self.notice = "controller 서비스가 load되지 않아 시작할 수 없습니다."
+                        return
+                    self._remove_controller_kill_switch_marker()
+                    self._set_paused(False)
+                    self._run_launchctl("kickstart", "-k", self._controller_service_target())
+                    self._notification_restart_required = False
+                    self.notice = "controller 실행을 재개했습니다."
+                    self._set_poll_boost()
+                except Exception as exc:
+                    self.notice = f"시작 실패: {exc}"
+                return
+
             if self._is_managed_running():
                 if self._is_paused():
                     try:
@@ -496,6 +2297,21 @@ class ControlState:
 
     def stop(self) -> None:
         with self.lock:
+            if self._is_controller_owner():
+                try:
+                    if self._is_console_controller():
+                        self._stop_console_controller()
+                        self._set_poll_boost()
+                        return
+                    self._write_controller_kill_switch_marker()
+                    self._run_launchctl("kill", "SIGTERM", self._controller_service_target())
+                    self.notice = "controller 중지 요청을 보냈습니다."
+                    self._set_poll_boost()
+                except Exception as exc:
+                    self.notice = f"중지 실패: {exc}"
+                    self._set_poll_boost()
+                return
+
             stopped: list[int] = []
             errors: list[str] = []
             pause_clear_failed: str | None = None
@@ -556,7 +2372,14 @@ class ControlState:
             threading.Thread(target=callback, daemon=True).start()
 
     def _db_counts(self) -> dict[str, int]:
-        counts = {"PENDING": 0, "PROCESSING": 0, "DONE": 0, "ERROR": 0, "UNREGISTERED": 0}
+        counts = {
+            "PENDING": 0,
+            "PROCESSING": 0,
+            "NEEDS_REVIEW": 0,
+            "DONE": 0,
+            "ERROR": 0,
+            "UNREGISTERED": 0,
+        }
         try:
             with sqlite3.connect(self.db_path, timeout=3.0) as conn:
                 conn.execute("PRAGMA busy_timeout = 3000")
@@ -683,52 +2506,84 @@ class ControlState:
         if not path.exists() or not path.is_dir():
             return "missing"
         try:
-            stems = set()
-            for item in path.iterdir():
+            sets: set[tuple[str, str]] = set()
+            for item in path.rglob("*"):
                 if (
                     not item.is_file()
+                    or item.is_symlink()
                     or item.name.startswith(".")
                     or item.name.startswith("~")
                     or item.name.endswith(".quality.json")
                     or item.suffix not in {".txt", ".json"}
                 ):
                     continue
-                stems.add(item.stem)
-            return str(len(stems))
+                relative_parent = str(item.parent.relative_to(path))
+                sets.add((relative_parent, item.stem))
+            return str(len(sets))
         except Exception:
             return "오류"
 
-    def _truncate_log(self) -> None:
+    def _truncate_log(self) -> bool:
         if not self.log_path.exists():
-            return
+            return True
         try:
             self.log_path.write_text("", encoding="utf-8")
+            return True
         except Exception:
             try:
                 self.log_path.unlink()
                 self.log_path.touch()
+                return True
             except Exception:
-                pass
+                return False
 
-    def clear_history(self) -> None:
-        """완료/오류 이력과 로그를 수동 초기화한다. 사용자가 버튼을 눌렀을 때만 실행."""
+    def clear_history(self) -> bool:
+        """완료/오류 이력 중 다른 원장에서 참조하지 않는 작업만 정리한다."""
         try:
             with sqlite3.connect(self.db_path, timeout=3.0) as conn:
                 conn.execute("PRAGMA busy_timeout = 3000")
-                # PROCESSING 작업은 건드리지 않는다 — 워커가 실제 처리 중일 수 있음
-                conn.execute("DELETE FROM jobs WHERE status IN ('DONE', 'ERROR')")
-                conn.commit()
+                conn.execute("BEGIN IMMEDIATE")
+                tables = {
+                    row[0]
+                    for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+                }
+                protected = ["SELECT id FROM jobs WHERE status NOT IN ('DONE', 'ERROR')"]
+                protected.extend(
+                    f"SELECT source_job_id FROM {table} WHERE source_job_id IS NOT NULL"
+                    for table in ("deliveries", "transcript_deliveries", "transcript_postprocess_jobs")
+                    if table in tables
+                )
+                delivery_cfg = getattr(self, "config_data", {}).get("transcript_delivery") or {}
+                if delivery_cfg.get("enabled") is True:
+                    # DONE without a queue row is still a reconciliation source.
+                    protected.append("SELECT id FROM jobs WHERE status = 'DONE'")
+                if "deduped_from_job_id" in {
+                    row[1] for row in conn.execute("PRAGMA table_info(jobs)")
+                }:
+                    protected.append(
+                        "SELECT jobs.deduped_from_job_id FROM jobs "
+                        "JOIN protected ON jobs.id = protected.id "
+                        "WHERE jobs.deduped_from_job_id IS NOT NULL"
+                    )
+                query = (
+                    "WITH RECURSIVE protected(id) AS (" + " UNION ".join(protected) + ") "
+                    "DELETE FROM jobs WHERE status IN ('DONE', 'ERROR') "
+                    "AND id NOT IN (SELECT id FROM protected)"
+                )
+                conn.execute(query)
         except Exception as exc:
             self.notice = f"이력 초기화 실패: {exc}"
-            return
+            return False
 
         try:
-            self._truncate_log()
-        except Exception:
-            pass
-
-        self.notice = "이력 및 로그가 초기화되었습니다."
+            log_cleared = self._truncate_log()
+        except OSError:
+            log_cleared = False
+        self.notice = "정리 가능한 완료/오류 이력을 정리했습니다. 확인 필요 항목, 다른 원장이 참조하는 작업, 후처리 재조정 대상은 보존됩니다."
+        if not log_cleared:
+            self.notice += " 로그는 지우지 못했습니다."
         self._set_poll_boost()
+        return True
 
     def _folder_counts(self) -> dict[str, str]:
         return {
@@ -801,17 +2656,25 @@ class ControlState:
         managed_running: bool,
         external_pids: list[int],
         paused: bool,
+        controller_ready: bool = False,
     ) -> str:
         if paused:
             return "paused"
-        if managed_running or external_pids:
+        if managed_running or external_pids or controller_ready:
             return "running"
         return "stopped"
 
     @staticmethod
-    def _runtime_source_key(*, managed_running: bool, external_pids: list[int]) -> str:
+    def _runtime_source_key(
+        *,
+        managed_running: bool,
+        external_pids: list[int],
+        controller_ready: bool = False,
+    ) -> str:
         if managed_running:
             return "web"
+        if controller_ready:
+            return "controller"
         if external_pids:
             return "external"
         return "none"
@@ -852,19 +2715,43 @@ class ControlState:
             managed_running = self._is_managed_running()
             pids = self._find_worker_pids()
             paused = self._is_paused()
+            controller_ready = False
+            controller_source = False
+            controller_idle_kill_switch = False
+            if self._is_controller_owner():
+                if self._is_console_controller():
+                    controller_loaded = True
+                    controller_process_active = self._console_controller_pid() is not None
+                else:
+                    controller_loaded = self._controller_service_loaded()
+                    controller_process_active = controller_loaded
+                kill_switch_active = self._controller_kill_switch_active()
+                controller_ready = controller_process_active and not kill_switch_active
+                controller_source = controller_loaded
+                controller_idle_kill_switch = controller_loaded and kill_switch_active and not pids
             runtime_status = self._runtime_status_key(
                 managed_running=managed_running,
                 external_pids=pids,
                 paused=paused,
+                controller_ready=controller_ready,
             )
             runtime_source = self._runtime_source_key(
                 managed_running=managed_running,
                 external_pids=pids,
+                controller_ready=controller_source,
             )
 
-            if managed_running or pids:
+            if controller_idle_kill_switch:
+                runtime = "중지"
+                runtime_desc = "controller kill-switch가 적용되어 대기 중입니다."
+            elif managed_running or pids or controller_ready:
                 runtime = "일시정지" if paused else "실행중"
-                runtime_desc = "일시정지 상태(큐/파일 대기 중)" if paused else "큐/파일 대기 중"
+                if controller_source and not managed_running and not pids:
+                    runtime_desc = "일시정지 상태(controller 대기 중)" if paused else "controller 대기 중"
+                elif controller_source and pids:
+                    runtime_desc = "일시정지 상태(controller apply worker 실행 중)" if paused else "controller apply worker 실행 중"
+                else:
+                    runtime_desc = "일시정지 상태(큐/파일 대기 중)" if paused else "큐/파일 대기 중"
             elif paused:
                 runtime = "일시정지"
                 runtime_desc = "일시정지 상태(워커 미실행)"
@@ -872,11 +2759,15 @@ class ControlState:
                 runtime = "중지"
                 runtime_desc = "워커가 실행 중이 아닙니다."
 
-            if not managed_running and not pids and paused:
+            if not managed_running and not pids and not controller_ready and paused:
                 runtime = "일시정지"
                 runtime_desc = "일시정지 플래그가 적용되어 있습니다."
 
-            origin = "웹에서 실행 중" if managed_running else ("외부 실행 중" if pids else "-")
+            origin = (
+                "웹에서 실행 중"
+                if managed_running
+                else ("controller에서 실행 중" if controller_source else ("외부 실행 중" if pids else "-"))
+            )
             jobs = self._recent_jobs()
             processing = self._processing_jobs()
             jobs_v2 = [self._serialize_job_row(row) for row in jobs]

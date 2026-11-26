@@ -5,14 +5,66 @@ app:
   stable_for_sec: 90
   stale_processing_hours: 6
   transcribe_max_retries: 2
+  # "python" keeps the legacy long-running polling worker as execution owner.
+  # Switch to "controller" only after provisioning the guarded Go binary.
+  execution_owner: python
+  # "launchd" controls controller_label. "console" lets the already-authorized
+  # local web console own an exact immutable binary when macOS denies iCloud
+  # access to a newly launched background service.
+  # controller_runtime: launchd
+  # controller_label: com.geonha.lecture-stt-controller
+  # controller_kill_switch: "~/Library/Application Support/lecture_stt/controller/controller.disabled"
+  # Binary and both parent dirs must be mode 0500 + Darwin user-immutable:
+  # <mode-0500-uchg-versions>/<controller_binary_sha256>/lecture-stt-controller
+  # controller_binary: "/absolute/path/to/versions/<sha256>/lecture-stt-controller"
+  # controller_binary_sha256: "<exact 64-char lowercase SHA-256>"
+  # controller_state_dir: "/absolute/path/to/owned-mode-0700-state"
+  # 0600 canonical JSON PID + process-birth fence, outside recovery state.
+  # controller_pid_path: "/absolute/path/outside-the-recovery-state/controller.pid"
+  # controller_stdout_path: "~/Library/Logs/lecture_stt/controller.out.jsonl"
+  # controller_stderr_path: "~/Library/Logs/lecture_stt/controller.err.log"
 
 paths:
   watch_folder: "${LECTURE_RECORDINGS_ROOT}/00_inbox"
   stable_audio_folder: "${LECTURE_RECORDINGS_ROOT}/01_audio"
+  # Routed lectures are written below <semester>/<course_dir>; existing flat
+  # artifacts and unrouted/non-lecture results remain readable at this root.
   transcript_folder: "${LECTURE_RECORDINGS_ROOT}/02_transcripts"
   error_folder: "${LECTURE_RECORDINGS_ROOT}/99_errors"
   tmp_dir: ~/Library/Caches/lecture_stt/tmp
   db_path: state/jobs.sqlite3
+
+# Storage v2 remains separate from the live legacy jobs DB. The archive review
+# API is opt-in, and every mutation still needs an explicit request guard.
+storage_v2:
+  db_path: state/storage-v2.sqlite3
+  # Preserve-first imports reject a target nested under the legacy iCloud root.
+  records_root: "~/Library/Application Support/lecture_stt/storage-v2/records"
+  analytics:
+    enabled: false
+  library:
+    enabled: false
+    # Transcript body access is a separate opt-in because it crosses the
+    # metadata-only dashboard boundary. Every dashboard reader can use it while
+    # enabled; only verified current DONE TXT is read.
+    transcript_preview_enabled: false
+    transcript_preview_max_bytes: 2097152
+  archive_review:
+    enabled: false
+    status_writes_enabled: false
+    promotions_enabled: false
+  timetable:
+    # CSV/JSON import and classification generation remain CLI-only. These
+    # flags expose imported metadata/reviews and explicit review writes only.
+    enabled: false
+    status_writes_enabled: false
+    confirmations_enabled: false
+  title_review:
+    # Title proposals are generated separately; the web panel only exposes the
+    # review queue plus explicit reject/confirmation guards.
+    enabled: false
+    status_writes_enabled: false
+    confirmations_enabled: false
 
 engine:
   engine: faster-whisper
@@ -29,6 +81,46 @@ transcribe:
   condition_on_previous_text: true
   keep_model_loaded: false
 
+# 활성 프로필은 전사 실행 시점에 snapshot(key/version/hash)으로 기록된다.
+# 일반 녹음을 기본값으로 두고, 강의/회의/메모는 필요할 때 active만 바꾼다.
+profiles:
+  active: general
+  definitions:
+    general:
+      version: "2026-07-23.1"
+      transcribe:
+        initial_prompt: ""
+      postprocess:
+        corrections: {}
+      quality:
+        warn_threshold: 0.55
+        bad_threshold: 0.70
+    lecture:
+      version: "2026-07-23.1"
+      transcribe:
+        initial_prompt: "한국어 대학 수업 녹음입니다."
+      quality:
+        warn_threshold: 0.55
+        bad_threshold: 0.70
+    meeting:
+      version: "2026-07-23.1"
+      transcribe:
+        initial_prompt: "한국어 회의 및 대화 녹음입니다."
+      postprocess:
+        corrections: {}
+      quality:
+        warn_threshold: 0.55
+        bad_threshold: 0.70
+    memo:
+      version: "2026-07-23.1"
+      transcribe:
+        initial_prompt: "한국어 개인 음성 메모입니다."
+      postprocess:
+        corrections: {}
+      quality:
+        warn_threshold: 0.55
+        bad_threshold: 0.70
+
 ffmpeg:
   binary_path: ffmpeg
 
@@ -41,6 +133,32 @@ cleanup:
   retain_days: 7
   retain_min_transcripts: 5
 
+# STT DONE 후처리는 opt-in이다. 과거 backlog 차단 시각은 별도 설정하지 않고
+# active semester snapshot의 activated_at을 단일 기준으로 사용한다.
+transcript_delivery:
+  enabled: false
+  active_semester_manifest: state/active-semester.json
+  # Routed staging paths are derived as root/<semester>/<course_dir>/<stem>.*.
+  correction_staging_dir: "${LECTURE_RECORDINGS_ROOT}/03_correction"
+  summary_staging_dir: "${LECTURE_RECORDINGS_ROOT}/04_summarize"
+  generator:
+    backend: codex_cli
+    # 저장된 ChatGPT 로그인 세션을 사용하는 Codex CLI 실행 파일.
+    # launchd 환경에서 PATH 탐색이 불확실하면 절대 경로를 지정한다.
+    codex_binary: codex
+    model: gpt-5.6-terra
+    reasoning_effort: low
+    timeout_sec: 1200
+    max_attempts: 3
+    max_correction_chars: 100000
+    max_summary_chars: 100000
+  scan_interval_sec: 30
+  batch_size: 20
+  log_jsonl_path: ~/Library/Logs/lecture_stt/transcript-delivery.jsonl
+  log_jsonl_max_bytes: 10485760
+  log_jsonl_backup_count: 5
+  lock_path: state/transcript-delivery.lock
+
 correction:
   prompt_folder: "${LECTURE_RECORDINGS_ROOT}/05_prompt"
   mode: manual  # API-backed automatic correction is disabled; use manual/provider-neutral correction.
@@ -52,9 +170,12 @@ notification:
   enabled: true
   send_start: true
   send_success: true
+  send_review: true
   send_failure: true
   dual_send_providers: []
 
+# Legacy correction/summary archive-evidence compatibility only. The active
+# distributor does not scan these folders.
 downstream:
   scan_interval_sec: 30
   stable_for_sec: 60
@@ -74,29 +195,29 @@ downstream:
       gh_course_dir: "01_logic_circuits"
       obsidian_course_dir: "01_logic_circuits"
       display_name: "논리회로"
-      obsidian_note_dir: "강의록"
+      obsidian_note_dir: "06_lecture_notes/01_summarize"
     DStr:
       gh_course_dir: "02_data_structures"
       obsidian_course_dir: "02_data_structures"
       display_name: "자료구조"
-      obsidian_note_dir: "강의록"
+      obsidian_note_dir: "06_lecture_notes/01_summarize"
     DS:
       gh_course_dir: "03_data_science"
       obsidian_course_dir: "03_data_science"
       display_name: "데이터사이언스"
-      obsidian_note_dir: "강의록"
+      obsidian_note_dir: "06_lecture_notes/01_summarize"
     LA:
       gh_course_dir: "04_linear_algebra"
       obsidian_course_dir: "04_linear_algebra"
       display_name: "선형대수학"
-      obsidian_note_dir: "강의록"
+      obsidian_note_dir: "06_lecture_notes/01_summarize"
     OOP:
       gh_course_dir: "05_object_oriented_programming"
       obsidian_course_dir: "05_object_oriented_programming"
       display_name: "객체지향언어"
-      obsidian_note_dir: "강의록"
+      obsidian_note_dir: "06_lecture_notes/01_summarize"
     Unix:
       gh_course_dir: "06_unix_fundamentals"
       obsidian_course_dir: "06_unix_fundamentals"
       display_name: "유닉스 기초"
-      obsidian_note_dir: "강의록"
+      obsidian_note_dir: "06_lecture_notes/01_summarize"

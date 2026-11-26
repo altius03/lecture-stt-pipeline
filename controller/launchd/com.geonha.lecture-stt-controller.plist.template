@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
+		<key>PYTHONDONTWRITEBYTECODE</key>
+		<string>1</string>
+	</dict>
+	<key>KeepAlive</key>
+	<true/>
+	<key>Label</key>
+	<string>com.geonha.lecture-stt-controller</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>__REPO_ROOT__/scripts/run_controller.sh</string>
+		<string>__CONTROLLER_BIN__</string>
+		<string>--python-bin</string>
+		<string>__PYTHON_BIN__</string>
+		<string>--repo-root</string>
+		<string>__REPO_ROOT__</string>
+		<string>--config</string>
+		<string>__CONFIG_PATH__</string>
+		<string>--kill-switch</string>
+		<string>__KILL_SWITCH_PATH__</string>
+		<string>--state-dir</string>
+		<string>__STATE_DIR__</string>
+		<string>--cycle-interval-sec</string>
+		<string>10</string>
+		<string>--max-fresh-jobs</string>
+		<string>1</string>
+		<string>--enable-execution</string>
+		<string>--allow-write</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>__HOME__/Library/Logs/lecture_stt/controller.err.log</string>
+	<key>StandardOutPath</key>
+	<string>__HOME__/Library/Logs/lecture_stt/controller.out.jsonl</string>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>WorkingDirectory</key>
+	<string>__REPO_ROOT__</string>
+</dict>
+</plist>

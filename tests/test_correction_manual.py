@@ -61,6 +61,40 @@ class CorrectionManualModeTests(unittest.TestCase):
             self.assertFalse((correction_dir / "260316LC_1.txt").exists())
             self.assertFalse((correction_dir / "260316LC_1.json").exists())
 
+    def test_correction_worker_discovers_nested_course_pair(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            transcript_dir = root / "02_transcripts"
+            correction_dir = root / "03_correction"
+            prompt_dir = root / "05_prompt"
+            relative_dir = Path("2026-2") / "01_computer_architecture"
+            (transcript_dir / relative_dir).mkdir(parents=True)
+            (correction_dir / relative_dir).mkdir(parents=True)
+            txt = transcript_dir / relative_dir / "260901CA_1.txt"
+            js = transcript_dir / relative_dir / "260901CA_1.json"
+            txt.write_text("raw transcript", encoding="utf-8")
+            js.write_text(
+                '{"segments":[{"id":1,"start":0,"end":1,"text":"raw transcript"}]}',
+                encoding="utf-8",
+            )
+
+            from lecture_stt.correction.worker import CorrectionConfig
+
+            config = CorrectionConfig(
+                transcript_dir=transcript_dir,
+                correction_dir=correction_dir,
+                prompt_dir=prompt_dir,
+                stable_for_sec=0,
+                scan_interval_sec=60,
+            )
+
+            pairs = CorrectionWorker(config)._collect_pending_pairs()
+
+            self.assertEqual(len(pairs), 1)
+            self.assertEqual(pairs[0].stem, "260901CA_1")
+            self.assertEqual(pairs[0].txt_path, txt)
+            self.assertEqual(pairs[0].json_path, js)
+
     def test_requirements_do_not_depend_on_anthropic(self) -> None:
         requirements = Path("requirements.txt").read_text(encoding="utf-8").lower()
         self.assertNotIn("anthropic", requirements)

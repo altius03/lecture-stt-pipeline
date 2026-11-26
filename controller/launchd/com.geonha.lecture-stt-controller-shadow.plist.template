@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
+		<key>PYTHONDONTWRITEBYTECODE</key>
+		<string>1</string>
+		<key>PYTHONPATH</key>
+		<string>__BUNDLED_RUNTIME_ROOT__</string>
+	</dict>
+	<key>Label</key>
+	<string>com.geonha.lecture-stt-controller-shadow</string>
+	<key>LowPriorityIO</key>
+	<true/>
+	<key>Nice</key>
+	<integer>1</integer>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>__PYTHON_BIN__</string>
+		<string>-m</string>
+		<string>lecture_stt.stt.controller_evidence</string>
+		<string>run</string>
+		<string>--journal-root</string>
+		<string>__EVIDENCE_ROOT__</string>
+		<string>--controller-bin</string>
+		<string>__CONTROLLER_SHADOW_BIN__</string>
+		<string>--python-bin</string>
+		<string>__PYTHON_BIN__</string>
+		<string>--repo-root</string>
+		<string>__REPO_ROOT__</string>
+		<string>--config</string>
+		<string>__CONFIG_PATH__</string>
+		<string>--kill-switch</string>
+		<string>__KILL_SWITCH_PATH__</string>
+		<string>--timeout-sec</string>
+		<string>1800</string>
+		<string>--expected-count</string>
+		<string>1</string>
+		<string>--enable-observation</string>
+		<string>--allow-write</string>
+	</array>
+	<key>StandardErrorPath</key>
+	<string>__HOME__/Library/Logs/lecture_stt/controller-shadow.err.log</string>
+	<key>StandardOutPath</key>
+	<string>__HOME__/Library/Logs/lecture_stt/controller-shadow.evidence-result.jsonl</string>
+	<key>StartInterval</key>
+	<integer>300</integer>
+	<key>WorkingDirectory</key>
+	<string>__BUNDLED_RUNTIME_ROOT__</string>
+</dict>
+</plist>

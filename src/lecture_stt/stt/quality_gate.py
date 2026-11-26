@@ -32,12 +32,18 @@ class QualityReport:
     empty_ratio: float
     dot_noise_ratio: float
     short_segment_ratio: float
+    nonempty_segments: int        # 비어 있지 않은 세그먼트 수
+    nonspace_chars: int           # 공백 제외 텍스트 문자 수
+    last_segment_end_sec: float   # 마지막 세그먼트 종료 시각
+    audio_duration_sec: float | None
+    chars_per_audio_min: float | None
+    coverage_ratio: float | None
     quality_score: int            # 0~100, 높을수록 건강함
     health: str                   # "good" | "warn" | "bad"
     summary: str                  # 사람이 읽을 수 있는 한 줄 요약
 
     def to_dict(self) -> dict:
-        return {
+        payload = {
             "total_segments": self.total_segments,
             "empty_segments": self.empty_segments,
             "dot_noise_segments": self.dot_noise_segments,
@@ -47,10 +53,20 @@ class QualityReport:
             "empty_ratio": round(self.empty_ratio, 4),
             "dot_noise_ratio": round(self.dot_noise_ratio, 4),
             "short_segment_ratio": round(self.short_segment_ratio, 4),
+            "nonempty_segments": self.nonempty_segments,
+            "nonspace_chars": self.nonspace_chars,
+            "last_segment_end_sec": round(self.last_segment_end_sec, 3),
             "quality_score": self.quality_score,
             "health": self.health,
             "summary": self.summary,
         }
+        if self.audio_duration_sec is not None:
+            payload["audio_duration_sec"] = round(self.audio_duration_sec, 3)
+        if self.chars_per_audio_min is not None:
+            payload["chars_per_audio_min"] = round(self.chars_per_audio_min, 2)
+        if self.coverage_ratio is not None:
+            payload["coverage_ratio"] = round(self.coverage_ratio, 4)
+        return payload
 
 
 def quality_scorecard_path(transcript_json_path: str | Path) -> Path:
@@ -96,6 +112,12 @@ def build_quality_scorecard(
             "empty_ratio",
             "dot_noise_ratio",
             "short_segment_ratio",
+            "nonempty_segments",
+            "nonspace_chars",
+            "last_segment_end_sec",
+            "audio_duration_sec",
+            "chars_per_audio_min",
+            "coverage_ratio",
         ),
     )
     model = _copy_present(
@@ -115,7 +137,7 @@ def build_quality_scorecard(
         ),
     )
 
-    return {
+    scorecard = {
         "schema_version": QUALITY_SCORECARD_SCHEMA_VERSION,
         "kind": QUALITY_SCORECARD_KIND,
         "canonical_base": str(metadata.get("canonical_base") or ""),
@@ -128,6 +150,18 @@ def build_quality_scorecard(
         "model": model,
         "artifacts": artifacts,
     }
+    profile = metadata.get("profile")
+    if isinstance(profile, Mapping):
+        profile_snapshot = _copy_present(
+            profile,
+            ("key", "version", "config_sha256"),
+        )
+        if profile_snapshot:
+            scorecard["profile"] = {
+                key: str(value)
+                for key, value in profile_snapshot.items()
+            }
+    return scorecard
 
 
 def write_quality_scorecard(transcript_json_path: str | Path, metadata: Mapping[str, Any]) -> Path:
@@ -179,6 +213,9 @@ def validate_quality_scorecard(transcript_json_path: str | Path, metadata: Mappi
         if scorecard.get(key) != expected[key]:
             raise ValueError(f"Quality scorecard {key} does not match transcript metadata")
 
+    if "profile" in expected and scorecard.get("profile") != expected["profile"]:
+        raise ValueError("Quality scorecard profile does not match transcript metadata")
+
     artifacts = scorecard.get("artifacts")
     if not isinstance(artifacts, dict):
         raise ValueError("Quality scorecard missing artifacts object")
@@ -205,26 +242,60 @@ def evaluate(
     text: str,
     warn_threshold: float = 0.55,
     bad_threshold: float = 0.70,
+    audio_duration_sec: float | None = None,
 ) -> QualityReport:
-    """segments(dict 리스트)와 text로 품질 보고서를 생성한다."""
+    """segments(dict 리스트)와 text로 품질 보고서를 생성한다.
+
+    audio_duration_sec가 있으면 오늘 260610LC처럼 "길이는 긴데 초반 일부만
+    전사된" 결과를 잡기 위해 전사 밀도와 시간 커버리지도 함께 본다.
+    """
     dot_re = re.compile(r"^[\s.,。、…·]+$")
 
     total = len(segments)
-    empty = sum(1 for seg in segments if not seg["text"].strip())
-    dot_noise = sum(1 for seg in segments if dot_re.match(seg["text"].strip() or " "))
+    empty = sum(1 for seg in segments if not str(seg.get("text", "")).strip())
+    dot_noise = sum(1 for seg in segments if dot_re.match(str(seg.get("text", "")).strip() or " "))
     short_segments = sum(
         1
         for seg in segments
-        if seg["text"].strip() and len(seg["text"].strip()) <= 2
+        if str(seg.get("text", "")).strip() and len(str(seg.get("text", "")).strip()) <= 2
     )
 
-    seg_lengths = [len(seg["text"].strip()) for seg in segments if seg["text"].strip()]
-    avg_len = sum(seg_lengths) / len(seg_lengths) if seg_lengths else 0.0
+    seg_lengths = [len(str(seg.get("text", "")).strip()) for seg in segments if str(seg.get("text", "")).strip()]
+    nonempty_segments = len(seg_lengths)
+    avg_len = sum(seg_lengths) / nonempty_segments if seg_lengths else 0.0
+    nonspace_chars = sum(1 for char in text if not char.isspace())
+
+    segment_ends: list[float] = []
+    for seg in segments:
+        try:
+            end = float(seg.get("end", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if end >= 0:
+            segment_ends.append(end)
+    last_segment_end_sec = max(segment_ends) if segment_ends else 0.0
+
+    normalized_duration_sec: float | None = None
+    if audio_duration_sec is not None:
+        try:
+            candidate_duration = float(audio_duration_sec)
+        except (TypeError, ValueError):
+            candidate_duration = 0.0
+        if candidate_duration > 0:
+            normalized_duration_sec = candidate_duration
+
+    chars_per_audio_min: float | None = None
+    coverage_ratio: float | None = None
+    if normalized_duration_sec is not None:
+        duration_min = normalized_duration_sec / 60.0
+        if duration_min > 0:
+            chars_per_audio_min = nonspace_chars / duration_min
+        coverage_ratio = min(1.0, last_segment_end_sec / normalized_duration_sec)
 
     rep_mass = _compression_ratio(text)
     empty_ratio = (empty / total) if total else 0.0
     dot_noise_ratio = (dot_noise / total) if total else 0.0
-    short_segment_ratio = (short_segments / len(seg_lengths)) if seg_lengths else 0.0
+    short_segment_ratio = (short_segments / nonempty_segments) if nonempty_segments else 0.0
 
     score = 100.0
     score -= min(55.0, rep_mass * 60.0)
@@ -236,8 +307,32 @@ def evaluate(
     elif avg_len < 7.0:
         score -= 6.0
 
-    quality_score = max(0, min(100, int(round(score))))
     issues: list[str] = []
+    duration_critical = False
+    if normalized_duration_sec is not None and normalized_duration_sec >= 180:
+        if chars_per_audio_min is not None:
+            if chars_per_audio_min < 15.0:
+                score -= 45.0
+                issues.append("오디오 길이 대비 전사량이 매우 적음")
+                duration_critical = True
+            elif chars_per_audio_min < 45.0:
+                score -= 25.0
+                issues.append("오디오 길이 대비 전사량이 적음")
+        if coverage_ratio is not None:
+            if coverage_ratio < 0.35:
+                score -= 40.0
+                issues.append("전사가 오디오 초반부에서 끊김")
+                duration_critical = True
+            elif coverage_ratio < 0.75:
+                score -= 20.0
+                issues.append("전사 시간 커버리지가 낮음")
+        if normalized_duration_sec >= 600:
+            min_expected_segments = max(10, int((normalized_duration_sec / 60.0) * 0.4))
+            if nonempty_segments < min_expected_segments:
+                score -= 20.0
+                issues.append("오디오 길이 대비 세그먼트 수가 적음")
+
+    quality_score = max(0, min(100, int(round(score))))
     if rep_mass >= bad_threshold:
         issues.append("반복 비율이 매우 높음")
     elif rep_mass >= warn_threshold:
@@ -257,7 +352,7 @@ def evaluate(
     if avg_len and avg_len < 4.0:
         issues.append("문장 길이가 지나치게 짧음")
 
-    if rep_mass >= bad_threshold or quality_score < 45 or len(issues) >= 3:
+    if duration_critical or rep_mass >= bad_threshold or quality_score < 45 or len(issues) >= 3:
         health = "bad"
         summary = (
             f"품질 위험 (점수 {quality_score}/100). "
@@ -283,13 +378,28 @@ def evaluate(
         empty_ratio=empty_ratio,
         dot_noise_ratio=dot_noise_ratio,
         short_segment_ratio=short_segment_ratio,
+        nonempty_segments=nonempty_segments,
+        nonspace_chars=nonspace_chars,
+        last_segment_end_sec=last_segment_end_sec,
+        audio_duration_sec=normalized_duration_sec,
+        chars_per_audio_min=chars_per_audio_min,
+        coverage_ratio=coverage_ratio,
         quality_score=quality_score,
         health=health,
         summary=summary,
     )
 
     logger.info(
-        "quality_gate: health=%s score=%d rep_mass=%.4f segments=%d empty=%d dot=%d short=%d avg_len=%.1f",
-        health, quality_score, rep_mass, total, empty, dot_noise, short_segments, avg_len,
+        "quality_gate: health=%s score=%d rep_mass=%.4f segments=%d empty=%d dot=%d short=%d avg_len=%.1f chars_per_min=%s coverage=%s",
+        health,
+        quality_score,
+        rep_mass,
+        total,
+        empty,
+        dot_noise,
+        short_segments,
+        avg_len,
+        f"{chars_per_audio_min:.2f}" if chars_per_audio_min is not None else "n/a",
+        f"{coverage_ratio:.4f}" if coverage_ratio is not None else "n/a",
     )
     return report
