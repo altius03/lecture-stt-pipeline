@@ -4,6 +4,7 @@ import importlib.util
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -27,6 +28,39 @@ def _load_module(module_name: str, path: Path):
 
 
 class ScriptEntrypointTests(unittest.TestCase):
+    def test_setup_launchd_refuses_controller_execution_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "scripts").mkdir()
+            (root / "config").mkdir()
+            (root / ".venv" / "bin").mkdir(parents=True)
+            shutil.copy2(REPO_ROOT / "scripts" / "setup_launchd.sh", root / "scripts" / "setup_launchd.sh")
+            (root / "config" / "config.yaml").write_text(
+                "app:\n  execution_owner: controller\n", encoding="utf-8"
+            )
+            python_wrapper = root / ".venv" / "bin" / "python"
+            python_wrapper.write_text(
+                f'#!/bin/sh\nif [ "$1" = "-m" ]; then exit 0; fi\nexec "{sys.executable}" "$@"\n',
+                encoding="utf-8",
+            )
+            python_wrapper.chmod(0o700)
+            override_config = root / "other-config.yaml"
+            override_config.write_text("app:\n  execution_owner: python\n", encoding="utf-8")
+            env = dict(os.environ)
+            env["HOME"] = str(root / "home")
+            env["LECTURE_STT_CONFIG"] = str(override_config)
+            result = subprocess.run(
+                ["bash", str(root / "scripts" / "setup_launchd.sh")],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("execution_owner=controller", result.stdout)
+            self.assertFalse((root / "home" / "Library" / "LaunchAgents").exists())
+
     def test_cleanup_script_runs_without_pythonpath(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -44,6 +78,7 @@ class ScriptEntrypointTests(unittest.TestCase):
                     f"  stable_audio_folder: {audio_dir}\n"
                     f"  transcript_folder: {transcript_dir}\n"
                     f"  tmp_dir: {tmp_dir}\n"
+                    f"  db_path: {root / 'jobs.sqlite3'}\n"
                 ),
                 encoding="utf-8",
             )
@@ -170,6 +205,103 @@ class ScriptEntrypointTests(unittest.TestCase):
             self.assertTrue((transcript_dir / "real_lecture.json").exists())
             self.assertTrue((transcript_dir / "real_lecture.quality.json").exists())
             self.assertFalse((transcript_dir / "orphan.quality.json").exists())
+
+    def test_cleanup_transcripts_groups_nested_course_sets_independently(self) -> None:
+        module = _load_module("cleanup_script", REPO_ROOT / "scripts" / "cleanup.py")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            transcript_dir = Path(temp_dir)
+            first = transcript_dir / "2026-2" / "01_computer_architecture"
+            second = transcript_dir / "2026-2" / "02_computer_network"
+            first.mkdir(parents=True)
+            second.mkdir(parents=True)
+            now = time.time()
+
+            for directory in (first, second):
+                for suffix in (".txt", ".json", ".quality.json"):
+                    path = directory / f"same_stem{suffix}"
+                    path.write_text("{}", encoding="utf-8")
+                    os.utime(path, (now - 600, now - 600))
+
+            deleted, kept = module._cleanup_transcripts(
+                transcript_dir,
+                cutoff_ts=now + 1,
+                dry_run=False,
+                min_keep=1,
+            )
+
+            self.assertEqual(deleted, 3)
+            self.assertEqual(kept, 3)
+            remaining_parents = {
+                path.parent.relative_to(transcript_dir)
+                for path in transcript_dir.rglob("same_stem.txt")
+            }
+            self.assertEqual(len(remaining_parents), 1)
+
+    def test_cleanup_preserves_unresolved_needs_review_artifacts(self) -> None:
+        module = _load_module("cleanup_script", REPO_ROOT / "scripts" / "cleanup.py")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            audio_dir = root / "audio"
+            transcript_dir = root / "transcripts"
+            audio_dir.mkdir()
+            transcript_dir.mkdir()
+            db_path = root / "jobs.sqlite3"
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    "CREATE TABLE jobs (canonical_base TEXT, status TEXT NOT NULL)"
+                )
+                conn.executemany(
+                    "INSERT INTO jobs (canonical_base, status) VALUES (?, ?)",
+                    [
+                        ("protected", "NEEDS_REVIEW"),
+                        ("expired", "DONE"),
+                    ],
+                )
+
+            now = time.time()
+            for directory, names in (
+                (audio_dir, ["protected.m4a", "expired.m4a"]),
+                (
+                    transcript_dir,
+                    [
+                        "protected.txt",
+                        "protected.json",
+                        "protected.quality.json",
+                        "expired.txt",
+                        "expired.json",
+                        "expired.quality.json",
+                    ],
+                ),
+            ):
+                for name in names:
+                    path = directory / name
+                    path.write_text("{}", encoding="utf-8")
+                    os.utime(path, (now - 600, now - 600))
+
+            protected = module._needs_review_stems(db_path)
+            removed_audio, _ = module._cleanup_audio(
+                audio_dir,
+                cutoff_ts=now,
+                dry_run=False,
+                protected_stems=protected,
+            )
+            removed_transcripts, _ = module._cleanup_transcripts(
+                transcript_dir,
+                cutoff_ts=now,
+                dry_run=False,
+                min_keep=0,
+                protected_stems=protected,
+            )
+
+            self.assertEqual(protected, {"protected"})
+            self.assertEqual(removed_audio, 1)
+            self.assertEqual(removed_transcripts, 3)
+            self.assertTrue((audio_dir / "protected.m4a").exists())
+            self.assertTrue((transcript_dir / "protected.txt").exists())
+            self.assertTrue((transcript_dir / "protected.json").exists())
+            self.assertTrue((transcript_dir / "protected.quality.json").exists())
+            self.assertFalse((audio_dir / "expired.m4a").exists())
+            self.assertFalse((transcript_dir / "expired.txt").exists())
 
     def test_rotate_logs_script_is_dry_run_by_default(self) -> None:
         module = _load_module("rotate_logs_script", REPO_ROOT / "scripts" / "rotate_logs.py")

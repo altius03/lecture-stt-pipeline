@@ -15,6 +15,7 @@ export interface PanelLogState {
 
 interface UsePanelLogsOptions {
   endpoint: string
+  eventsEndpoint?: string | null
   pollIntervalSec: number
   enabled: boolean
   resetKey: number
@@ -51,7 +52,7 @@ function appendLogText(previous: PanelLogState, nextChunk: string, nextOffset: n
   }
 }
 
-export function usePanelLogs({ endpoint, pollIntervalSec, enabled, resetKey }: UsePanelLogsOptions) {
+export function usePanelLogs({ endpoint, eventsEndpoint, pollIntervalSec, enabled, resetKey }: UsePanelLogsOptions) {
   const logRef = useRef<HTMLPreElement>(null)
   const offsetRef = useRef<number | null>(null)
   const intervalMsRef = useRef(1000)
@@ -72,6 +73,7 @@ export function usePanelLogs({ endpoint, pollIntervalSec, enabled, resetKey }: U
       setError(null)
       setAutoFollowState(true)
       setHasUnread(false)
+      setRealtimeConnected(false)
       return
     }
 
@@ -82,36 +84,40 @@ export function usePanelLogs({ endpoint, pollIntervalSec, enabled, resetKey }: U
   }, [enabled, endpoint, resetKey])
 
   useEffect(() => {
-    if (!enabled) {
+    if (!enabled || eventsEndpoint === null) {
+      setRealtimeConnected(false)
       return
     }
 
-    return subscribePanelEvents({
-      onEvent: (event) => {
-        if (event.type === "log_chunk") {
-          offsetRef.current = event.payload.offset
-          setLogs((previous) => appendLogText(previous, event.payload.text, event.payload.offset, false))
-          setError(null)
-          return
-        }
+    return subscribePanelEvents(
+      {
+        onEvent: (event) => {
+          if (event.type === "log_chunk") {
+            offsetRef.current = event.payload.offset
+            setLogs((previous) => appendLogText(previous, event.payload.text, event.payload.offset, false))
+            setError(null)
+            return
+          }
 
-        if (event.type === "log_reset") {
-          offsetRef.current = event.payload.offset
-          setLogs((previous) => appendLogText(previous, event.payload.text, event.payload.offset, true))
-          setError(null)
-        }
+          if (event.type === "log_reset") {
+            offsetRef.current = event.payload.offset
+            setLogs((previous) => appendLogText(previous, event.payload.text, event.payload.offset, true))
+            setError(null)
+          }
+        },
+        onConnectionChange: (connected) => {
+          if (connected) {
+            setError(null)
+          }
+          setRealtimeConnected(connected)
+        },
+        onFatalError: (message) => {
+          setError(message)
+        },
       },
-      onConnectionChange: (connected) => {
-        if (connected) {
-          setError(null)
-        }
-        setRealtimeConnected(connected)
-      },
-      onFatalError: (message) => {
-        setError(message)
-      },
-    })
-  }, [enabled])
+      eventsEndpoint,
+    )
+  }, [enabled, eventsEndpoint])
 
   useEffect(() => {
     if (!enabled || realtimeConnected) {

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import json
 import logging
 from logging.handlers import RotatingFileHandler
@@ -8,17 +9,33 @@ import os
 from pathlib import Path
 import re
 import shutil
+import sqlite3
+import sys
 import time
 import traceback
-from typing import Any, Dict
+from typing import Any, Callable, Dict, Mapping, cast
 
 from dotenv import load_dotenv
 import yaml
 
+from lecture_stt.downstream.course_storage import (
+    ROUTE_KIND_ROUTED,
+    CourseRoutingSource,
+    CourseStorageError,
+    descendant_relative_path,
+    ensure_course_storage_parent,
+    resolve_course_route,
+)
+from lecture_stt.downstream.semester import load_active_semester
+from lecture_stt.downstream.transcript_delivery import (
+    enqueue_completed_job,
+    load_postprocess_settings,
+)
 from lecture_stt.shared import db, utils
 from lecture_stt.shared.db import (
     STATUS_DONE,
     STATUS_ERROR,
+    STATUS_NEEDS_REVIEW,
     STATUS_PENDING,
     STATUS_PROCESSING,
 )
@@ -34,13 +51,64 @@ from lecture_stt.shared.paths import (
 )
 from lecture_stt.stt.notifier import SUPPORTED_PROVIDERS, build_notifier
 from lecture_stt.stt.postprocess import postprocess
+from lecture_stt.stt.profiles import (
+    legacy_unknown_snapshot,
+    merge_transcribe_config,
+    resolve_profile,
+)
 from lecture_stt.stt.quality_gate import (
     evaluate as quality_evaluate,
     validate_quality_scorecard,
     write_quality_scorecard,
 )
+from lecture_stt.stt.controller_gate import (
+    ControllerGateError,
+    controller_kill_switch_is_active,
+    ensure_controller_execution_unpaused,
+    ensure_controller_kill_switch_inactive,
+    normalize_controller_kill_switch_path,
+)
+from lecture_stt.stt.retry_job import (
+    RetryJobConflictError,
+    RetryJobContractError,
+    build_next_retry_job_plan,
+    build_retry_job_plan,
+    load_retry_job_plan,
+    retry_job_result,
+    revalidate_retry_job_plan,
+    validate_next_retry_job_plan,
+    validate_retry_apply_guards,
+)
+from lecture_stt.stt.single_job import (
+    SingleJobContractError,
+    build_single_job_plan,
+    load_single_job_plan,
+    revalidate_single_job_plan,
+    single_job_result,
+    validate_apply_guards,
+)
+from lecture_stt.stt.terminal_error_recovery import (
+    TerminalErrorRecoveryConflictError,
+    TerminalErrorRecoveryContractError,
+    build_terminal_error_recovery_plan,
+    load_terminal_error_recovery_plan,
+    terminal_error_recovery_result,
+    apply_terminal_error_recovery_plan,
+    validate_terminal_error_recovery_apply_guards,
+)
 from lecture_stt.stt.transcribe import EngineParams, STTWorker
 from lecture_stt.stt.watcher import PollingWatcher
+
+
+def _audio_duration_from_tmp_wav(tmp_wav: Path) -> float | None:
+    """Return decoded WAV duration when available, without failing transcript output."""
+    duration_reader = cast("Callable[[Path], float | None] | None", getattr(STTWorker, "_wav_duration_sec", None))
+    if not callable(duration_reader):
+        return None
+    try:
+        return duration_reader(tmp_wav)
+    except Exception:
+        return None
 
 try:
     import fcntl
@@ -123,7 +191,12 @@ def load_config(config_path: str = "config/config.yaml") -> dict:
 
     return loaded
 
-def validate_config(config_path: str, config: dict) -> dict:
+def validate_config(
+    config_path: str,
+    config: dict,
+    *,
+    check_writable: bool = True,
+) -> dict:
     # 설정 섹션/타입/값 범위를 검증해 실행 시 실패를 앞당긴다.
     config = _normalize_config_paths(config)
     config_path_obj = Path(config_path)
@@ -155,6 +228,11 @@ def validate_config(config_path: str, config: dict) -> dict:
     notification = config.get("notification") or {}
     if notification and not isinstance(notification, dict):
         raise ValueError(f"Config error in {config_path_obj}: invalid section 'notification'")
+    transcript_delivery = config.get("transcript_delivery") or {}
+    if transcript_delivery and not isinstance(transcript_delivery, dict):
+        raise ValueError(
+            f"Config error in {config_path_obj}: invalid section 'transcript_delivery'"
+        )
 
     required_app = ["polling_interval_sec", "stable_for_sec", "stale_processing_hours"]
     for key in required_app:
@@ -209,42 +287,51 @@ def validate_config(config_path: str, config: dict) -> dict:
     if not watch_folder.is_dir():
         raise NotADirectoryError(f"Config error: watch_folder is not a directory: {watch_folder}")
 
-    writable_dirs = [
-        ("paths.stable_audio_folder", Path(paths["stable_audio_folder"])),
-        ("paths.transcript_folder", Path(paths["transcript_folder"])),
-        ("paths.error_folder", Path(paths["error_folder"])),
-        ("paths.tmp_dir", Path(paths["tmp_dir"])),
-    ]
-    for label, directory in writable_dirs:
+    if check_writable:
+        writable_dirs = [
+            ("paths.stable_audio_folder", Path(paths["stable_audio_folder"])),
+            ("paths.transcript_folder", Path(paths["transcript_folder"])),
+            ("paths.error_folder", Path(paths["error_folder"])),
+            ("paths.tmp_dir", Path(paths["tmp_dir"])),
+        ]
+        for label, directory in writable_dirs:
+            try:
+                directory.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                raise PermissionError(
+                    f"Config error: cannot create {label} directory {directory}"
+                ) from exc
+            probe = directory / f".lecture_stt_write_probe_{os.getpid()}"
+            try:
+                probe.write_text("", encoding="utf-8")
+                probe.unlink()
+            except OSError as exc:
+                raise PermissionError(
+                    f"Config error: cannot write in {label} directory {directory}"
+                ) from exc
+
+        db_parent = Path(paths["db_path"]).parent
         try:
-            directory.mkdir(parents=True, exist_ok=True)
+            db_parent.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
-            raise PermissionError(f"Config error: cannot create {label} directory {directory}") from exc
-        probe = directory / f".lecture_stt_write_probe_{os.getpid()}"
+            raise PermissionError(
+                f"Config error: cannot create db_path parent directory {db_parent}"
+            ) from exc
+        state_log_dir = db_parent / "logs"
         try:
+            state_log_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise PermissionError(
+                f"Config error: cannot create state logs directory {state_log_dir}"
+            ) from exc
+        try:
+            probe = state_log_dir / f".lecture_stt_state_probe_{os.getpid()}"
             probe.write_text("", encoding="utf-8")
             probe.unlink()
         except OSError as exc:
-            raise PermissionError(f"Config error: cannot write in {label} directory {directory}") from exc
-
-    db_parent = Path(paths["db_path"]).parent
-    try:
-        db_parent.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        raise PermissionError(f"Config error: cannot create db_path parent directory {db_parent}") from exc
-    state_log_dir = db_parent / "logs"
-    try:
-        state_log_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        raise PermissionError(
-            f"Config error: cannot create state logs directory {state_log_dir}"
-        ) from exc
-    try:
-        probe = state_log_dir / f".lecture_stt_state_probe_{os.getpid()}"
-        probe.write_text("", encoding="utf-8")
-        probe.unlink()
-    except OSError as exc:
-        raise PermissionError(f"Config error: cannot write in state logs directory {state_log_dir}") from exc
+            raise PermissionError(
+                f"Config error: cannot write in state logs directory {state_log_dir}"
+            ) from exc
 
     if "binary_path" not in ffmpeg_cfg:
         raise ValueError(f"Config error in {config_path_obj}: missing key 'binary_path' under 'ffmpeg'")
@@ -297,7 +384,7 @@ def validate_config(config_path: str, config: dict) -> dict:
                 f"Config error: notification.provider must be one of {sorted(SUPPORTED_PROVIDERS)}"
             )
 
-        for key in ["enabled", "send_start", "send_success", "send_failure"]:
+        for key in ["enabled", "send_start", "send_success", "send_review", "send_failure"]:
             if key in notification:
                 notification[key] = parse_bool(f"notification.{key}", notification[key])
 
@@ -322,6 +409,30 @@ def validate_config(config_path: str, config: dict) -> dict:
         notification["provider"] = provider
         notification["dual_send_providers"] = normalized_dual
 
+    if transcript_delivery:
+        enabled = parse_bool(
+            "transcript_delivery.enabled",
+            transcript_delivery.get("enabled", False),
+        )
+        transcript_delivery["enabled"] = enabled
+        if enabled:
+            active_raw = transcript_delivery.get("active_semester_manifest")
+            if not isinstance(active_raw, str) or not active_raw.strip():
+                raise ValueError(
+                    "Config error: transcript_delivery.active_semester_manifest "
+                    "must be a non-empty path"
+                )
+            try:
+                # The STT process validates only what raw course routing needs.
+                # The separate distribute worker owns Codex/staging validation;
+                # a downstream outage must not prevent raw transcription.
+                load_active_semester(Path(active_raw))
+            except Exception as exc:
+                raise ValueError(f"Config error: {exc}") from exc
+
+    # 모든 definition을 시작 시 검증한다. profiles가 없으면 기존 동작을
+    # 유지하는 추적용 legacy profile로 해석한다.
+    resolve_profile(config)
     return config
 
 
@@ -366,12 +477,14 @@ def _ensure_config_defaults(config: dict) -> dict:
             "enabled": True,
             "send_start": True,
             "send_success": True,
+            "send_review": True,
             "send_failure": True,
             "dual_send_providers": [],
         },
     }
 
-    merged = defaults.copy()
+    # STT 기본값을 채우되 profiles/downstream 같은 독립 섹션은 보존한다.
+    merged = dict(config)
     for section, values in defaults.items():
         merged[section] = {**values, **(config.get(section, {}) or {})}
 
@@ -407,6 +520,28 @@ def _normalize_config_paths(config: dict) -> dict:
     log_file = logging_cfg.get("file")
     if isinstance(log_file, str) and log_file.strip():
         logging_cfg["file"] = str(resolve_config_path(log_file, base_dir=root, env=os.environ))
+
+    delivery_cfg = normalized.get("transcript_delivery")
+    if isinstance(delivery_cfg, dict):
+        for key in [
+            "active_semester_manifest",
+            "log_jsonl_path",
+            "lock_path",
+            "correction_staging_dir",
+            "summary_staging_dir",
+        ]:
+            value = delivery_cfg.get(key)
+            if isinstance(value, str) and value.strip():
+                delivery_cfg[key] = str(
+                    resolve_config_path(value, base_dir=root, env=os.environ)
+                )
+        generator_cfg = delivery_cfg.get("generator")
+        if isinstance(generator_cfg, dict):
+            temp_root = generator_cfg.get("temp_root")
+            if isinstance(temp_root, str) and temp_root.strip():
+                generator_cfg["temp_root"] = str(
+                    resolve_config_path(temp_root, base_dir=root, env=os.environ)
+                )
 
     return normalized
 
@@ -472,7 +607,8 @@ class STTPipeline:
         self.stale_processing_hours = int(app_cfg["stale_processing_hours"])
         self.transcribe_max_retries = max(0, int(app_cfg.get("transcribe_max_retries", 2)))
 
-        trans = self.config["transcribe"]
+        self.active_profile = resolve_profile(self.config)
+        trans = merge_transcribe_config(self.config["transcribe"], self.active_profile)
         self.params = EngineParams(
             model_size=trans["model_size"],
             device=trans["device"],
@@ -534,6 +670,33 @@ class STTPipeline:
         ratio = max(0.0, min(1.0, processed_audio_sec / audio_duration_sec))
         return max(18, min(72, int(round(18 + ratio * 54))))
 
+    def _transcription_progress_callback(
+        self, job_id: int, initial_eta: int | None
+    ) -> Callable[[float, float | None, int | None], None]:
+        last_update_at = 0.0
+        last_progress = 0
+        last_eta = initial_eta
+
+        def update(processed_sec: float, duration_sec: float | None, eta_sec: int | None) -> None:
+            nonlocal last_update_at, last_progress, last_eta
+            progress = self._transcription_progress_pct(processed_sec, duration_sec)
+            now = time.monotonic()
+            eta_changed = eta_sec is not None and (
+                last_eta is None or abs(eta_sec - last_eta) >= 15
+            )
+            if not (
+                progress >= last_progress + 2
+                or eta_changed
+                or now - last_update_at >= 3.0
+            ):
+                return
+            self._update_progress(job_id, "전사 시작/진행", progress=progress, eta_sec=eta_sec)
+            last_update_at = now
+            last_progress = progress
+            last_eta = eta_sec
+
+        return update
+
     def _time_based_progress(self, job_id: int, eta_sec: int | None) -> int | None:
         """started_at 기준 경과 시간 / 예상 총 시간으로 진행률을 계산한다."""
         if eta_sec is None or eta_sec <= 0:
@@ -560,7 +723,39 @@ class STTPipeline:
         try:
             return db.get_status_counts(self.conn)
         except Exception:
-            return {"PENDING": 0, "PROCESSING": 0, "DONE": 0, "ERROR": 0}
+            return {"PENDING": 0, "PROCESSING": 0, "DONE": 0, "NEEDS_REVIEW": 0, "ERROR": 0}
+
+    def _enqueue_transcript_delivery(self, job_id: int, canonical_base: str) -> None:
+        delivery_cfg = self.config.get("transcript_delivery")
+        if not isinstance(delivery_cfg, dict) or delivery_cfg.get("enabled") is not True:
+            return
+        try:
+            settings = load_postprocess_settings(
+                delivery_cfg,
+                base_dir=repo_root(),
+                env=os.environ,
+                default_tmp_root=Path(str(self.config["paths"]["tmp_dir"])),
+            )
+            status = enqueue_completed_job(
+                self.conn,
+                source_job_id=job_id,
+                settings=settings,
+            )
+            self._log(
+                logging.INFO,
+                "Transcript delivery queue status=%s",
+                {"job_id": str(job_id), "canonical_base": canonical_base},
+                status,
+            )
+        except Exception as exc:
+            # DONE is the source-of-truth outcome. The delivery worker reconciles
+            # this narrow crash/error window without changing STT success.
+            self._log(
+                logging.ERROR,
+                "Transcript delivery enqueue failed: %s",
+                {"job_id": str(job_id), "canonical_base": canonical_base},
+                exc,
+            )
 
     def _update_progress(
         self,
@@ -613,6 +808,17 @@ class STTPipeline:
                 restored_staged,
                 cleared_jobs,
             )
+        counts = db.recover_processing_jobs(self.conn, stale_processing_hours=self.stale_processing_hours)
+        if any(counts.values()):
+            self._log(
+                logging.INFO,
+                "Recovered PROCESSING jobs: done=%s needs_review=%s pending=%s error=%s",
+                {"job_id": "-", "canonical_base": "-"},
+                counts["done"],
+                counts["needs_review"],
+                counts["pending"],
+                counts["error"],
+            )
         restored_pending, cleared_pending_jobs = self._recover_pending_canonical_claims()
         if restored_pending or cleared_pending_jobs:
             self._log(
@@ -621,16 +827,6 @@ class STTPipeline:
                 {"job_id": "-", "canonical_base": "-"},
                 restored_pending,
                 cleared_pending_jobs,
-            )
-        counts = db.recover_processing_jobs(self.conn, stale_processing_hours=self.stale_processing_hours)
-        if any(counts.values()):
-            self._log(
-                logging.INFO,
-                "Recovered PROCESSING jobs: done=%s pending=%s error=%s",
-                {"job_id": "-", "canonical_base": "-"},
-                counts["done"],
-                counts["pending"],
-                counts["error"],
             )
 
     # 공통 로그 헬퍼: 작업 컨텍스트를 함께 출력한다.
@@ -646,24 +842,95 @@ class STTPipeline:
 
     # 소스 파일 기준으로 유일한 base와 경로들을 생성한다.
     # 원본 파일명이 앞에 와서 전사물에서 원본을 쉽게 식별할 수 있다.
-    def _job_paths(self, source_path: Path) -> Dict[str, Any]:
+    def _job_paths(
+        self,
+        source_path: Path,
+        *,
+        recorded_at: str | None = None,
+    ) -> Dict[str, Any]:
         safe_stem = utils.sanitize_stem(source_path.stem)
-
-        # 기본: 원본 파일명(sanitize만 적용) 그대로 사용
         base_candidate = safe_stem
+        if recorded_at is None:
+            recorded_at = self._recorded_at_for_source(source_path)
 
-        # 충돌 검사: audio 또는 transcript 폴더에 동명 파일이 이미 있으면 suffix 부착
-        audio_target = self.audio_dir / f"{base_candidate}{source_path.suffix.lower()}"
-        txt_target = self.transcript_dir / f"{base_candidate}.txt"
-        if audio_target.exists() or txt_target.exists():
+        while True:
+            route = self._course_storage_route(
+                canonical_base=base_candidate,
+                orig_name=source_path.name,
+                recorded_at=recorded_at,
+            )
+            audio_target = self.audio_dir / f"{base_candidate}{source_path.suffix.lower()}"
+            transcript_parent = self.transcript_dir
+            if route is not None:
+                transcript_parent = ensure_course_storage_parent(
+                    self.transcript_dir,
+                    semester=route["semester"],
+                    course_dir=route["course_dir"],
+                    field="transcript_folder",
+                    create=False,
+                )
+            txt_target = transcript_parent / f"{base_candidate}.txt"
+            if not (audio_target.exists() or txt_target.exists()):
+                break
             base_candidate = f"{safe_stem}__{utils.local_timestamp()}__{utils.short_id(6)}"
 
+        json_target = txt_target.with_suffix(".json")
         return {
             "canonical_base": base_candidate,
-            "canonical_audio_path": self.audio_dir / f"{base_candidate}{source_path.suffix.lower()}",
-            "transcript_txt_path": self.transcript_dir / f"{base_candidate}.txt",
-            "transcript_json_path": self.transcript_dir / f"{base_candidate}.json",
+            "canonical_audio_path": audio_target,
+            "transcript_txt_path": txt_target,
+            "transcript_json_path": json_target,
         }
+
+    def _recorded_at_for_source(self, source_path: Path) -> str | None:
+        try:
+            return datetime.fromtimestamp(source_path.stat().st_mtime).astimezone().isoformat()
+        except OSError:
+            return None
+
+    def _course_storage_route(
+        self,
+        *,
+        canonical_base: str,
+        orig_name: str,
+        recorded_at: str | None,
+    ) -> dict[str, str] | None:
+        delivery_cfg = self.config.get("transcript_delivery")
+        if not isinstance(delivery_cfg, dict) or delivery_cfg.get("enabled") is not True:
+            return None
+        try:
+            active_path_raw = delivery_cfg.get("active_semester_manifest")
+            if not isinstance(active_path_raw, str) or not active_path_raw.strip():
+                raise ValueError(
+                    "transcript_delivery.active_semester_manifest must be a non-empty path"
+                )
+            # Raw placement depends only on the validated semester snapshot.
+            # Codex availability and correction/summary roots are downstream
+            # concerns and must not silently force a valid raw route flat.
+            active = load_active_semester(Path(active_path_raw))
+            decision = resolve_course_route(
+                active,
+                CourseRoutingSource(
+                    canonical_base=canonical_base,
+                    orig_name=orig_name,
+                    profile_key=self.active_profile.key,
+                    recorded_at=recorded_at,
+                ),
+            )
+            if decision.kind != ROUTE_KIND_ROUTED or decision.course is None:
+                return None
+            return {
+                "semester": active.semester,
+                "course_dir": decision.course.course_dir,
+            }
+        except (CourseStorageError, OSError, RuntimeError, ValueError) as exc:
+            self._log(
+                logging.WARNING,
+                "course-scoped transcript routing unavailable; using flat transcript path: %s",
+                {"job_id": "-", "canonical_base": canonical_base},
+                exc,
+            )
+            return None
 
     def _staging_path(self, source_path: Path) -> Path:
         target = self.staging_dir / source_path.name
@@ -709,40 +976,18 @@ class STTPipeline:
             )
         return candidate
 
-    def _original_base_from_staging_stem(self, stem: str) -> str:
-        # __stage__ 또는 __requeued__ 마커 앞부분만 추출해 원본 base를 복원한다.
-        for marker in ("__stage__", "__requeued__"):
-            if marker in stem:
-                return stem.split(marker)[0]
-        return utils.sanitize_stem(stem)
-
     def _recover_staged_claims(self) -> tuple[int, int]:
         restored = 0
         cleared_jobs = 0
+        requeued_paths: set[Path] = set()
 
         if self.staging_dir.exists() and self.staging_dir.is_dir():
             for item in sorted(self.staging_dir.iterdir()):
-                if not item.is_file():
-                    continue
-                # 이미 DONE된 base의 staging 잔여물은 재처리 없이 삭제한다.
-                original_base = self._original_base_from_staging_stem(item.stem)
-                done_row = self.conn.execute(
-                    "SELECT id FROM jobs WHERE canonical_base = ? AND status = ? LIMIT 1",
-                    (original_base, STATUS_DONE),
-                ).fetchone()
-                if done_row:
-                    self.logger.info(
-                        "recovery: staging 잔여물 삭제 (job %s 이미 DONE): %s",
-                        done_row["id"], item,
-                    )
-                    try:
-                        item.unlink()
-                    except OSError:
-                        pass
-                    cleared_jobs += 1
+                if not item.is_file() or item.is_symlink() or utils.is_temporary_file(item):
                     continue
                 target = self._requeue_target_for_staged(item, None)
                 utils.safe_move_file(item, target)
+                requeued_paths.add(item)
                 restored += 1
 
         rows = self.conn.execute(
@@ -761,8 +1006,17 @@ class STTPipeline:
                 in_staging = False
             if not in_staging and str(row["current_step"] or "") != "로컬 staging":
                 continue
-            db.delete_job(self.conn, int(row["id"]))
-            cleared_jobs += 1
+            if audio_path in requeued_paths:
+                db.delete_job(self.conn, int(row["id"]))
+                cleared_jobs += 1
+            else:
+                db.set_status(
+                    self.conn,
+                    int(row["id"]),
+                    STATUS_NEEDS_REVIEW,
+                    current_step="staging 입력 위치 확인 필요",
+                    error_message=f"복구 시 staging 파일이 없음: {audio_path}",
+                )
 
         return restored, cleared_jobs
 
@@ -816,6 +1070,7 @@ class STTPipeline:
             "word_timestamps": self.params.word_timestamps,
             "condition_on_previous_text": self.params.condition_on_previous_text,
             "keep_model_loaded": self.params.keep_model_loaded,
+            "profile": self.active_profile.snapshot(),
             "timings": {
                 "preprocess_sec": round(float(preprocess_sec), 6),
                 "transcribe_sec": round(float(transcribe_sec), 6),
@@ -826,16 +1081,69 @@ class STTPipeline:
             "deduped": deduped,
             "canonical_base": canonical_base,
         }
+        try:
+            payload["recorded_at"] = datetime.fromtimestamp(
+                Path(canonical_audio_path).stat().st_mtime
+            ).astimezone().isoformat()
+        except OSError:
+            # 녹음 시각은 route 보조 증거다. 읽지 못해도 전사 산출물 자체는 보존한다.
+            payload["recorded_at"] = None
         if deduped_from_job_id is not None:
             payload["deduped_from_job_id"] = deduped_from_job_id
         if source_sha256 is not None:
             payload["source_sha256"] = source_sha256
         return payload
 
+    def _ensure_transcript_artifact_parent(
+        self,
+        txt_path: Path,
+        json_path: Path,
+    ) -> None:
+        txt_relative = Path(
+            descendant_relative_path(
+                self.transcript_dir,
+                txt_path,
+                field="transcript_txt_path",
+                expected_filename=txt_path.name,
+            )
+        )
+        json_relative = Path(
+            descendant_relative_path(
+                self.transcript_dir,
+                json_path,
+                field="transcript_json_path",
+                expected_filename=json_path.name,
+            )
+        )
+        if (
+            txt_relative.parent != json_relative.parent
+            or txt_relative.stem != json_relative.stem
+        ):
+            raise CourseStorageError("transcript TXT/JSON paths must share a parent and stem")
+        parent_parts = txt_relative.parent.parts
+        if not parent_parts:
+            return
+        if len(parent_parts) < 2:
+            raise CourseStorageError(
+                "nested transcript paths must use <semester>/<course_dir>"
+            )
+        expected_parent = ensure_course_storage_parent(
+            self.transcript_dir,
+            semester=parent_parts[0],
+            course_dir=os.fspath(Path(*parent_parts[1:])),
+            field="transcript_folder",
+            create=True,
+        )
+        if txt_path.parent != expected_parent or json_path.parent != expected_parent:
+            raise CourseStorageError(
+                "transcript paths do not match the validated course-scoped parent"
+            )
+
     def _write_output(self, txt_path: Path, json_path: Path, segments: list, text: str,
                       metadata: Dict[str, Any]) -> None:
         # 텍스트와 JSON 결과를 원자적 쓰기로 저장한다.
         self.transcript_dir.mkdir(parents=True, exist_ok=True)
+        self._ensure_transcript_artifact_parent(txt_path, json_path)
         utils.atomic_write(txt_path, text)
         utils.atomic_write(json_path, {"segments": segments, "metadata": metadata})
         if isinstance(metadata.get("quality"), dict):
@@ -860,6 +1168,7 @@ class STTPipeline:
                             canonical_audio_path: Path, txt_path: Path, json_path: Path,
                             duplicate) -> bool:
         # 동일 파일의 기존 결과를 복제해 처리 시간을 절약한다.
+        original_engine_params = db.get_job(self.conn, job_id)["engine_params"]
         prior_txt = Path(duplicate["transcript_txt_path"])
         prior_json = Path(duplicate["transcript_json_path"])
         try:
@@ -903,6 +1212,24 @@ class STTPipeline:
                 source_sha256=duplicate["sha256"],
             )
             prior_metadata = prior_payload.get("metadata")
+            prior_profile = (
+                prior_metadata.get("profile")
+                if isinstance(prior_metadata, dict)
+                else None
+            )
+            if (
+                isinstance(prior_profile, dict)
+                and all(
+                    isinstance(prior_profile.get(key), str) and prior_profile.get(key)
+                    for key in ("key", "version", "config_sha256")
+                )
+            ):
+                metadata["profile"] = {
+                    key: str(prior_profile[key])
+                    for key in ("key", "version", "config_sha256")
+                }
+            else:
+                metadata["profile"] = legacy_unknown_snapshot()
             prior_quality = (
                 prior_metadata.get("quality")
                 if isinstance(prior_metadata, dict)
@@ -913,9 +1240,33 @@ class STTPipeline:
             else:
                 metadata["quality"] = quality_evaluate(segments, text).to_dict()
 
+            db.update_job(
+                self.conn,
+                job_id,
+                engine_params=json.dumps(metadata),
+                is_deduped=1,
+                deduped_from_job_id=int(duplicate["id"]),
+            )
             self._write_output(txt_path, json_path, segments, text, metadata)
             self._validate_output_files(txt_path, json_path)
             self._update_progress(job_id, "전사문 생성(TXT/JSON)")
+            replay_health = str(metadata["quality"].get("health", "")).strip().lower()
+            if replay_health == "bad":
+                self._handle_bad_quality(
+                    job_id=job_id,
+                    source_path=source_path,
+                    canonical_audio=canonical_audio_path,
+                    canonical_base=canonical_base,
+                    txt_path=txt_path,
+                    json_path=json_path,
+                    metadata=metadata,
+                    quality_report=metadata["quality"],
+                    ended_at=ended_at,
+                    preprocess_sec=0.0,
+                    transcribe_sec=0.0,
+                    total_sec=0.0,
+                )
+                return True
 
             db.update_job(
                 self.conn,
@@ -935,6 +1286,7 @@ class STTPipeline:
                 progress_pct=100,
                 eta_sec=0,
             )
+            self._enqueue_transcript_delivery(job_id, canonical_base)
             queue = self._queue_status()
             self.notifier.notify_transcript_generated({
                 "job_id": job_id,
@@ -965,6 +1317,15 @@ class STTPipeline:
             })
             return True
         except (OSError, json.JSONDecodeError, ValueError):
+            if db.get_job(self.conn, job_id)["status"] == STATUS_DONE:
+                return True
+            db.update_job(
+                self.conn,
+                job_id,
+                engine_params=original_engine_params,
+                is_deduped=0,
+                deduped_from_job_id=None,
+            )
             for replay_file in (txt_path, json_path):
                 try:
                     replay_file.unlink()
@@ -992,6 +1353,23 @@ class STTPipeline:
         except (TypeError, json.JSONDecodeError):
             return {}
         return loaded if isinstance(loaded, dict) else {}
+
+    @staticmethod
+    def _preserve_terminal_error_recovery_audit(
+        metadata: dict[str, Any],
+        prior_engine_params: Mapping[str, Any],
+    ) -> None:
+        terminal_recovery_metadata = prior_engine_params.get("terminal_error_recovery")
+        if not isinstance(terminal_recovery_metadata, dict):
+            return
+        if (
+            terminal_recovery_metadata.get("schema_version")
+            != "lecture-stt/terminal-error-recovery-metadata@1"
+        ):
+            return
+        metadata["terminal_error_recovery"] = json.loads(
+            json.dumps(terminal_recovery_metadata, ensure_ascii=False)
+        )
 
     def _transcription_failure_metadata(self, job_id: int, safe_error: str) -> tuple[int, dict[str, Any]]:
         row = db.get_job(self.conn, job_id)
@@ -1088,9 +1466,73 @@ class STTPipeline:
             })
         self._log(logging.ERROR, "failed", job_ctx)
 
+    def _handle_bad_quality(
+        self,
+        *,
+        job_id: int,
+        source_path: Path,
+        canonical_audio: Path,
+        canonical_base: str,
+        txt_path: Path,
+        json_path: Path,
+        metadata: dict[str, Any],
+        quality_report: Any,
+        ended_at: str,
+        preprocess_sec: float,
+        transcribe_sec: float,
+        total_sec: float,
+    ) -> None:
+        """Persist a completed-but-unusable transcript as an actionable quality failure.
+
+        The transcript and scorecard stay on disk for inspection/remediation, but the job
+        must not be announced as a normal success or silently enter downstream work.
+        """
+        if isinstance(quality_report, dict):
+            raw_summary = quality_report.get("summary", "품질 위험")
+        else:
+            raw_summary = getattr(quality_report, "summary", "품질 위험")
+        safe_summary = _redact_sensitive_text(str(raw_summary))
+        db.update_job(
+            self.conn,
+            job_id,
+            status=STATUS_NEEDS_REVIEW,
+            ended_at=ended_at,
+            preprocess_sec=preprocess_sec,
+            transcribe_sec=transcribe_sec,
+            total_sec=total_sec,
+            engine_params=json.dumps(metadata, ensure_ascii=False),
+            error_message=safe_summary,
+            error_trace=None,
+            current_step="품질 검토 필요",
+            progress_pct=100,
+            eta_sec=0,
+        )
+        queue = self._queue_status()
+        self.notifier.notify_review({
+            "job_id": job_id,
+            "orig_name": source_path.name,
+            "canonical_base": canonical_base,
+            "orig_inbox_path": str(source_path),
+            "canonical_audio_path": str(canonical_audio),
+            "transcript_txt_path": str(txt_path),
+            "transcript_json_path": str(json_path),
+            "review_message": safe_summary,
+            "review_step": "품질 검사",
+            "pending_count": queue.get("PENDING", 0),
+            "processing_count": queue.get("PROCESSING", 0),
+        })
+        self._log(logging.WARNING, "bad quality transcript preserved for remediation: %s", {"job_id": str(job_id), "canonical_base": canonical_base}, safe_summary)
+
     # 하나의 파일에 대해 이동, 중복 처리, 전사, 저장, 알림까지 수행한다.
-    def process_job(self, source_path: Path) -> None:
-        paths = self._job_paths(source_path)
+    def process_job(
+        self,
+        source_path: Path,
+        *,
+        single_job_plan: Mapping[str, Any] | None = None,
+        kill_switch_path: Path | None = None,
+    ) -> dict[str, Any]:
+        recorded_at = self._recorded_at_for_source(source_path)
+        paths = self._job_paths(source_path, recorded_at=recorded_at)
         canonical_base = paths["canonical_base"]
         canonical_audio = paths["canonical_audio_path"]
         txt_path = paths["transcript_txt_path"]
@@ -1110,6 +1552,9 @@ class STTPipeline:
         fail_step = "파이프라인 시작"
 
         try:
+            if kill_switch_path is not None:
+                ensure_controller_execution_unpaused(self.config)
+                ensure_controller_kill_switch_inactive(kill_switch_path)
             if not source_path.exists():
                 self._skip_disappeared_source(
                     job_ctx=job_ctx,
@@ -1117,11 +1562,22 @@ class STTPipeline:
                     staging_path=staging_source,
                     canonical_audio=canonical_audio,
                 )
-                return
+                return single_job_result(
+                    plan_sha256=str(single_job_plan["plan_sha256"]) if single_job_plan else "",
+                    status="skipped",
+                    job_id=None,
+                )
 
             # iCloud inbox 원본은 먼저 로컬 staging으로 옮겨 이후 처리에서 rename/sync 영향을 줄인다.
             fail_step = "로컬 staging"
             self._update_progress(job_id, "로컬 staging", 15)
+            if single_job_plan is not None:
+                # Manifest evidence is checked again at the last practical boundary
+                # before the pathname is claimed into local staging.
+                if kill_switch_path is not None:
+                    ensure_controller_execution_unpaused(self.config)
+                    ensure_controller_kill_switch_inactive(kill_switch_path)
+                source_path = revalidate_single_job_plan(self.config, single_job_plan)
             try:
                 utils.safe_move_file(source_path, staging_source)
             except FileNotFoundError:
@@ -1131,8 +1587,26 @@ class STTPipeline:
                     staging_path=staging_source,
                     canonical_audio=canonical_audio,
                 )
-                return
+                return single_job_result(
+                    plan_sha256=str(single_job_plan["plan_sha256"]) if single_job_plan else "",
+                    status="skipped",
+                    job_id=None,
+                )
             source_claim_path = staging_source
+
+            # Semester apply uses the same BEGIN IMMEDIATE fence.  Recompute
+            # all active-semester-dependent paths only after acquiring it: if
+            # a switch committed while the source was moving to staging, this
+            # admission uses the new snapshot; if admission wins, the PENDING
+            # row is committed before apply performs its idle check.
+            fail_step = "작업 입장"
+            self.conn.execute("BEGIN IMMEDIATE")
+            paths = self._job_paths(source_path, recorded_at=recorded_at)
+            canonical_base = paths["canonical_base"]
+            canonical_audio = paths["canonical_audio_path"]
+            txt_path = paths["transcript_txt_path"]
+            json_path = paths["transcript_json_path"]
+            job_ctx["canonical_base"] = canonical_base
 
             job_id = db.create_job(
                 self.conn,
@@ -1155,6 +1629,7 @@ class STTPipeline:
                     "word_timestamps": self.params.word_timestamps,
                     "condition_on_previous_text": self.params.condition_on_previous_text,
                     "keep_model_loaded": self.params.keep_model_loaded,
+                    "profile": self.active_profile.snapshot(),
                 },
                 current_step="로컬 staging",
                 progress_pct=15,
@@ -1196,7 +1671,12 @@ class STTPipeline:
             self._log(logging.INFO, "moved to stable folder", job_ctx)
             self._update_progress(job_id, "파일 이동", 30)
 
-            duplicate = db.find_done_job_by_sha(self.conn, sha256)
+            if not db.claim_job_for_processing(self.conn, job_id):
+                # 재사용 경로도 복구 가능한 PROCESSING 상태에서 산출물을 쓴다.
+                fail_step = "처리 상태 전환"
+                raise RuntimeError(f"Failed to claim job {job_id} as PROCESSING")
+
+            duplicate = db.find_replayable_job_by_sha(self.conn, sha256)
             if duplicate and duplicate["id"] != job_id:
                 # 이미 변환 완료된 동일 파일이 있으면 결과를 재사용해 중복 작업 시간을 줄인다.
                 fail_step = "중복 결과 재사용"
@@ -1211,12 +1691,12 @@ class STTPipeline:
                     duplicate=duplicate,
                 ):
                     self._log(logging.INFO, "dedupe completed", job_ctx)
-                    return
+                    return single_job_result(
+                        plan_sha256=str(single_job_plan["plan_sha256"]) if single_job_plan else "",
+                        status="completed",
+                        job_id=job_id,
+                    )
 
-            if not db.claim_job_for_processing(self.conn, job_id):
-                # 상태를 PROCESSING으로 바꿔 다른 워커가 같은 작업을 중복 처리하지 않게 막는다.
-                fail_step = "처리 상태 전환"
-                raise RuntimeError(f"Failed to claim job {job_id} as PROCESSING")
             started_at = utils.now_iso()
             eta = self._estimate_eta_sec()
             self._update_progress(job_id, "전사 시작/진행", None, eta)
@@ -1224,49 +1704,13 @@ class STTPipeline:
 
             # Whisper 전사 단계: 오디오에서 텍스트를 추출한다.
             fail_step = "전사 실행"
-            last_transcription_update_at = 0.0
-            last_transcription_progress = 0
-            last_transcription_eta: int | None = eta
-
-            def handle_transcription_progress(
-                processed_audio_sec: float,
-                audio_duration_sec: float | None,
-                eta_remaining_sec: int | None,
-            ) -> None:
-                nonlocal last_transcription_update_at, last_transcription_progress, last_transcription_eta
-
-                progress_pct = self._transcription_progress_pct(processed_audio_sec, audio_duration_sec)
-                now_mono = time.monotonic()
-                eta_changed = (
-                    eta_remaining_sec is not None
-                    and (
-                        last_transcription_eta is None
-                        or abs(eta_remaining_sec - last_transcription_eta) >= 15
-                    )
-                )
-                should_update = (
-                    progress_pct >= last_transcription_progress + 2
-                    or eta_changed
-                    or now_mono - last_transcription_update_at >= 3.0
-                )
-                if not should_update:
-                    return
-
-                self._update_progress(
-                    job_id,
-                    "전사 시작/진행",
-                    progress=progress_pct,
-                    eta_sec=eta_remaining_sec,
-                )
-                last_transcription_update_at = now_mono
-                last_transcription_progress = progress_pct
-                last_transcription_eta = eta_remaining_sec
+            progress_callback = self._transcription_progress_callback(job_id, eta)
 
             assert canonical_audio_final is not None
             segments, transcript_text, preprocess_sec, transcribe_sec, tmp_wav = self.worker.transcribe_file(
                 canonical_audio_final,
                 canonical_base,
-                progress_callback=handle_transcription_progress,
+                progress_callback=progress_callback,
             )
             total_sec = preprocess_sec + transcribe_sec
             ended_at = utils.now_iso()
@@ -1274,11 +1718,22 @@ class STTPipeline:
             # ── v2: 후처리 + 품질 게이트 ──
             fail_step = "후처리"
             self._update_progress(job_id, "후처리(반복/노이즈 제거)", 78, 12)
-            segments, transcript_text = postprocess(segments, transcript_text)
+            segments, transcript_text = postprocess(
+                segments,
+                transcript_text,
+                corrections=self.active_profile.corrections,
+            )
 
             fail_step = "품질 검사"
             self._update_progress(job_id, "품질 검사", 88, 6)
-            quality_report = quality_evaluate(segments, transcript_text)
+            audio_duration_sec = _audio_duration_from_tmp_wav(tmp_wav)
+            quality_report = quality_evaluate(
+                segments,
+                transcript_text,
+                warn_threshold=self.active_profile.warn_threshold,
+                bad_threshold=self.active_profile.bad_threshold,
+                audio_duration_sec=audio_duration_sec,
+            )
             self._log(
                 logging.WARNING if quality_report.health != "good" else logging.INFO,
                 f"quality: {quality_report.summary}",
@@ -1307,6 +1762,26 @@ class STTPipeline:
             self._update_progress(job_id, "전사문 생성(TXT/JSON)", 94, 3)
             self._write_output(txt_path, json_path, segments, transcript_text, metadata)
             self._validate_output_files(txt_path, json_path)
+            if quality_report.health == "bad":
+                self._handle_bad_quality(
+                    job_id=job_id,
+                    source_path=source_path,
+                    canonical_audio=canonical_audio_final,
+                    canonical_base=canonical_base,
+                    txt_path=txt_path,
+                    json_path=json_path,
+                    metadata=metadata,
+                    quality_report=quality_report,
+                    ended_at=ended_at,
+                    preprocess_sec=preprocess_sec,
+                    transcribe_sec=transcribe_sec,
+                    total_sec=total_sec,
+                )
+                return single_job_result(
+                    plan_sha256=str(single_job_plan["plan_sha256"]) if single_job_plan else "",
+                    status="needs_review",
+                    job_id=job_id,
+                )
             self.notifier.notify_transcript_generated({
                 "job_id": job_id,
                 "orig_name": source_path.name,
@@ -1326,10 +1801,13 @@ class STTPipeline:
                 transcribe_sec=transcribe_sec,
                 total_sec=total_sec,
                 engine_params=json.dumps(metadata),
+                is_deduped=0,
+                deduped_from_job_id=None,
                 current_step="전체 완료",
                 progress_pct=100,
                 eta_sec=0,
             )
+            self._enqueue_transcript_delivery(job_id, canonical_base)
             # 최종 산출물 생성이 완료되면 성공 알림을 전송한다.
             fail_step = "알림 전송"
             queue = self._queue_status()
@@ -1357,8 +1835,15 @@ class STTPipeline:
                 "processing_count": queue.get("PROCESSING", 0),
             })
             self._log(logging.INFO, "done", job_ctx)
+            return single_job_result(
+                plan_sha256=str(single_job_plan["plan_sha256"]) if single_job_plan else "",
+                status="completed",
+                job_id=job_id,
+            )
 
         except Exception as exc:
+            if self.conn.in_transaction:
+                self.conn.rollback()
             self._handle_job_failure(
                 exc=exc,
                 fail_step=fail_step,
@@ -1371,10 +1856,103 @@ class STTPipeline:
                 txt_path=txt_path,
                 json_path=json_path,
             )
+            result_status = "failed"
+            if job_id is not None:
+                failed_row = db.get_job(self.conn, job_id)
+                if failed_row is not None and failed_row["status"] == STATUS_PENDING:
+                    result_status = "retry_pending"
+            return single_job_result(
+                plan_sha256=str(single_job_plan["plan_sha256"]) if single_job_plan else "",
+                status=result_status,
+                job_id=job_id,
+            )
         finally:
             if tmp_wav:
                 self.worker.cleanup_tmp(tmp_wav)
             self._release_worker_model_if_idle()
+
+    def process_single_job_plan(
+        self,
+        plan: Mapping[str, Any],
+        *,
+        kill_switch_path: Path,
+    ) -> dict[str, Any]:
+        # Startup recovery remains owned by the existing Python worker. The
+        # manifest source is checked both before recovery and immediately before
+        # process_job claims it into local staging.
+        ensure_controller_execution_unpaused(self.config)
+        ensure_controller_kill_switch_inactive(kill_switch_path)
+        revalidate_single_job_plan(self.config, plan)
+        self.startup_recovery()
+        ensure_controller_execution_unpaused(self.config)
+        ensure_controller_kill_switch_inactive(kill_switch_path)
+        source_path = revalidate_single_job_plan(self.config, plan)
+        return self.process_job(
+            source_path,
+            single_job_plan=plan,
+            kill_switch_path=kill_switch_path,
+        )
+
+    def process_retry_job_plan(
+        self,
+        plan: Mapping[str, Any],
+        *,
+        kill_switch_path: Path,
+    ) -> dict[str, Any]:
+        ensure_controller_execution_unpaused(self.config)
+        validated = revalidate_retry_job_plan(self.config, self.conn, plan)
+        ensure_controller_kill_switch_inactive(kill_switch_path)
+        self.startup_recovery()
+        ensure_controller_execution_unpaused(self.config)
+        validated = revalidate_retry_job_plan(self.config, self.conn, plan)
+        ensure_controller_kill_switch_inactive(kill_switch_path)
+
+        job_id = int(validated["job_id"])
+        try:
+            row = db.get_job(self.conn, job_id)
+        except sqlite3.Error as exc:
+            raise RetryJobConflictError(
+                "retry-job row could not be read before execution"
+            ) from exc
+        if row is None:
+            raise RetryJobContractError("retry-job row disappeared before execution")
+        ensure_controller_execution_unpaused(self.config)
+        ensure_controller_kill_switch_inactive(kill_switch_path)
+        self._process_retryable_transcription_job(
+            row,
+            exact_claim=validated["claim_fence"],
+        )
+
+        try:
+            final_row = db.get_job(self.conn, job_id)
+        except sqlite3.Error as exc:
+            raise RetryJobConflictError(
+                "retry-job row could not be read after execution"
+            ) from exc
+        if final_row is None:
+            raise RetryJobContractError("retry-job row disappeared after execution")
+        status_map = {
+            STATUS_DONE: "completed",
+            STATUS_NEEDS_REVIEW: "needs_review",
+            STATUS_PENDING: "retry_pending",
+            STATUS_ERROR: "failed",
+        }
+        status = status_map.get(str(final_row["status"]))
+        if status is None:
+            raise RetryJobContractError(
+                f"retry-job ended in unsupported status: {final_row['status']}"
+            )
+        if status == "retry_pending" and not str(final_row["current_step"] or "").startswith(
+            "전사 재시도 대기 "
+        ):
+            raise RetryJobContractError(
+                "retry-job remained PENDING without exact retry ownership evidence"
+            )
+        return retry_job_result(
+            plan_sha256=str(plan["plan_sha256"]),
+            status=status,
+            job_id=job_id,
+        )
 
     def _retryable_transcription_rows(self) -> list[Any]:
         return self.conn.execute(
@@ -1391,7 +1969,12 @@ class STTPipeline:
             processed += 1
         return processed
 
-    def _process_retryable_transcription_job(self, row: Any) -> None:
+    def _process_retryable_transcription_job(
+        self,
+        row: Any,
+        *,
+        exact_claim: Mapping[str, Any] | None = None,
+    ) -> None:
         job_id = int(row["id"])
         canonical_base = str(row["canonical_base"])
         source_path = Path(str(row["orig_inbox_path"]))
@@ -1408,7 +1991,37 @@ class STTPipeline:
                 fail_step = "전사 재시도 입력 확인"
                 raise FileNotFoundError(f"Missing retry input audio: {canonical_audio}")
 
-            if not db.claim_job_for_processing(self.conn, job_id):
+            if exact_claim is None:
+                claimed = db.claim_job_for_processing(self.conn, job_id)
+            else:
+                try:
+                    claimed = db.claim_retry_job_for_processing(
+                        self.conn,
+                        job_id=job_id,
+                        expected_updated_at=str(exact_claim["updated_at"]),
+                        expected_current_step=str(exact_claim["current_step"]),
+                        expected_orig_name=str(exact_claim["orig_name"]),
+                        expected_canonical_base=str(exact_claim["canonical_base"]),
+                        expected_canonical_audio_path=str(
+                            exact_claim["canonical_audio_path"]
+                        ),
+                        expected_transcript_txt_path=str(
+                            exact_claim["transcript_txt_path"]
+                        ),
+                        expected_transcript_json_path=str(
+                            exact_claim["transcript_json_path"]
+                        ),
+                        expected_engine_params=str(exact_claim["engine_params"]),
+                    )
+                except sqlite3.Error as exc:
+                    raise RetryJobConflictError(
+                        "retry-job exact claim could not acquire ownership"
+                    ) from exc
+            if not claimed:
+                if exact_claim is not None:
+                    raise RetryJobConflictError(
+                        "retry-job exact claim fence changed before ownership"
+                    )
                 self._log(logging.WARNING, "retry job was not claimable", job_ctx)
                 return
 
@@ -1417,59 +2030,34 @@ class STTPipeline:
             self._update_progress(job_id, "전사 시작/진행", None, eta)
             self._log(logging.INFO, "transcription retry started", job_ctx)
 
-            last_transcription_update_at = 0.0
-            last_transcription_progress = 0
-            last_transcription_eta: int | None = eta
-
-            def handle_transcription_progress(
-                processed_audio_sec: float,
-                audio_duration_sec: float | None,
-                eta_remaining_sec: int | None,
-            ) -> None:
-                nonlocal last_transcription_update_at, last_transcription_progress, last_transcription_eta
-
-                progress_pct = self._transcription_progress_pct(processed_audio_sec, audio_duration_sec)
-                now_mono = time.monotonic()
-                eta_changed = (
-                    eta_remaining_sec is not None
-                    and (
-                        last_transcription_eta is None
-                        or abs(eta_remaining_sec - last_transcription_eta) >= 15
-                    )
-                )
-                should_update = (
-                    progress_pct >= last_transcription_progress + 2
-                    or eta_changed
-                    or now_mono - last_transcription_update_at >= 3.0
-                )
-                if not should_update:
-                    return
-
-                self._update_progress(
-                    job_id,
-                    "전사 시작/진행",
-                    progress=progress_pct,
-                    eta_sec=eta_remaining_sec,
-                )
-                last_transcription_update_at = now_mono
-                last_transcription_progress = progress_pct
-                last_transcription_eta = eta_remaining_sec
+            progress_callback = self._transcription_progress_callback(job_id, eta)
 
             segments, transcript_text, preprocess_sec, transcribe_sec, tmp_wav = self.worker.transcribe_file(
                 canonical_audio,
                 canonical_base,
-                progress_callback=handle_transcription_progress,
+                progress_callback=progress_callback,
             )
             total_sec = preprocess_sec + transcribe_sec
             ended_at = utils.now_iso()
 
             fail_step = "후처리"
             self._update_progress(job_id, "후처리(반복/노이즈 제거)", 78, 12)
-            segments, transcript_text = postprocess(segments, transcript_text)
+            segments, transcript_text = postprocess(
+                segments,
+                transcript_text,
+                corrections=self.active_profile.corrections,
+            )
 
             fail_step = "품질 검사"
             self._update_progress(job_id, "품질 검사", 88, 6)
-            quality_report = quality_evaluate(segments, transcript_text)
+            audio_duration_sec = _audio_duration_from_tmp_wav(tmp_wav)
+            quality_report = quality_evaluate(
+                segments,
+                transcript_text,
+                warn_threshold=self.active_profile.warn_threshold,
+                bad_threshold=self.active_profile.bad_threshold,
+                audio_duration_sec=audio_duration_sec,
+            )
             self._log(
                 logging.WARNING if quality_report.health != "good" else logging.INFO,
                 f"quality: {quality_report.summary}",
@@ -1493,12 +2081,29 @@ class STTPipeline:
             retry_metadata = self._load_engine_params(row["engine_params"])
             if retry_metadata.get("transcription_failures") is not None:
                 metadata["transcription_failures_before_success"] = retry_metadata["transcription_failures"]
+            self._preserve_terminal_error_recovery_audit(metadata, retry_metadata)
             metadata["quality"] = quality_report.to_dict()
 
             fail_step = "산출물 저장/검증"
             self._update_progress(job_id, "전사문 생성(TXT/JSON)", 94, 3)
             self._write_output(txt_path, json_path, segments, transcript_text, metadata)
             self._validate_output_files(txt_path, json_path)
+            if quality_report.health == "bad":
+                self._handle_bad_quality(
+                    job_id=job_id,
+                    source_path=source_path,
+                    canonical_audio=canonical_audio,
+                    canonical_base=canonical_base,
+                    txt_path=txt_path,
+                    json_path=json_path,
+                    metadata=metadata,
+                    quality_report=quality_report,
+                    ended_at=ended_at,
+                    preprocess_sec=preprocess_sec,
+                    transcribe_sec=transcribe_sec,
+                    total_sec=total_sec,
+                )
+                return
             self.notifier.notify_transcript_generated({
                 "job_id": job_id,
                 "orig_name": source_path.name,
@@ -1523,6 +2128,7 @@ class STTPipeline:
                 progress_pct=100,
                 eta_sec=0,
             )
+            self._enqueue_transcript_delivery(job_id, canonical_base)
 
             fail_step = "알림 전송"
             queue = self._queue_status()
@@ -1550,6 +2156,8 @@ class STTPipeline:
             })
             self._log(logging.INFO, "retry done", job_ctx)
 
+        except RetryJobConflictError:
+            raise
         except Exception as exc:
             self._handle_job_failure(
                 exc=exc,
@@ -1627,6 +2235,71 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Always-on lecture STT worker")
     parser.add_argument("--once", action="store_true", help="Process at most one stable file")
     parser.add_argument("--watch-folder", dest="watch_folder", help="Override paths.watch_folder in runtime")
+    worker_plan_group = parser.add_mutually_exclusive_group()
+    worker_plan_group.add_argument(
+        "--plan-single-job",
+        metavar="RELATIVE_PATH",
+        help="Print a closed manifest for one direct child of the watch folder",
+    )
+    worker_plan_group.add_argument(
+        "--single-job-manifest",
+        metavar="PATH",
+        help="Execute exactly one previously planned single-job manifest",
+    )
+    worker_plan_group.add_argument(
+        "--plan-next-retry-job",
+        action="store_true",
+        help="Read-only controller selector for the next retry-job candidate",
+    )
+    worker_plan_group.add_argument(
+        "--plan-retry-job",
+        nargs="?",
+        const="auto",
+        metavar="JOB_ID",
+        help="Print a closed manifest for one exact retry row; omit JOB_ID only when unique",
+    )
+    worker_plan_group.add_argument(
+        "--retry-job-manifest",
+        metavar="PATH",
+        help="Execute exactly one previously planned retry-job manifest",
+    )
+    worker_plan_group.add_argument(
+        "--plan-terminal-error-recovery",
+        metavar="JOB_ID",
+        help="Print a closed manifest for one exact terminal transcription ERROR row",
+    )
+    worker_plan_group.add_argument(
+        "--terminal-error-recovery-manifest",
+        metavar="PATH",
+        help="Execute exactly one previously planned terminal-error-recovery manifest",
+    )
+    parser.add_argument(
+        "--enable-single-job",
+        action="store_true",
+        help="Explicitly enable the single-job execution path",
+    )
+    parser.add_argument(
+        "--allow-write",
+        action="store_true",
+        help="Allow the single-job worker to perform its normal file and DB writes",
+    )
+    parser.add_argument(
+        "--enable-retry-job",
+        action="store_true",
+        help="Explicitly enable the exact retry-job execution path",
+    )
+    parser.add_argument(
+        "--enable-terminal-error-recovery",
+        action="store_true",
+        help="Explicitly enable the exact terminal-error-recovery execution path",
+    )
+    parser.add_argument(
+        "--controller-kill-switch",
+        metavar="PATH",
+        help="Required fail-closed marker path for controller-owned single/retry execution",
+    )
+    parser.add_argument("--expected-count", type=int)
+    parser.add_argument("--expected-plan-sha256")
     control_group = parser.add_mutually_exclusive_group()
     control_group.add_argument("--pause", action="store_true", help="Pause scanning/processing")
     control_group.add_argument("--resume", action="store_true", help="Resume scanning/processing")
@@ -1645,6 +2318,23 @@ def main() -> None:
     load_dotenv(str(env_file()), override=False)
 
     if args.pause or args.resume or args.status:
+        if (
+            args.once
+            or args.plan_single_job
+            or args.single_job_manifest
+            or args.plan_retry_job is not None
+            or args.retry_job_manifest
+            or args.plan_terminal_error_recovery
+            or args.terminal_error_recovery_manifest
+            or args.enable_single_job
+            or args.enable_retry_job
+            or args.enable_terminal_error_recovery
+            or args.controller_kill_switch
+            or args.allow_write
+            or args.expected_count is not None
+            or args.expected_plan_sha256 is not None
+        ):
+            raise SystemExit("pause/resume/status cannot be combined with worker execution arguments")
         control_config = _normalize_config_paths(load_config(args.config))
         if args.pause:
             utils.set_paused(True, control_config)
@@ -1664,6 +2354,200 @@ def main() -> None:
     config = load_config(args.config)
     if args.watch_folder:
         config.setdefault("paths", {})["watch_folder"] = args.watch_folder
+
+    if args.plan_single_job:
+        if (
+            args.once
+            or args.plan_next_retry_job
+            or args.enable_single_job
+            or args.enable_retry_job
+            or args.enable_terminal_error_recovery
+            or args.controller_kill_switch
+            or args.allow_write
+            or args.expected_count is not None
+            or args.expected_plan_sha256 is not None
+        ):
+            raise SystemExit(
+                "--plan-single-job cannot be combined with execution-only arguments"
+            )
+        try:
+            config = validate_config(args.config, config, check_writable=False)
+            plan = build_single_job_plan(config, args.plan_single_job)
+        except (SingleJobContractError, OSError, ValueError) as exc:
+            print(f"Single-job plan rejected: {exc}", file=sys.stderr)
+            raise SystemExit(2) from exc
+        print(json.dumps(plan, ensure_ascii=False, sort_keys=True))
+        return
+
+    if args.plan_next_retry_job:
+        if (
+            args.once
+            or args.enable_single_job
+            or args.enable_retry_job
+            or args.enable_terminal_error_recovery
+            or args.controller_kill_switch
+            or args.allow_write
+            or args.expected_count is not None
+            or args.expected_plan_sha256 is not None
+        ):
+            raise SystemExit(
+                "--plan-next-retry-job cannot be combined with execution-only arguments"
+            )
+        try:
+            config = validate_config(args.config, config, check_writable=False)
+            plan = validate_next_retry_job_plan(build_next_retry_job_plan(config))
+        except (RetryJobContractError, OSError, ValueError) as exc:
+            print(f"Retry-job plan rejected: {exc}", file=sys.stderr)
+            raise SystemExit(2) from exc
+        print(json.dumps(plan, ensure_ascii=False, sort_keys=True))
+        return
+
+    if args.plan_retry_job is not None:
+        if (
+            args.once
+            or args.plan_next_retry_job
+            or args.enable_single_job
+            or args.enable_retry_job
+            or args.enable_terminal_error_recovery
+            or args.controller_kill_switch
+            or args.allow_write
+            or args.expected_count is not None
+            or args.expected_plan_sha256 is not None
+        ):
+            raise SystemExit(
+                "--plan-retry-job cannot be combined with execution-only arguments"
+            )
+        try:
+            retry_job_id = (
+                None
+                if args.plan_retry_job == "auto"
+                else int(args.plan_retry_job)
+            )
+            if retry_job_id is not None and retry_job_id <= 0:
+                raise ValueError("JOB_ID must be a positive integer")
+            config = validate_config(args.config, config, check_writable=False)
+            plan = build_retry_job_plan(config, job_id=retry_job_id)
+        except (RetryJobContractError, OSError, ValueError) as exc:
+            print(f"Retry-job plan rejected: {exc}", file=sys.stderr)
+            raise SystemExit(2) from exc
+        print(json.dumps(plan, ensure_ascii=False, sort_keys=True))
+        return
+
+    if args.plan_terminal_error_recovery is not None:
+        if (
+            args.once
+            or args.plan_next_retry_job
+            or args.enable_single_job
+            or args.enable_retry_job
+            or args.enable_terminal_error_recovery
+            or args.controller_kill_switch
+            or args.allow_write
+            or args.expected_count is not None
+            or args.expected_plan_sha256 is not None
+        ):
+            raise SystemExit(
+                "--plan-terminal-error-recovery cannot be combined with execution-only arguments"
+            )
+        try:
+            job_id = int(args.plan_terminal_error_recovery)
+            if job_id <= 0:
+                raise ValueError("JOB_ID must be a positive integer")
+            config = validate_config(args.config, config, check_writable=False)
+            plan = build_terminal_error_recovery_plan(config, job_id=job_id)
+        except (TerminalErrorRecoveryContractError, OSError, ValueError) as exc:
+            print(f"Terminal-error-recovery plan rejected: {exc}", file=sys.stderr)
+            raise SystemExit(2) from exc
+        print(json.dumps(plan, ensure_ascii=False, sort_keys=True))
+        return
+
+    single_job_plan: dict[str, Any] | None = None
+    retry_job_plan: dict[str, Any] | None = None
+    terminal_error_recovery_plan: dict[str, Any] | None = None
+    controller_kill_switch_path: Path | None = None
+    if args.single_job_manifest:
+        if args.once or args.enable_retry_job or args.enable_terminal_error_recovery:
+            raise SystemExit(
+                "--single-job-manifest cannot be combined with --once or other guarded worker modes"
+            )
+        try:
+            single_job_plan = load_single_job_plan(Path(args.single_job_manifest))
+            validate_apply_guards(
+                single_job_plan,
+                enabled=args.enable_single_job,
+                allow_write=args.allow_write,
+                expected_count=args.expected_count,
+                expected_plan_sha256=args.expected_plan_sha256,
+            )
+            controller_kill_switch_path = normalize_controller_kill_switch_path(
+                args.controller_kill_switch,
+                operation="controller single-job execution",
+            )
+            ensure_controller_kill_switch_inactive(controller_kill_switch_path)
+        except (ControllerGateError, SingleJobContractError) as exc:
+            print(f"Single-job execution rejected: {exc}", file=sys.stderr)
+            raise SystemExit(2) from exc
+    elif args.retry_job_manifest:
+        if args.once or args.enable_single_job or args.enable_terminal_error_recovery:
+            raise SystemExit(
+                "--retry-job-manifest cannot be combined with --once or other guarded worker modes"
+            )
+        try:
+            retry_job_plan = load_retry_job_plan(Path(args.retry_job_manifest))
+            validate_retry_apply_guards(
+                retry_job_plan,
+                enabled=args.enable_retry_job,
+                allow_write=args.allow_write,
+                expected_count=args.expected_count,
+                expected_plan_sha256=args.expected_plan_sha256,
+            )
+            controller_kill_switch_path = normalize_controller_kill_switch_path(
+                args.controller_kill_switch,
+                operation="controller retry execution",
+            )
+            ensure_controller_kill_switch_inactive(controller_kill_switch_path)
+        except (ControllerGateError, RetryJobContractError) as exc:
+            print(f"Retry-job execution rejected: {exc}", file=sys.stderr)
+            raise SystemExit(2) from exc
+    elif args.terminal_error_recovery_manifest:
+        if args.once or args.enable_single_job or args.enable_retry_job:
+            raise SystemExit(
+                "--terminal-error-recovery-manifest cannot be combined with --once or other guarded worker modes"
+            )
+        try:
+            terminal_error_recovery_plan = load_terminal_error_recovery_plan(
+                Path(args.terminal_error_recovery_manifest)
+            )
+            validate_terminal_error_recovery_apply_guards(
+                terminal_error_recovery_plan,
+                enabled=args.enable_terminal_error_recovery,
+                allow_write=args.allow_write,
+                expected_count=args.expected_count,
+                expected_plan_sha256=args.expected_plan_sha256,
+            )
+            controller_kill_switch_path = normalize_controller_kill_switch_path(
+                args.controller_kill_switch,
+                operation="controller terminal error recovery",
+            )
+            if not controller_kill_switch_is_active(controller_kill_switch_path):
+                raise ControllerGateError(
+                    "terminal-error-recovery execution requires an active controller kill switch"
+                )
+        except (ControllerGateError, TerminalErrorRecoveryContractError) as exc:
+            print(f"Terminal-error-recovery execution rejected: {exc}", file=sys.stderr)
+            raise SystemExit(2) from exc
+    elif (
+        args.enable_single_job
+        or args.enable_retry_job
+        or args.enable_terminal_error_recovery
+        or args.controller_kill_switch
+        or args.allow_write
+        or args.expected_count is not None
+        or args.expected_plan_sha256 is not None
+    ):
+        raise SystemExit(
+            "worker execution guards require a single-job, retry-job, or terminal-error-recovery manifest"
+        )
+
     config = validate_config(args.config, config)
     logging_cfg = config["logging"]
     logger = setup_logging(
@@ -1680,9 +2564,118 @@ def main() -> None:
             logger.info("Waiting for main worker lock at %s", lock_path)
         with SingleInstanceLock(lock_path, blocking=wait_for_lock):
             logger.info("Acquired main worker lock at %s", lock_path)
-            STTPipeline(config=config, logger=logger).run(run_once=args.once)
+            if controller_kill_switch_path is not None:
+                try:
+                    if terminal_error_recovery_plan is None:
+                        ensure_controller_execution_unpaused(config)
+                        ensure_controller_kill_switch_inactive(controller_kill_switch_path)
+                    elif not controller_kill_switch_is_active(controller_kill_switch_path):
+                        raise ControllerGateError(
+                            "terminal-error-recovery execution requires an active controller kill switch"
+                        )
+                except ControllerGateError as exc:
+                    if single_job_plan is not None:
+                        print(f"Single-job execution rejected: {exc}", file=sys.stderr)
+                    elif retry_job_plan is not None:
+                        print(f"Retry-job execution rejected: {exc}", file=sys.stderr)
+                    else:
+                        print(
+                            f"Terminal-error-recovery execution rejected: {exc}",
+                            file=sys.stderr,
+                        )
+                    raise SystemExit(2) from exc
+            pipeline = STTPipeline(config=config, logger=logger)
+            if single_job_plan is not None:
+                try:
+                    result = pipeline.process_single_job_plan(
+                        single_job_plan,
+                        kill_switch_path=controller_kill_switch_path,
+                    )
+                except (ControllerGateError, SingleJobContractError) as exc:
+                    print(f"Single-job execution rejected: {exc}", file=sys.stderr)
+                    raise SystemExit(2) from exc
+                print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+                if result["status"] == "retry_pending":
+                    raise SystemExit(75)
+                if result["status"] in {"failed", "skipped"}:
+                    raise SystemExit(2)
+                return
+            if retry_job_plan is not None:
+                assert controller_kill_switch_path is not None
+                try:
+                    result = pipeline.process_retry_job_plan(
+                        retry_job_plan,
+                        kill_switch_path=controller_kill_switch_path,
+                    )
+                except (ControllerGateError, RetryJobContractError) as exc:
+                    print(f"Retry-job execution rejected: {exc}", file=sys.stderr)
+                    raise SystemExit(2) from exc
+                print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+                if result["status"] == "retry_pending":
+                    raise SystemExit(75)
+                if result["status"] == "failed":
+                    raise SystemExit(2)
+                return
+            if terminal_error_recovery_plan is not None:
+                assert controller_kill_switch_path is not None
+                try:
+                    terminal_conn = db.connect_db(str(config["paths"]["db_path"]))
+                    try:
+                        result = apply_terminal_error_recovery_plan(
+                            config,
+                            terminal_conn,
+                            terminal_error_recovery_plan,
+                            kill_switch_path=controller_kill_switch_path,
+                        )
+                    finally:
+                        terminal_conn.close()
+                except (ControllerGateError, TerminalErrorRecoveryContractError) as exc:
+                    print(f"Terminal-error-recovery execution rejected: {exc}", file=sys.stderr)
+                    raise SystemExit(2) from exc
+                print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+                return
+            pipeline.run(run_once=args.once)
     except BlockingIOError:
         logger.warning("Another STT worker is already running; exiting (lock=%s)", lock_path)
+        if single_job_plan is not None:
+            print(
+                json.dumps(
+                    single_job_result(
+                        plan_sha256=str(single_job_plan["plan_sha256"]),
+                        status="busy",
+                        job_id=None,
+                    ),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            raise SystemExit(75)
+        if retry_job_plan is not None:
+            print(
+                json.dumps(
+                    retry_job_result(
+                        plan_sha256=str(retry_job_plan["plan_sha256"]),
+                        status="busy",
+                        job_id=int(retry_job_plan["retry_job"]["job_id"]),
+                    ),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            raise SystemExit(75)
+        if terminal_error_recovery_plan is not None:
+            print(
+                json.dumps(
+                    terminal_error_recovery_result(
+                        plan_sha256=str(terminal_error_recovery_plan["plan_sha256"]),
+                        status="busy",
+                        job_id=int(terminal_error_recovery_plan["error_job"]["job_id"]),
+                    ),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            raise SystemExit(75)
 
 
 if __name__ == "__main__":

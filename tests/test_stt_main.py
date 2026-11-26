@@ -6,7 +6,7 @@ import logging
 import os
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -18,6 +18,12 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from lecture_stt.stt import main as stt_main  # noqa: E402
+from lecture_stt.storage_v2.timetable import (  # noqa: E402
+    apply_timetable_import,
+    plan_timetable_import,
+)
+
+CANONICAL_TEMP_ROOT = "/private/tmp" if sys.platform == "darwin" else tempfile.gettempdir()
 
 
 class SttMainControlCommandTests(unittest.TestCase):
@@ -81,6 +87,75 @@ class SttMainControlCommandTests(unittest.TestCase):
         self.assertIn(f"Pause flag: {env_db_path.parent / 'paused'}", output)
 
 
+class SttConfigValidationTests(unittest.TestCase):
+    def test_enabled_delivery_rejects_active_manifest_under_symlinked_parent(self) -> None:
+        with tempfile.TemporaryDirectory(dir=CANONICAL_TEMP_ROOT) as tmp:
+            root = Path(tmp)
+            watch = root / "watch"
+            watch.mkdir()
+            real_parent = root / "real-state"
+            real_parent.mkdir()
+            (real_parent / "active-semester.json").write_text("{}", encoding="utf-8")
+            linked_parent = root / "linked-state"
+            linked_parent.symlink_to(real_parent, target_is_directory=True)
+            correction_staging = root / "03_correction"
+            summary_staging = root / "04_summarize"
+            correction_staging.mkdir()
+            summary_staging.mkdir()
+            config = {
+                "app": {
+                    "polling_interval_sec": 10,
+                    "stable_for_sec": 1,
+                    "stale_processing_hours": 6,
+                },
+                "paths": {
+                    "watch_folder": str(watch),
+                    "stable_audio_folder": str(root / "audio"),
+                    "transcript_folder": str(root / "transcripts"),
+                    "error_folder": str(root / "errors"),
+                    "tmp_dir": str(root / "tmp"),
+                    "db_path": str(root / "state" / "jobs.sqlite3"),
+                },
+                "ffmpeg": {"binary_path": "/usr/bin/true"},
+                "transcribe": {
+                    "model_size": "tiny",
+                    "device": "cpu",
+                    "compute_type": "int8",
+                    "language": "ko",
+                    "task": "transcribe",
+                    "beam_size": 1,
+                    "vad_filter": False,
+                    "word_timestamps": False,
+                },
+                "transcript_delivery": {
+                    "enabled": True,
+                    "active_semester_manifest": str(
+                        linked_parent / "active-semester.json"
+                    ),
+                    "activation_cutoff": "2026-01-01T00:00:00+09:00",
+                    "correction_staging_dir": str(correction_staging),
+                    "summary_staging_dir": str(summary_staging),
+                    "generator": {
+                        "backend": "codex_cli",
+                        "codex_binary": "/usr/bin/true",
+                        "model": "test-model",
+                        "reasoning_effort": "low",
+                        "timeout_sec": 30,
+                        "max_attempts": 3,
+                        "max_correction_chars": 100000,
+                        "max_summary_chars": 100000,
+                    },
+                },
+            }
+
+            with self.assertRaisesRegex(ValueError, "must not contain symlink components"):
+                stt_main.validate_config(
+                    str(root / "config.yaml"),
+                    config,
+                    check_writable=False,
+                )
+
+
 class _FakeNotifier:
     def notify_detected(self, payload: dict) -> None:
         pass
@@ -100,13 +175,28 @@ class _FakeNotifier:
     def notify_error(self, payload: dict) -> None:
         pass
 
+    def notify_review(self, payload: dict) -> None:
+        pass
+
 
 class _RecordingNotifier(_FakeNotifier):
     def __init__(self) -> None:
         self.errors: list[dict] = []
+        self.reviews: list[dict] = []
+        self.successes: list[dict] = []
+        self.transcript_generated: list[dict] = []
 
     def notify_error(self, payload: dict) -> None:
         self.errors.append(dict(payload))
+
+    def notify_success(self, payload: dict) -> None:
+        self.successes.append(dict(payload))
+
+    def notify_review(self, payload: dict) -> None:
+        self.reviews.append(dict(payload))
+
+    def notify_transcript_generated(self, payload: dict) -> None:
+        self.transcript_generated.append(dict(payload))
 
 
 class _FakeWorker:
@@ -138,9 +228,35 @@ class _FailingWorker(_FakeWorker):
         pass
 
 
+class _BadQualityReport:
+    health = "bad"
+    summary = "품질 위험"
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "quality_score": 10,
+            "health": "bad",
+            "summary": "품질 위험",
+            "total_segments": 1,
+            "empty_segments": 0,
+            "dot_noise_segments": 0,
+            "short_segments": 1,
+            "rep_mass": 0.0,
+            "avg_segment_length": 1.0,
+            "empty_ratio": 0.0,
+            "dot_noise_ratio": 0.0,
+            "short_segment_ratio": 1.0,
+            "nonempty_segments": 1,
+            "nonspace_chars": 1,
+            "last_segment_end_sec": 1.0,
+        }
+
+
 class SttPipelineBehaviorTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.tmpdir = tempfile.TemporaryDirectory()
+        # Use the canonical macOS temp root so path-safety tests do not pass
+        # through the system /var -> /private/var alias.
+        self.tmpdir = tempfile.TemporaryDirectory(dir=CANONICAL_TEMP_ROOT)
         self.root = Path(self.tmpdir.name)
         self.watch_dir = self.root / "watch"
         self.audio_dir = self.root / "audio"
@@ -205,6 +321,29 @@ class SttPipelineBehaviorTests(unittest.TestCase):
         self.pipeline.conn.close()
         self.tmpdir.cleanup()
 
+    def _write_stable_source(self, name: str, payload: bytes) -> Path:
+        path = self.watch_dir / name
+        path.write_bytes(payload)
+        aged = path.stat().st_mtime - 10
+        os.utime(path, (aged, aged))
+        return path
+
+    def test_transcription_progress_callback_throttles_small_updates(self) -> None:
+        self.pipeline._update_progress = mock.Mock()
+        callback = self.pipeline._transcription_progress_callback(7, 100)
+        with mock.patch.object(stt_main.time, "monotonic", side_effect=[10.0, 11.0, 12.0]):
+            callback(0.0, 100.0, 100)
+            callback(1.0, 100.0, 100)
+            callback(50.0, 100.0, 70)
+
+        self.assertEqual(self.pipeline._update_progress.call_count, 2)
+        self.pipeline._update_progress.assert_any_call(
+            7, "전사 시작/진행", progress=18, eta_sec=100
+        )
+        self.pipeline._update_progress.assert_any_call(
+            7, "전사 시작/진행", progress=45, eta_sec=70
+        )
+
     def _quality_metadata(self, canonical_base: str, txt_path: Path, json_path: Path) -> dict:
         return {
             "canonical_base": canonical_base,
@@ -228,6 +367,101 @@ class SttPipelineBehaviorTests(unittest.TestCase):
             },
         }
 
+    def _enable_course_scoped_delivery(self, *, profile_key: str) -> None:
+        correction_root = self.root / "03_correction"
+        summary_root = self.root / "04_summarize"
+        correction_root.mkdir(parents=True, exist_ok=True)
+        summary_root.mkdir(parents=True, exist_ok=True)
+
+        timetable_db_path = self.root / "state" / "storage-v2.sqlite3"
+        timetable_source = self.root / "timetable.csv"
+        timetable_source.write_text(
+            "학기,과목명,과목코드,요일,시작시간,종료시간,교시,강의실\n"
+            "2026-1,Data Structures,CS201,목,10:00,11:15,2교시,E101\n",
+            encoding="utf-8",
+        )
+        timetable_plan = plan_timetable_import(timetable_source)
+        apply_timetable_import(
+            timetable_source,
+            timetable_db_path,
+            expected_count=timetable_plan["expected_count"],
+            expected_plan_sha256=timetable_plan["plan_sha256"],
+            allow_write=True,
+        )
+
+        vault_root = self.root / "vault"
+        semester_root = vault_root / "01_current"
+        (vault_root / ".obsidian").mkdir(parents=True)
+        (semester_root / "cs201" / "06_lecture_notes" / "02_origin").mkdir(
+            parents=True
+        )
+        (semester_root / "cs201" / "06_lecture_notes" / "01_summarize").mkdir(
+            parents=True
+        )
+
+        active_path = self.root / "active-semester.json"
+        active_payload = {
+            "schema_version": "lecture-stt/active-semester@2",
+            "activated_at": "2026-01-01T10:00:00+09:00",
+            "activation_plan_sha256": "1" * 64,
+            "manifest_source_path": str(self.root / "semester.yaml"),
+            "manifest_source_sha256": "2" * 64,
+            "expected_course_count": 1,
+            "semester": "2026-1",
+            "vault_root": str(vault_root),
+            "semester_root": str(semester_root),
+            "timetable_db_path": str(timetable_db_path),
+            "origin_subdir": "06_lecture_notes/02_origin",
+            "summary_subdir": "06_lecture_notes/01_summarize",
+            "match_margin_minutes": 30,
+            "courses": [
+                {
+                    "course_code": "CS201",
+                    "course_name": "Data Structures",
+                    "course_dir": "cs201",
+                    "aliases": ["CA_2"],
+                }
+            ],
+            "selected_timetable_courses": [
+                {"course_code": "CS201", "course_name": "Data Structures"}
+            ],
+            "timetable_selection_plan_sha256": timetable_plan["plan_sha256"],
+        }
+        active_path.write_text(json.dumps(active_payload), encoding="utf-8")
+
+        self.config["profiles"] = {
+            "active": profile_key,
+            "definitions": {
+                profile_key: {
+                    "version": "test.1",
+                    "transcribe": {"initial_prompt": ""},
+                    "quality": {"warn_threshold": 0.55, "bad_threshold": 0.70},
+                }
+            },
+        }
+        self.config["transcript_delivery"] = {
+            "enabled": True,
+            "active_semester_manifest": str(active_path),
+            "activation_cutoff": "2026-01-01T00:00:00+09:00",
+            "correction_staging_dir": str(correction_root),
+            "summary_staging_dir": str(summary_root),
+            "generator": {
+                "backend": "codex_cli",
+                "codex_binary": "/usr/bin/true",
+                "model": "test-model",
+                "reasoning_effort": "low",
+                "timeout_sec": 30,
+                "max_attempts": 3,
+                "max_correction_chars": 100000,
+                "max_summary_chars": 100000,
+            },
+        }
+        self.pipeline.conn.close()
+        self.pipeline = stt_main.STTPipeline(config=self.config, logger=self.logger)
+
+    def _controller_kill_switch(self) -> Path:
+        return self.root / "controller.stop"
+
     def test_process_job_uses_local_staging_before_canonical_move(self) -> None:
         source_path = self.watch_dir / "sample.m4a"
         source_path.write_bytes(b"fake-audio")
@@ -248,9 +482,547 @@ class SttPipelineBehaviorTests(unittest.TestCase):
         self.assertEqual(rows[0]["status"], stt_main.STATUS_DONE)
         self.assertEqual(rows[0]["current_step"], "전체 완료")
 
+    def test_process_job_routes_lecture_raw_outputs_under_course_directory(self) -> None:
+        self._enable_course_scoped_delivery(profile_key="lecture")
+        source_path = self._write_stable_source("260101CA_2.m4a", b"lecture-audio")
+
+        planned = self.pipeline._job_paths(source_path)
+        self.assertEqual(
+            planned["transcript_txt_path"],
+            self.transcript_dir / "2026-1" / "cs201" / "260101CA_2.txt",
+        )
+        self.assertFalse((self.transcript_dir / "2026-1").exists())
+
+        self.pipeline.process_job(source_path)
+
+        course_transcript_dir = self.transcript_dir / "2026-1" / "cs201"
+        txt_path = course_transcript_dir / "260101CA_2.txt"
+        json_path = course_transcript_dir / "260101CA_2.json"
+        quality_path = course_transcript_dir / "260101CA_2.quality.json"
+        self.assertTrue(txt_path.exists())
+        self.assertTrue(json_path.exists())
+        self.assertTrue(quality_path.exists())
+
+        row = self.pipeline.conn.execute(
+            "SELECT transcript_txt_path, transcript_json_path FROM jobs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        assert row is not None
+        self.assertEqual(row["transcript_txt_path"], str(txt_path))
+        self.assertEqual(row["transcript_json_path"], str(json_path))
+
+        queue_row = self.pipeline.conn.execute(
+            "SELECT correction_stage_txt_path, summary_stage_md_path FROM transcript_postprocess_jobs "
+            "ORDER BY source_job_id DESC LIMIT 1"
+        ).fetchone()
+        assert queue_row is not None
+        self.assertEqual(
+            queue_row["correction_stage_txt_path"],
+            str(self.root / "03_correction" / "2026-1" / "cs201" / "260101CA_2.txt"),
+        )
+        self.assertEqual(
+            queue_row["summary_stage_md_path"],
+            str(self.root / "04_summarize" / "2026-1" / "cs201" / "260101CA_2.md"),
+        )
+
+    def test_job_admission_revalidates_active_semester_after_staging(self) -> None:
+        self._enable_course_scoped_delivery(profile_key="lecture")
+        source_path = self._write_stable_source("260101CA_2.m4a", b"lecture-audio")
+        active_path = Path(
+            self.pipeline.config["transcript_delivery"]["active_semester_manifest"]
+        )
+        next_semester_root = self.root / "vault" / "02_next"
+        next_notes = next_semester_root / "cs201-next" / "06_lecture_notes"
+        (next_notes / "02_origin").mkdir(parents=True)
+        (next_notes / "01_summarize").mkdir(parents=True)
+
+        original_move = stt_main.utils.safe_move_file
+        move_count = 0
+
+        def move_and_switch(src: Path, dst: Path) -> None:
+            nonlocal move_count
+            original_move(src, dst)
+            move_count += 1
+            if move_count != 1:
+                return
+            payload = json.loads(active_path.read_text(encoding="utf-8"))
+            payload["activated_at"] = "2026-01-01T10:01:00+09:00"
+            payload["semester"] = "2026-2"
+            payload["semester_root"] = str(next_semester_root)
+            payload["courses"][0]["course_dir"] = "cs201-next"
+            active_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        statements: list[str] = []
+        self.pipeline.conn.set_trace_callback(statements.append)
+        try:
+            with mock.patch.object(
+                stt_main.utils,
+                "safe_move_file",
+                side_effect=move_and_switch,
+            ):
+                self.pipeline.process_job(source_path)
+        finally:
+            self.pipeline.conn.set_trace_callback(None)
+
+        row = self.pipeline.conn.execute(
+            "SELECT status, transcript_txt_path FROM jobs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        assert row is not None
+        self.assertEqual(row["status"], stt_main.STATUS_DONE)
+        self.assertEqual(
+            row["transcript_txt_path"],
+            str(self.transcript_dir / "2026-2" / "cs201-next" / "260101CA_2.txt"),
+        )
+        self.assertIn("BEGIN IMMEDIATE", statements)
+
+    def test_raw_course_route_does_not_depend_on_codex_or_stage_roots(self) -> None:
+        self._enable_course_scoped_delivery(profile_key="lecture")
+        delivery = self.pipeline.config["transcript_delivery"]
+        delivery["generator"]["codex_binary"] = str(self.root / "missing-codex")
+        Path(delivery["correction_staging_dir"]).rmdir()
+        Path(delivery["summary_staging_dir"]).rmdir()
+        validated = stt_main.validate_config(
+            str(self.root / "config.yaml"),
+            self.pipeline.config,
+            check_writable=False,
+        )
+        source_path = self._write_stable_source("260101CA_2.m4a", b"lecture-audio")
+
+        self.pipeline.process_job(source_path)
+
+        self.assertTrue(validated["transcript_delivery"]["enabled"])
+        course_transcript_dir = self.transcript_dir / "2026-1" / "cs201"
+        self.assertTrue((course_transcript_dir / "260101CA_2.txt").is_file())
+        self.assertTrue((course_transcript_dir / "260101CA_2.json").is_file())
+        self.assertEqual(
+            self.pipeline.conn.execute(
+                "SELECT COUNT(*) FROM transcript_postprocess_jobs"
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_process_job_keeps_nonlecture_raw_outputs_flat_when_delivery_is_enabled(self) -> None:
+        self._enable_course_scoped_delivery(profile_key="general")
+        source_path = self._write_stable_source("plain-general.m4a", b"general-audio")
+
+        self.pipeline.process_job(source_path)
+
+        self.assertTrue((self.transcript_dir / "plain-general.txt").exists())
+        self.assertTrue((self.transcript_dir / "plain-general.json").exists())
+        self.assertTrue((self.transcript_dir / "plain-general.quality.json").exists())
+        self.assertFalse((self.transcript_dir / "2026-1").exists())
+
+    def test_single_job_plan_executes_exactly_one_source_with_explicit_result(self) -> None:
+        source_path = self._write_stable_source("manifest-job.m4a", b"manifest-audio")
+        plan = stt_main.build_single_job_plan(self.pipeline.config, source_path.name)
+
+        result = self.pipeline.process_single_job_plan(
+            plan,
+            kill_switch_path=self._controller_kill_switch(),
+        )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["plan_sha256"], plan["plan_sha256"])
+        self.assertIsInstance(result["job_id"], int)
+        self.assertFalse(source_path.exists())
+        self.assertTrue((self.audio_dir / "manifest-job.m4a").exists())
+        self.assertEqual(
+            self.pipeline.conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0],
+            1,
+        )
+
+    def test_single_job_plan_rejects_changed_source_before_any_job_write(self) -> None:
+        source_path = self._write_stable_source("stale-manifest-job.m4a", b"planned-audio")
+        plan = stt_main.build_single_job_plan(self.pipeline.config, source_path.name)
+        source_path.write_bytes(b"changed-audio")
+        aged = source_path.stat().st_mtime - 10
+        os.utime(source_path, (aged, aged))
+
+        with self.assertRaisesRegex(
+            stt_main.SingleJobContractError,
+            "source changed after planning",
+        ):
+            self.pipeline.process_single_job_plan(
+                plan,
+                kill_switch_path=self._controller_kill_switch(),
+            )
+
+        self.assertTrue(source_path.exists())
+        self.assertEqual(
+            self.pipeline.conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0],
+            0,
+        )
+
+    def test_single_job_plan_replay_is_rejected_after_source_is_claimed(self) -> None:
+        source_path = self._write_stable_source("one-shot-manifest-job.m4a", b"one-shot-audio")
+        plan = stt_main.build_single_job_plan(self.pipeline.config, source_path.name)
+        first_result = self.pipeline.process_single_job_plan(
+            plan,
+            kill_switch_path=self._controller_kill_switch(),
+        )
+        self.assertEqual(first_result["status"], "completed")
+
+        with self.assertRaisesRegex(
+            stt_main.SingleJobContractError,
+            "not safely openable",
+        ):
+            self.pipeline.process_single_job_plan(
+                plan,
+                kill_switch_path=self._controller_kill_switch(),
+            )
+
+        self.assertEqual(
+            self.pipeline.conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0],
+            1,
+        )
+
+    def test_single_job_plan_returns_retry_pending_on_transient_error(self) -> None:
+        source_path = self._write_stable_source("transcription-fail.m4a", b"transcription-fail-audio")
+        plan = stt_main.build_single_job_plan(self.pipeline.config, source_path.name)
+        self.pipeline.worker.transcribe_file = mock.Mock(side_effect=RuntimeError("simulated"))
+
+        result = self.pipeline.process_single_job_plan(
+            plan,
+            kill_switch_path=self._controller_kill_switch(),
+        )
+
+        self.assertEqual(result["status"], "retry_pending")
+        self.assertEqual(result["plan_sha256"], plan["plan_sha256"])
+        self.assertIsInstance(result["job_id"], int)
+        row = self.pipeline.conn.execute(
+            "SELECT status, current_step FROM jobs WHERE id = ?",
+            (int(result["job_id"]),),
+        ).fetchone()
+        self.assertEqual(row["status"], stt_main.STATUS_PENDING)
+        self.assertIn("전사 재시도 대기", row["current_step"])
+
+    def _plan_retry_after_transient_failure(
+        self,
+        name: str,
+    ) -> tuple[dict[str, object], int, Path]:
+        source_path = self._write_stable_source(name, b"retry-contract-audio")
+        single_plan = stt_main.build_single_job_plan(
+            self.pipeline.config,
+            source_path.name,
+        )
+        with mock.patch.object(
+            self.pipeline.worker,
+            "transcribe_file",
+            side_effect=RuntimeError("simulated retryable failure"),
+        ):
+            first_result = self.pipeline.process_single_job_plan(
+                single_plan,
+                kill_switch_path=self._controller_kill_switch(),
+            )
+        self.assertEqual(first_result["status"], "retry_pending")
+        job_id = int(first_result["job_id"])
+        retry_plan = stt_main.build_retry_job_plan(
+            self.pipeline.config,
+            job_id=job_id,
+        )
+        return retry_plan, job_id, self.audio_dir / name
+
+    def test_single_job_plan_active_kill_switch_rejects_without_mutation(self) -> None:
+        source_path = self._write_stable_source("kill-switched-single.m4a", b"audio")
+        plan = stt_main.build_single_job_plan(self.pipeline.config, source_path.name)
+        kill_switch = self._controller_kill_switch()
+        kill_switch.write_text("stop\n", encoding="utf-8")
+
+        with mock.patch.object(
+            self.pipeline.worker,
+            "transcribe_file",
+            wraps=self.pipeline.worker.transcribe_file,
+        ) as transcribe:
+            with self.assertRaises(stt_main.ControllerGateError):
+                self.pipeline.process_single_job_plan(
+                    plan,
+                    kill_switch_path=kill_switch,
+                )
+
+        transcribe.assert_not_called()
+        self.assertTrue(source_path.exists())
+        self.assertEqual(
+            self.pipeline.conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0],
+            0,
+        )
+
+    def test_single_job_plan_invalid_kill_switch_rejects_without_mutation(self) -> None:
+        source_path = self._write_stable_source("invalid-switch-single.m4a", b"audio")
+        plan = stt_main.build_single_job_plan(self.pipeline.config, source_path.name)
+        kill_switch = self._controller_kill_switch()
+        target = self.root / "kill-target"
+        target.write_text("target\n", encoding="utf-8")
+        kill_switch.symlink_to(target)
+
+        with self.assertRaisesRegex(
+            stt_main.ControllerGateError,
+            "regular single-link marker",
+        ):
+            self.pipeline.process_single_job_plan(
+                plan,
+                kill_switch_path=kill_switch,
+            )
+
+        self.assertTrue(source_path.exists())
+        self.assertEqual(
+            self.pipeline.conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0],
+            0,
+        )
+
+    def test_single_job_plan_activation_between_revalidation_and_claim_is_fail_closed(self) -> None:
+        source_path = self._write_stable_source("race-single.m4a", b"audio")
+        plan = stt_main.build_single_job_plan(self.pipeline.config, source_path.name)
+        kill_switch = self._controller_kill_switch()
+
+        with (
+            mock.patch.object(
+                self.pipeline,
+                "startup_recovery",
+                side_effect=lambda: kill_switch.write_text("stop\n", encoding="utf-8"),
+            ),
+            mock.patch.object(
+                self.pipeline.worker,
+                "transcribe_file",
+                wraps=self.pipeline.worker.transcribe_file,
+            ) as transcribe,
+        ):
+            with self.assertRaises(stt_main.ControllerGateError):
+                self.pipeline.process_single_job_plan(
+                    plan,
+                    kill_switch_path=kill_switch,
+                )
+
+        transcribe.assert_not_called()
+        self.assertTrue(source_path.exists())
+        self.assertEqual(
+            self.pipeline.conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0],
+            0,
+        )
+
+    def test_single_job_plan_pause_flag_rejects_without_mutation(self) -> None:
+        source_path = self._write_stable_source("paused-single.m4a", b"audio")
+        plan = stt_main.build_single_job_plan(self.pipeline.config, source_path.name)
+        stt_main.utils.set_paused(True, self.pipeline.config)
+
+        with self.assertRaisesRegex(
+            stt_main.ControllerGateError,
+            "pause flag is active",
+        ):
+            self.pipeline.process_single_job_plan(
+                plan,
+                kill_switch_path=self._controller_kill_switch(),
+            )
+
+        self.assertTrue(source_path.exists())
+        self.assertEqual(
+            self.pipeline.conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0],
+            0,
+        )
+
+    def test_retry_job_plan_executes_exact_row_and_replay_is_distinct(self) -> None:
+        retry_plan, job_id, canonical_audio = self._plan_retry_after_transient_failure(
+            "exact-retry.m4a"
+        )
+        kill_switch = self.root / "controller.stop"
+
+        result = self.pipeline.process_retry_job_plan(
+            retry_plan,
+            kill_switch_path=kill_switch,
+        )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["job_id"], job_id)
+        self.assertEqual(result["plan_sha256"], retry_plan["plan_sha256"])
+        self.assertTrue(canonical_audio.exists())
+        self.assertEqual(
+            self.pipeline.conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0],
+            1,
+        )
+        with self.assertRaisesRegex(
+            stt_main.RetryJobContractError,
+            "eligible retry job",
+        ):
+            self.pipeline.process_retry_job_plan(
+                retry_plan,
+                kill_switch_path=kill_switch,
+            )
+
+    def test_retry_job_plan_kill_switch_rejects_before_claim(self) -> None:
+        retry_plan, job_id, _ = self._plan_retry_after_transient_failure(
+            "kill-switched-retry.m4a"
+        )
+        kill_switch = self._controller_kill_switch()
+        kill_switch.write_text("stop\n", encoding="utf-8")
+
+        with mock.patch.object(
+            self.pipeline.worker,
+            "transcribe_file",
+            wraps=self.pipeline.worker.transcribe_file,
+        ) as transcribe:
+            with self.assertRaises(stt_main.ControllerGateError):
+                self.pipeline.process_retry_job_plan(
+                    retry_plan,
+                    kill_switch_path=kill_switch,
+                )
+
+        transcribe.assert_not_called()
+        row = stt_main.db.get_job(self.pipeline.conn, job_id)
+        self.assertEqual(row["status"], stt_main.STATUS_PENDING)
+        self.assertEqual(row["current_step"], "전사 재시도 대기 1/2")
+
+    def test_retry_job_plan_pause_flag_rejects_before_claim(self) -> None:
+        retry_plan, job_id, _ = self._plan_retry_after_transient_failure(
+            "paused-retry.m4a"
+        )
+        stt_main.utils.set_paused(True, self.pipeline.config)
+
+        with mock.patch.object(
+            self.pipeline.worker,
+            "transcribe_file",
+            wraps=self.pipeline.worker.transcribe_file,
+        ) as transcribe:
+            with self.assertRaisesRegex(
+                stt_main.ControllerGateError,
+                "pause flag is active",
+            ):
+                self.pipeline.process_retry_job_plan(
+                    retry_plan,
+                    kill_switch_path=self._controller_kill_switch(),
+                )
+
+        transcribe.assert_not_called()
+        row = stt_main.db.get_job(self.pipeline.conn, job_id)
+        self.assertEqual(row["status"], stt_main.STATUS_PENDING)
+        self.assertEqual(row["current_step"], "전사 재시도 대기 1/2")
+
+    def test_retry_job_plan_rejects_changed_audio_before_claim(self) -> None:
+        retry_plan, job_id, canonical_audio = self._plan_retry_after_transient_failure(
+            "tampered-retry.m4a"
+        )
+        canonical_audio.write_bytes(b"tampered-after-plan")
+
+        with mock.patch.object(
+            self.pipeline.worker,
+            "transcribe_file",
+            wraps=self.pipeline.worker.transcribe_file,
+        ) as transcribe:
+            with self.assertRaisesRegex(
+                stt_main.RetryJobContractError,
+                "changed after planning",
+            ):
+                self.pipeline.process_retry_job_plan(
+                    retry_plan,
+                    kill_switch_path=self.root / "controller.stop",
+                )
+
+        transcribe.assert_not_called()
+        row = stt_main.db.get_job(self.pipeline.conn, job_id)
+        self.assertEqual(row["status"], stt_main.STATUS_PENDING)
+
+    def test_retry_job_atomic_claim_fence_rejects_post_validation_race(self) -> None:
+        retry_plan, job_id, _ = self._plan_retry_after_transient_failure(
+            "claim-race-retry.m4a"
+        )
+        original_claim = stt_main.db.claim_retry_job_for_processing
+
+        def race_then_claim(conn, **kwargs):
+            stt_main.db.update_job(
+                conn,
+                job_id,
+                orig_name="changed-after-validation.m4a",
+            )
+            return original_claim(conn, **kwargs)
+
+        with (
+            mock.patch.object(
+                stt_main.db,
+                "claim_retry_job_for_processing",
+                side_effect=race_then_claim,
+            ),
+            mock.patch.object(
+                self.pipeline.worker,
+                "transcribe_file",
+                wraps=self.pipeline.worker.transcribe_file,
+            ) as transcribe,
+        ):
+            with self.assertRaisesRegex(
+                stt_main.RetryJobContractError,
+                "exact claim fence changed",
+            ):
+                self.pipeline.process_retry_job_plan(
+                    retry_plan,
+                    kill_switch_path=self.root / "controller.stop",
+                )
+
+        transcribe.assert_not_called()
+        row = stt_main.db.get_job(self.pipeline.conn, job_id)
+        self.assertEqual(row["status"], stt_main.STATUS_PENDING)
+
+    def test_retry_job_atomic_claim_db_error_is_not_counted_as_worker_failure(self) -> None:
+        retry_plan, job_id, _ = self._plan_retry_after_transient_failure(
+            "claim-error-retry.m4a"
+        )
+        before = dict(stt_main.db.get_job(self.pipeline.conn, job_id))
+
+        with (
+            mock.patch.object(
+                stt_main.db,
+                "claim_retry_job_for_processing",
+                side_effect=stt_main.sqlite3.OperationalError("locked"),
+            ),
+            mock.patch.object(
+                self.pipeline.worker,
+                "transcribe_file",
+                wraps=self.pipeline.worker.transcribe_file,
+            ) as transcribe,
+        ):
+            with self.assertRaisesRegex(
+                stt_main.RetryJobContractError,
+                "could not acquire ownership",
+            ):
+                self.pipeline.process_retry_job_plan(
+                    retry_plan,
+                    kill_switch_path=self.root / "controller.stop",
+                )
+
+        transcribe.assert_not_called()
+        after = dict(stt_main.db.get_job(self.pipeline.conn, job_id))
+        self.assertEqual(after, before)
+
+    def test_retry_job_crash_recovery_fences_old_plan_and_allows_replan(self) -> None:
+        retry_plan, job_id, _ = self._plan_retry_after_transient_failure(
+            "recovered-retry.m4a"
+        )
+        self.assertTrue(
+            stt_main.db.claim_job_for_processing(self.pipeline.conn, job_id)
+        )
+
+        self.pipeline.startup_recovery()
+
+        recovered = stt_main.db.get_job(self.pipeline.conn, job_id)
+        self.assertEqual(recovered["status"], stt_main.STATUS_PENDING)
+        self.assertEqual(recovered["current_step"], "전사 재시도 대기 1/2")
+        with self.assertRaisesRegex(
+            stt_main.RetryJobContractError,
+            "row changed after planning",
+        ):
+            self.pipeline.process_retry_job_plan(
+                retry_plan,
+                kill_switch_path=self.root / "controller.stop",
+            )
+
+        replacement_plan = stt_main.build_retry_job_plan(
+            self.pipeline.config,
+            job_id=job_id,
+        )
+        result = self.pipeline.process_retry_job_plan(
+            replacement_plan,
+            kill_switch_path=self.root / "controller.stop",
+        )
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["job_id"], job_id)
+
     def test_process_job_writes_quality_scorecard_without_transcript_body(self) -> None:
-        source_path = self.watch_dir / "scorecard.m4a"
-        source_path.write_bytes(b"fake-audio")
+        source_path = self._write_stable_source("scorecard.m4a", b"fake-audio")
 
         self.pipeline.process_job(source_path)
 
@@ -267,8 +1039,102 @@ class SttPipelineBehaviorTests(unittest.TestCase):
         self.assertIn(scorecard["health"], {"good", "warn", "bad"})
         self.assertIsInstance(scorecard["quality_score"], int)
         self.assertEqual(scorecard["artifacts"]["transcript_json_path"], str(transcript_json_path))
+        self.assertEqual(scorecard["profile"]["key"], "legacy")
+        self.assertEqual(len(scorecard["profile"]["config_sha256"]), 64)
         self.assertNotIn("segments", scorecard)
         self.assertNotIn("테스트", scorecard_text)
+
+    def test_active_profile_is_applied_and_snapshotted(self) -> None:
+        self.pipeline.conn.close()
+        self.config["profiles"] = {
+            "active": "general",
+            "definitions": {
+                "general": {
+                    "version": "2026-07-23.1",
+                    "transcribe": {
+                        "initial_prompt": "",
+                        "beam_size": 2,
+                    },
+                    "postprocess": {
+                        "corrections": {},
+                    },
+                    "quality": {
+                        "warn_threshold": 0.6,
+                        "bad_threshold": 0.8,
+                    },
+                }
+            },
+        }
+        self.pipeline = stt_main.STTPipeline(config=self.config, logger=self.logger)
+
+        self.assertEqual(self.pipeline.params.initial_prompt, "")
+        self.assertEqual(self.pipeline.params.beam_size, 2)
+        self.assertEqual(self.pipeline.active_profile.corrections, {})
+
+        source_path = self.watch_dir / "profiled.m4a"
+        source_path.write_bytes(b"profiled-audio")
+        self.pipeline.process_job(source_path)
+
+        payload = json.loads(
+            (self.transcript_dir / "profiled.json").read_text(encoding="utf-8")
+        )
+        scorecard = json.loads(
+            (self.transcript_dir / "profiled.quality.json").read_text(encoding="utf-8")
+        )
+        snapshot = payload["metadata"]["profile"]
+        self.assertEqual(snapshot["key"], "general")
+        self.assertEqual(snapshot["version"], "2026-07-23.1")
+        self.assertEqual(len(snapshot["config_sha256"]), 64)
+        self.assertEqual(scorecard["profile"], snapshot)
+
+    def test_process_job_flags_sparse_transcript_when_audio_duration_is_long(self) -> None:
+        source_path = self.watch_dir / "sparse-long.m4a"
+        source_path.write_bytes(b"fake-audio")
+        notifier = _RecordingNotifier()
+        self.pipeline.notifier = notifier  # type: ignore[assignment]
+
+        with mock.patch.object(stt_main.STTWorker, "_wav_duration_sec", return_value=2755.051, create=True):
+            self.pipeline.process_job(source_path)
+
+        scorecard_path = self.transcript_dir / "sparse-long.quality.json"
+        scorecard = json.loads(scorecard_path.read_text(encoding="utf-8"))
+        self.assertEqual(scorecard["health"], "bad")
+        self.assertLess(scorecard["quality_score"], 45)
+        self.assertLess(scorecard["metrics"]["chars_per_audio_min"], 15)
+        self.assertLess(scorecard["metrics"]["coverage_ratio"], 0.35)
+        self.assertIn("전사량", scorecard["summary"])
+
+        rows = self.pipeline.conn.execute("SELECT status, current_step, error_message FROM jobs").fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], stt_main.STATUS_NEEDS_REVIEW)
+        self.assertEqual(rows[0]["current_step"], "품질 검토 필요")
+        self.assertIn("전사량", rows[0]["error_message"])
+        self.assertEqual(notifier.successes, [])
+        self.assertEqual(notifier.errors, [])
+        self.assertEqual(len(notifier.reviews), 1)
+        self.assertEqual(notifier.reviews[0]["review_step"], "품질 검사")
+        self.assertIn("전사량", notifier.reviews[0]["review_message"])
+
+    def test_bad_quality_marks_need_review_and_uses_review_notification(self) -> None:
+        source_path = self.watch_dir / "sparse-review.m4a"
+        source_path.write_bytes(b"fake-audio")
+        notifier = _RecordingNotifier()
+        self.pipeline.notifier = notifier  # type: ignore[assignment]
+
+        with mock.patch.object(stt_main.STTWorker, "_wav_duration_sec", return_value=2755.051, create=True):
+            self.pipeline.process_job(source_path)
+
+        rows = self.pipeline.conn.execute(
+            "SELECT status, current_step, error_message FROM jobs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertIsNotNone(rows)
+        self.assertEqual(rows["status"], stt_main.STATUS_NEEDS_REVIEW)
+        self.assertEqual(rows["current_step"], "품질 검토 필요")
+        self.assertIn("전사량", rows["error_message"])
+        self.assertEqual(len(notifier.reviews), 1)
+        self.assertEqual(len(notifier.successes), 0)
+        self.assertEqual(len(notifier.errors), 0)
+        self.assertEqual(len(notifier.transcript_generated), 0)
 
     def test_validate_output_requires_quality_scorecard_sidecar(self) -> None:
         txt_path = self.transcript_dir / "missing-sidecar.txt"
@@ -316,11 +1182,22 @@ class SttPipelineBehaviorTests(unittest.TestCase):
 
         duplicate_path = self.watch_dir / "dedupe-copy.m4a"
         duplicate_path.write_bytes(b"same-audio")
+        original_replay = self.pipeline._replay_existing_job
+
+        def replay_after_claim(**kwargs):
+            status = self.pipeline.conn.execute(
+                "SELECT status FROM jobs WHERE id = ?", (kwargs["job_id"],)
+            ).fetchone()["status"]
+            self.assertEqual(status, stt_main.STATUS_PROCESSING)
+            return original_replay(**kwargs)
+
         with mock.patch.object(
             self.pipeline.worker,
             "transcribe_file",
             wraps=self.pipeline.worker.transcribe_file,
-        ) as transcribe_file:
+        ) as transcribe_file, mock.patch.object(
+            self.pipeline, "_replay_existing_job", side_effect=replay_after_claim
+        ):
             self.pipeline.process_job(duplicate_path)
 
         self.assertEqual(transcribe_file.call_count, 0)
@@ -332,12 +1209,207 @@ class SttPipelineBehaviorTests(unittest.TestCase):
         duplicate_payload = json.loads(duplicate_json_path.read_text(encoding="utf-8"))
         self.assertTrue(duplicate_payload["metadata"]["deduped"])
         self.assertIn("quality", duplicate_payload["metadata"])
+        self.assertEqual(
+            duplicate_payload["metadata"]["profile"]["config_sha256"],
+            self.pipeline.active_profile.config_sha256,
+        )
 
         scorecard_text = duplicate_scorecard_path.read_text(encoding="utf-8")
         scorecard = json.loads(scorecard_text)
         self.assertEqual(scorecard["canonical_base"], "dedupe-copy")
         self.assertNotIn("segments", scorecard)
         self.assertNotIn("테스트", scorecard_text)
+
+    def test_deduped_output_recovery_preserves_lineage_after_interruption(self) -> None:
+        original = self.watch_dir / "lineage-original.m4a"
+        original.write_bytes(b"lineage-audio")
+        self.pipeline.process_job(original)
+        original_id = self.pipeline.conn.execute(
+            "SELECT id FROM jobs WHERE orig_name = ?", (original.name,)
+        ).fetchone()["id"]
+        original_json = self.transcript_dir / "lineage-original.json"
+        original_payload = json.loads(original_json.read_text(encoding="utf-8"))
+        original_payload["metadata"].pop("profile", None)
+        original_json.write_text(json.dumps(original_payload, ensure_ascii=False), encoding="utf-8")
+
+        replay = self.watch_dir / "lineage-replay.m4a"
+        replay.write_bytes(b"lineage-audio")
+        validate_output = self.pipeline._validate_output_files
+
+        def interrupt_after_output(*args):
+            validate_output(*args)
+            raise KeyboardInterrupt("simulated worker crash")
+
+        with mock.patch.object(self.pipeline, "_validate_output_files", side_effect=interrupt_after_output):
+            with self.assertRaises(KeyboardInterrupt):
+                self.pipeline.process_job(replay)
+
+        row = self.pipeline.conn.execute(
+            "SELECT id, status, is_deduped, deduped_from_job_id FROM jobs WHERE orig_name = ?",
+            (replay.name,),
+        ).fetchone()
+        self.assertEqual(row["status"], stt_main.STATUS_PROCESSING)
+        self.assertEqual(stt_main.db.recover_processing_jobs(self.pipeline.conn)["done"], 1)
+        recovered = stt_main.db.get_job(self.pipeline.conn, row["id"])
+        self.assertEqual(recovered["status"], stt_main.STATUS_DONE)
+        self.assertEqual(recovered["is_deduped"], 1)
+        self.assertEqual(recovered["deduped_from_job_id"], original_id)
+        replay_metadata = json.loads(
+            (self.transcript_dir / "lineage-replay.json").read_text(encoding="utf-8")
+        )["metadata"]
+        self.assertEqual(replay_metadata["profile"]["key"], "legacy-unknown")
+        self.assertEqual(json.loads(recovered["engine_params"])["profile"], replay_metadata["profile"])
+
+    def test_failed_dedupe_replay_falls_back_without_lineage(self) -> None:
+        original = self.watch_dir / "fallback-original.m4a"
+        original.write_bytes(b"fallback-audio")
+        self.pipeline.process_job(original)
+        replay = self.watch_dir / "fallback-replay.m4a"
+        replay.write_bytes(b"fallback-audio")
+        write_output = self.pipeline._write_output
+        attempts = 0
+
+        def fail_first_output(*args):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise OSError("replay output failed")
+            return write_output(*args)
+
+        with mock.patch.object(self.pipeline, "_write_output", side_effect=fail_first_output), mock.patch.object(
+            self.pipeline.worker, "transcribe_file", wraps=self.pipeline.worker.transcribe_file
+        ) as transcribe:
+            self.pipeline.process_job(replay)
+
+        row = self.pipeline.conn.execute(
+            "SELECT status, is_deduped, deduped_from_job_id FROM jobs WHERE orig_name = ?",
+            (replay.name,),
+        ).fetchone()
+        self.assertEqual(row["status"], stt_main.STATUS_DONE)
+        self.assertEqual(row["is_deduped"], 0)
+        self.assertIsNone(row["deduped_from_job_id"])
+        self.assertEqual(transcribe.call_count, 1)
+
+    def test_failed_replay_then_interrupted_transcription_recovers_without_lineage(self) -> None:
+        original = self.watch_dir / "fallback-crash-original.m4a"
+        original.write_bytes(b"fallback-crash-audio")
+        self.pipeline.process_job(original)
+        replay = self.watch_dir / "fallback-crash-replay.m4a"
+        replay.write_bytes(b"fallback-crash-audio")
+        write_output = self.pipeline._write_output
+        validate_output = self.pipeline._validate_output_files
+        attempts = 0
+
+        def fail_replay_output(*args):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise OSError("replay output failed")
+            return write_output(*args)
+
+        def interrupt_after_transcription(*args):
+            validate_output(*args)
+            raise KeyboardInterrupt("simulated worker crash")
+
+        with mock.patch.object(self.pipeline, "_write_output", side_effect=fail_replay_output), mock.patch.object(
+            self.pipeline, "_validate_output_files", side_effect=interrupt_after_transcription
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                self.pipeline.process_job(replay)
+
+        row = self.pipeline.conn.execute(
+            "SELECT id, status, is_deduped, deduped_from_job_id FROM jobs WHERE orig_name = ?",
+            (replay.name,),
+        ).fetchone()
+        self.assertEqual(row["status"], stt_main.STATUS_PROCESSING)
+        self.assertEqual(row["is_deduped"], 0)
+        self.assertIsNone(row["deduped_from_job_id"])
+        self.assertEqual(stt_main.db.recover_processing_jobs(self.pipeline.conn)["done"], 1)
+        recovered = stt_main.db.get_job(self.pipeline.conn, row["id"])
+        self.assertEqual(recovered["status"], stt_main.STATUS_DONE)
+        transcript_metadata = json.loads(
+            (self.transcript_dir / "fallback-crash-replay.json").read_text(encoding="utf-8")
+        )["metadata"]
+        self.assertEqual(json.loads(recovered["engine_params"])["profile"], transcript_metadata["profile"])
+
+    def test_deduped_pre_profile_output_is_not_attributed_to_active_profile(self) -> None:
+        original_path = self.watch_dir / "legacy-original.m4a"
+        original_path.write_bytes(b"legacy-same-audio")
+        self.pipeline.process_job(original_path)
+
+        original_json_path = self.transcript_dir / "legacy-original.json"
+        original_payload = json.loads(original_json_path.read_text(encoding="utf-8"))
+        original_payload["metadata"].pop("profile", None)
+        original_json_path.write_text(
+            json.dumps(original_payload, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        duplicate_path = self.watch_dir / "legacy-copy.m4a"
+        duplicate_path.write_bytes(b"legacy-same-audio")
+        self.pipeline.process_job(duplicate_path)
+
+        duplicate_payload = json.loads(
+            (self.transcript_dir / "legacy-copy.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            duplicate_payload["metadata"]["profile"],
+            {
+                "key": "legacy-unknown",
+                "version": "unknown",
+                "config_sha256": "unknown",
+            },
+        )
+
+    def test_deduped_bad_historical_quality_remains_needs_review(self) -> None:
+        original_path = self.watch_dir / "bad-history-original.m4a"
+        original_path.write_bytes(b"bad-history-audio")
+        self.pipeline.process_job(original_path)
+
+        original_row = self.pipeline.conn.execute(
+            "SELECT id FROM jobs WHERE canonical_base = 'bad-history-original'"
+        ).fetchone()
+        original_json_path = self.transcript_dir / "bad-history-original.json"
+        original_payload = json.loads(original_json_path.read_text(encoding="utf-8"))
+        original_payload["metadata"]["quality"]["health"] = "bad"
+        original_payload["metadata"]["quality"]["summary"] = "과거 품질 검토 대상"
+        original_json_path.write_text(
+            json.dumps(original_payload, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        self.pipeline.conn.execute(
+            "UPDATE jobs SET status = ?, current_step = ?, error_message = ? WHERE id = ?",
+            (
+                stt_main.STATUS_NEEDS_REVIEW,
+                "품질 검토 필요",
+                "과거 품질 검토 대상",
+                int(original_row["id"]),
+            ),
+        )
+        self.pipeline.conn.commit()
+
+        notifier = _RecordingNotifier()
+        self.pipeline.notifier = notifier  # type: ignore[assignment]
+        duplicate_path = self.watch_dir / "bad-history-copy.m4a"
+        duplicate_path.write_bytes(b"bad-history-audio")
+        with mock.patch.object(
+            self.pipeline.worker,
+            "transcribe_file",
+            wraps=self.pipeline.worker.transcribe_file,
+        ) as transcribe_file:
+            self.pipeline.process_job(duplicate_path)
+
+        self.assertEqual(transcribe_file.call_count, 0)
+        row = self.pipeline.conn.execute(
+            "SELECT status, current_step, error_message FROM jobs "
+            "WHERE canonical_base = 'bad-history-copy'"
+        ).fetchone()
+        self.assertEqual(row["status"], stt_main.STATUS_NEEDS_REVIEW)
+        self.assertEqual(row["current_step"], "품질 검토 필요")
+        self.assertIn("과거 품질", row["error_message"])
+        self.assertEqual(len(notifier.reviews), 1)
+        self.assertEqual(notifier.successes, [])
+        self.assertEqual(notifier.transcript_generated, [])
 
     def test_process_job_skips_missing_source_when_competing_job_exists(self) -> None:
         source_path = self.watch_dir / "race.m4a"
@@ -372,6 +1444,8 @@ class SttPipelineBehaviorTests(unittest.TestCase):
         staged_path = self.pipeline.staging_dir / "recover.m4a"
         staged_path.parent.mkdir(parents=True, exist_ok=True)
         staged_path.write_bytes(b"staged-audio")
+        partial_copy = self.pipeline.staging_dir / ".recover.partial.tmp"
+        partial_copy.write_bytes(b"partial")
         source_path = self.watch_dir / "recover.m4a"
 
         self.pipeline.conn.execute(
@@ -396,8 +1470,77 @@ class SttPipelineBehaviorTests(unittest.TestCase):
 
         self.assertTrue(source_path.exists())
         self.assertFalse(staged_path.exists())
+        self.assertEqual(partial_copy.read_bytes(), b"partial")
         remaining = self.pipeline.conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
         self.assertEqual(remaining, 0)
+
+    def test_startup_recovery_keeps_new_staging_file_with_done_name(self) -> None:
+        staged_path = self.pipeline.staging_dir / "sample.m4a"
+        staged_path.parent.mkdir(parents=True, exist_ok=True)
+        staged_path.write_bytes(b"new-audio")
+        old_audio = self.audio_dir / "sample.m4a"
+        old_audio.write_bytes(b"old-audio")
+        self.pipeline.conn.execute(
+            "INSERT INTO jobs (status, created_at, updated_at, orig_inbox_path, orig_name, "
+            "canonical_base, canonical_audio_path) "
+            "VALUES (?, datetime('now'), datetime('now'), ?, ?, ?, ?)",
+            (stt_main.STATUS_DONE, str(self.watch_dir / "sample.m4a"), "sample.m4a", "sample", str(old_audio)),
+        )
+        self.pipeline.conn.commit()
+
+        self.pipeline.startup_recovery()
+
+        self.assertEqual((self.watch_dir / "sample.m4a").read_bytes(), b"new-audio")
+        self.assertEqual(old_audio.read_bytes(), b"old-audio")
+        self.assertFalse(staged_path.exists())
+
+    def test_startup_recovery_preserves_claim_when_staging_file_is_missing(self) -> None:
+        staged_path = self.pipeline.staging_dir / "orphan.m4a"
+        canonical_audio = self.audio_dir / "orphan.m4a"
+        canonical_audio.write_bytes(b"claimed-audio")
+        self.pipeline.conn.execute(
+            "INSERT INTO jobs (status, created_at, updated_at, orig_inbox_path, orig_name, "
+            "canonical_base, canonical_audio_path, current_step) "
+            "VALUES (?, datetime('now'), datetime('now'), ?, ?, ?, ?, ?)",
+            (stt_main.STATUS_PENDING, str(self.watch_dir / "orphan.m4a"), "orphan.m4a", "orphan", str(staged_path), "로컬 staging"),
+        )
+        self.pipeline.conn.commit()
+
+        self.pipeline.startup_recovery()
+
+        row = self.pipeline.conn.execute("SELECT status, error_message FROM jobs").fetchone()
+        self.assertEqual(row["status"], stt_main.STATUS_NEEDS_REVIEW)
+        self.assertIn("staging 파일이 없음", row["error_message"])
+        self.assertEqual(canonical_audio.read_bytes(), b"claimed-audio")
+
+    def test_startup_recovery_requeues_first_processing_and_completes_written_output(self) -> None:
+        interrupted_audio = self.audio_dir / "interrupted.m4a"
+        interrupted_audio.write_bytes(b"interrupted-audio")
+        replay_audio = self.audio_dir / "replay.m4a"
+        replay_audio.write_bytes(b"replay-audio")
+        replay_txt = self.transcript_dir / "replay.txt"
+        replay_json = self.transcript_dir / "replay.json"
+        replay_txt.write_text("replayed", encoding="utf-8")
+        replay_json.write_text('{"segments": [{"text": "replayed"}]}', encoding="utf-8")
+        for name, audio, txt, json_path in (
+            ("interrupted", interrupted_audio, self.transcript_dir / "interrupted.txt", self.transcript_dir / "interrupted.json"),
+            ("replay", replay_audio, replay_txt, replay_json),
+        ):
+            self.pipeline.conn.execute(
+                "INSERT INTO jobs (status, created_at, updated_at, orig_inbox_path, orig_name, "
+                "canonical_base, canonical_audio_path, transcript_txt_path, transcript_json_path, "
+                "engine_params, current_step) VALUES (?, datetime('now'), datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?)",
+                (stt_main.STATUS_PROCESSING, str(self.watch_dir / f"{name}.m4a"), f"{name}.m4a", name,
+                 str(audio), str(txt), str(json_path), "{}", "전사 시작/진행"),
+            )
+        self.pipeline.conn.commit()
+
+        self.pipeline.startup_recovery()
+
+        self.assertEqual((self.watch_dir / "interrupted.m4a").read_bytes(), b"interrupted-audio")
+        self.assertFalse(interrupted_audio.exists())
+        rows = self.pipeline.conn.execute("SELECT canonical_base, status FROM jobs").fetchall()
+        self.assertEqual([(row["canonical_base"], row["status"]) for row in rows], [("replay", stt_main.STATUS_DONE)])
 
     def test_startup_recovery_requeues_pending_canonical_audio_jobs(self) -> None:
         canonical_audio = self.audio_dir / "stuck.m4a"
@@ -506,6 +1649,161 @@ class SttPipelineBehaviorTests(unittest.TestCase):
         self.assertEqual(done["status"], stt_main.STATUS_DONE)
         self.assertEqual(done["current_step"], "전체 완료")
 
+    def test_startup_recovery_preserves_bad_quality_as_needs_review(self) -> None:
+        canonical_audio = self.audio_dir / "review-recovery.m4a"
+        canonical_audio.write_bytes(b"claimed-audio")
+        txt_path = self.transcript_dir / "review-recovery.txt"
+        json_path = self.transcript_dir / "review-recovery.json"
+        metadata = self._quality_metadata("review-recovery", txt_path, json_path)
+        metadata["quality"]["health"] = "bad"
+        metadata["quality"]["quality_score"] = 21
+        metadata["quality"]["summary"] = "오디오 길이 대비 전사량이 매우 적음"
+        txt_path.write_text("검토가 필요한 전사", encoding="utf-8")
+        json_path.write_text(
+            json.dumps(
+                {
+                    "segments": [
+                        {"id": 0, "start": 0.0, "end": 2.0, "text": "검토가 필요한 전사"}
+                    ],
+                    "metadata": metadata,
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        stt_main.write_quality_scorecard(json_path, metadata)
+        self.pipeline.conn.execute(
+            "INSERT INTO jobs (status, created_at, updated_at, started_at, orig_inbox_path, orig_name, canonical_base, "
+            "canonical_audio_path, transcript_txt_path, transcript_json_path, current_step, progress_pct) "
+            "VALUES (?, datetime('now'), datetime('now'), datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                stt_main.STATUS_PROCESSING,
+                str(self.watch_dir / "review-recovery.m4a"),
+                "review-recovery.m4a",
+                "review-recovery",
+                str(canonical_audio),
+                str(txt_path),
+                str(json_path),
+                "산출물 저장/검증",
+                94,
+            ),
+        )
+        self.pipeline.conn.commit()
+
+        counts = stt_main.db.recover_processing_jobs(self.pipeline.conn)
+
+        recovered = self.pipeline.conn.execute(
+            "SELECT status, current_step, progress_pct, error_message FROM jobs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual(counts["needs_review"], 1)
+        self.assertEqual(recovered["status"], stt_main.STATUS_NEEDS_REVIEW)
+        self.assertEqual(recovered["current_step"], "품질 검토 필요")
+        self.assertEqual(recovered["progress_pct"], 100)
+        self.assertIn("전사량", recovered["error_message"])
+
+    def test_startup_recovery_rebuilds_missing_quality_scorecard_before_done(self) -> None:
+        canonical_audio = self.audio_dir / "missing-recovery-sidecar.m4a"
+        canonical_audio.write_bytes(b"claimed-audio")
+        txt_path = self.transcript_dir / "missing-recovery-sidecar.txt"
+        json_path = self.transcript_dir / "missing-recovery-sidecar.json"
+        metadata = self._quality_metadata("missing-recovery-sidecar", txt_path, json_path)
+        txt_path.write_text("scorecard missing", encoding="utf-8")
+        json_path.write_text(
+            json.dumps({"segments": [{"text": "검증"}], "metadata": metadata}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        self.pipeline.conn.execute(
+            "INSERT INTO jobs (status, created_at, updated_at, started_at, orig_inbox_path, orig_name, canonical_base, "
+            "canonical_audio_path, transcript_txt_path, transcript_json_path, current_step, progress_pct) "
+            "VALUES (?, datetime('now'), datetime('now'), datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                stt_main.STATUS_PROCESSING,
+                str(self.watch_dir / "missing-recovery-sidecar.m4a"),
+                "missing-recovery-sidecar.m4a",
+                "missing-recovery-sidecar",
+                str(canonical_audio),
+                str(txt_path),
+                str(json_path),
+                "산출물 저장/검증",
+                94,
+            ),
+        )
+        self.pipeline.conn.commit()
+
+        counts = stt_main.db.recover_processing_jobs(self.pipeline.conn)
+
+        recovered = self.pipeline.conn.execute(
+            "SELECT status, current_step, progress_pct, error_message FROM jobs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        scorecard_path = self.transcript_dir / "missing-recovery-sidecar.quality.json"
+        scorecard = json.loads(scorecard_path.read_text(encoding="utf-8"))
+        self.assertEqual(counts["done"], 1)
+        self.assertEqual(counts["needs_review"], 0)
+        self.assertEqual(recovered["status"], stt_main.STATUS_DONE)
+        self.assertIsNone(recovered["error_message"])
+        self.assertEqual(scorecard["canonical_base"], "missing-recovery-sidecar")
+        self.assertNotIn("segments", scorecard)
+        self.assertTrue(txt_path.exists())
+        self.assertTrue(json_path.exists())
+
+    def test_startup_recovery_rejects_malformed_quality_scorecard(self) -> None:
+        canonical_audio = self.audio_dir / "malformed-recovery-sidecar.m4a"
+        canonical_audio.write_bytes(b"claimed-audio")
+        txt_path = self.transcript_dir / "malformed-recovery-sidecar.txt"
+        json_path = self.transcript_dir / "malformed-recovery-sidecar.json"
+        scorecard_path = self.transcript_dir / "malformed-recovery-sidecar.quality.json"
+        metadata = self._quality_metadata("malformed-recovery-sidecar", txt_path, json_path)
+        txt_path.write_text("scorecard malformed", encoding="utf-8")
+        json_path.write_text(
+            json.dumps({"segments": [{"text": "검증"}], "metadata": metadata}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        scorecard_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "kind": "lecture_stt_quality_scorecard",
+                    "canonical_base": "wrong-stem",
+                    "segments": [{"text": "raw transcript must not be here"}],
+                    "artifacts": {"transcript_json_path": str(json_path)},
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        self.pipeline.conn.execute(
+            "INSERT INTO jobs (status, created_at, updated_at, started_at, orig_inbox_path, orig_name, canonical_base, "
+            "canonical_audio_path, transcript_txt_path, transcript_json_path, current_step, progress_pct) "
+            "VALUES (?, datetime('now'), datetime('now'), datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                stt_main.STATUS_PROCESSING,
+                str(self.watch_dir / "malformed-recovery-sidecar.m4a"),
+                "malformed-recovery-sidecar.m4a",
+                "malformed-recovery-sidecar",
+                str(canonical_audio),
+                str(txt_path),
+                str(json_path),
+                "산출물 저장/검증",
+                94,
+            ),
+        )
+        self.pipeline.conn.commit()
+
+        counts = stt_main.db.recover_processing_jobs(self.pipeline.conn)
+
+        recovered = self.pipeline.conn.execute(
+            "SELECT status, current_step, progress_pct, error_message FROM jobs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual(counts["done"], 0)
+        self.assertEqual(counts["needs_review"], 1)
+        self.assertEqual(recovered["status"], stt_main.STATUS_NEEDS_REVIEW)
+        self.assertEqual(recovered["current_step"], "품질 산출물 검증 필요")
+        self.assertEqual(recovered["progress_pct"], 100)
+        self.assertIn("검증 실패", recovered["error_message"])
+        self.assertTrue(txt_path.exists())
+        self.assertTrue(json_path.exists())
+        self.assertTrue(scorecard_path.exists())
+
     def test_transcription_retries_transient_failures_before_success(self) -> None:
         source_path = self.watch_dir / "retry-success.m4a"
         source_path.write_bytes(b"fake-audio")
@@ -530,7 +1828,19 @@ class SttPipelineBehaviorTests(unittest.TestCase):
             self.assertEqual(worker.calls, 2)
             self.assertEqual(second_row["status"], stt_main.STATUS_PENDING)
             self.assertEqual(second_row["current_step"], "전사 재시도 대기 2/2")
-            self.assertEqual(json.loads(second_row["engine_params"])["transcription_failures"], 2)
+            second_metadata = json.loads(second_row["engine_params"])
+            self.assertEqual(second_metadata["transcription_failures"], 2)
+            second_metadata["terminal_error_recovery"] = {
+                "schema_version": "lecture-stt/terminal-error-recovery-metadata@1",
+                "plan_sha256": "a" * 64,
+                "source_error_relative_path": "retry-success.m4a",
+                "target_audio_relative_path": "retry-success.m4a",
+            }
+            self.pipeline.conn.execute(
+                "UPDATE jobs SET engine_params = ? WHERE id = (SELECT id FROM jobs ORDER BY id DESC LIMIT 1)",
+                (json.dumps(second_metadata, ensure_ascii=False),),
+            )
+            self.pipeline.conn.commit()
 
             self.assertEqual(self.pipeline.process_retryable_jobs(), 1)
 
@@ -551,7 +1861,83 @@ class SttPipelineBehaviorTests(unittest.TestCase):
         self.assertIn("재시도 성공", Path(row["transcript_txt_path"]).read_text(encoding="utf-8"))
         payload = json.loads(Path(row["transcript_json_path"]).read_text(encoding="utf-8"))
         self.assertEqual(payload["metadata"]["canonical_base"], "retry-success")
-        self.assertEqual(json.loads(row["engine_params"])["transcription_failures_before_success"], 2)
+        row_metadata = json.loads(row["engine_params"])
+        self.assertEqual(row_metadata["transcription_failures_before_success"], 2)
+        self.assertEqual(
+            row_metadata["terminal_error_recovery"]["plan_sha256"],
+            "a" * 64,
+        )
+        self.assertEqual(
+            payload["metadata"]["terminal_error_recovery"]["plan_sha256"],
+            "a" * 64,
+        )
+
+    def test_retry_success_without_terminal_recovery_audit_remains_unchanged(self) -> None:
+        source_path = self.watch_dir / "retry-success-no-audit.m4a"
+        source_path.write_bytes(b"fake-audio")
+        worker = _FailingWorker(self.tmp_dir, failures_before_success=1)
+
+        with mock.patch.object(self.pipeline, "worker", worker):
+            self.pipeline.process_job(source_path)
+            self.assertEqual(self.pipeline.process_retryable_jobs(), 1)
+
+        row = self.pipeline.conn.execute(
+            "SELECT status, engine_params FROM jobs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["status"], stt_main.STATUS_DONE)
+        row_metadata = json.loads(row["engine_params"])
+        self.assertEqual(row_metadata["transcription_failures_before_success"], 1)
+        self.assertNotIn("terminal_error_recovery", row_metadata)
+
+    def test_retry_bad_quality_preserves_terminal_recovery_audit(self) -> None:
+        source_path = self.watch_dir / "retry-bad-quality.m4a"
+        source_path.write_bytes(b"fake-audio")
+        worker = _FailingWorker(self.tmp_dir, failures_before_success=1)
+
+        with mock.patch.object(self.pipeline, "worker", worker):
+            self.pipeline.process_job(source_path)
+            pending_row = self.pipeline.conn.execute(
+                "SELECT id, engine_params FROM jobs ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            self.assertIsNotNone(pending_row)
+            second_metadata = json.loads(pending_row["engine_params"])
+            second_metadata["terminal_error_recovery"] = {
+                "schema_version": "lecture-stt/terminal-error-recovery-metadata@1",
+                "plan_sha256": "b" * 64,
+                "source_error_relative_path": "retry-bad-quality.m4a",
+                "target_audio_relative_path": "retry-bad-quality.m4a",
+                "prior_status": "ERROR",
+                "prior_current_step": "실패: 전사 실행",
+            }
+            self.pipeline.conn.execute(
+                "UPDATE jobs SET engine_params = ? WHERE id = ?",
+                (json.dumps(second_metadata, ensure_ascii=False), int(pending_row["id"])),
+            )
+            self.pipeline.conn.commit()
+
+            with mock.patch.object(
+                stt_main,
+                "quality_evaluate",
+                return_value=_BadQualityReport(),
+            ):
+                self.assertEqual(self.pipeline.process_retryable_jobs(), 1)
+
+        row = self.pipeline.conn.execute(
+            "SELECT status, engine_params, transcript_json_path FROM jobs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["status"], stt_main.STATUS_NEEDS_REVIEW)
+        row_metadata = json.loads(row["engine_params"])
+        self.assertEqual(
+            row_metadata["terminal_error_recovery"]["plan_sha256"],
+            "b" * 64,
+        )
+        payload = json.loads(Path(row["transcript_json_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(
+            payload["metadata"]["terminal_error_recovery"]["plan_sha256"],
+            "b" * 64,
+        )
 
     def test_redacts_authorization_bearer_and_jwt_tokens(self) -> None:
         sample_jwt = ".".join([
@@ -696,3 +2082,743 @@ class SttPipelineBehaviorTests(unittest.TestCase):
 
         self.assertEqual(lock_args, [(self.db_path.parent / "stt.lock", True)])
         pipeline_mock.run.assert_called_once_with(run_once=False)
+
+
+class SttSingleJobCliTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmpdir.name)
+        self.config_path = self.root / "config.yaml"
+        self.watch_dir = self.root / "watch"
+        self.audio_dir = self.root / "audio"
+        self.transcript_dir = self.root / "transcripts"
+        self.error_dir = self.root / "errors"
+        self.tmp_dir = self.root / "tmp"
+        self.db_path = self.root / "state" / "jobs.sqlite3"
+        for directory in (
+            self.watch_dir,
+            self.audio_dir,
+            self.transcript_dir,
+            self.error_dir,
+            self.tmp_dir,
+            self.db_path.parent,
+        ):
+            directory.mkdir(parents=True, exist_ok=True)
+        self.config = {
+            "app": {
+                "polling_interval_sec": 10,
+                "stable_for_sec": 1,
+                "stale_processing_hours": 6,
+                "transcribe_max_retries": 2,
+            },
+            "paths": {
+                "watch_folder": str(self.watch_dir),
+                "stable_audio_folder": str(self.audio_dir),
+                "transcript_folder": str(self.transcript_dir),
+                "error_folder": str(self.error_dir),
+                "tmp_dir": str(self.tmp_dir),
+                "db_path": str(self.db_path),
+            },
+            "transcribe": {
+                "model_size": "tiny",
+                "device": "cpu",
+                "compute_type": "int8",
+                "language": "ko",
+                "task": "transcribe",
+                "beam_size": 1,
+                "vad_filter": False,
+                "word_timestamps": False,
+                "condition_on_previous_text": False,
+            },
+            "ffmpeg": {"binary_path": "/usr/bin/true"},
+            "logging": {
+                "file": str(self.root / "app.log"),
+                "max_bytes": 1024,
+                "backup_count": 1,
+            },
+        }
+        self.config_path.write_text(json.dumps(self.config, ensure_ascii=False), encoding="utf-8")
+        self.logger = logging.getLogger(f"lecture_stt.test.cli.{id(self)}")
+        self.logger.handlers = []
+        self.logger.addHandler(logging.NullHandler())
+        self.logger.setLevel(logging.INFO)
+
+    def tearDown(self) -> None:
+        self.tmpdir.cleanup()
+
+    class _NoopSingleInstanceLock:
+        def __init__(self, path: Path, blocking: bool = False):
+            self.path = path
+            self.blocking = blocking
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+    def _run_main(self, *args: str) -> tuple[str, str]:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(sys, "argv", ["lecture-stt", *args]),
+            mock.patch.object(stt_main, "load_config", return_value=self.config),
+            mock.patch.object(stt_main, "validate_config", return_value=self.config),
+            mock.patch.object(stt_main, "setup_logging", return_value=self.logger),
+            mock.patch.object(stt_main, "SingleInstanceLock", self._NoopSingleInstanceLock),
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+        ):
+            stt_main.main()
+        return stdout.getvalue(), stderr.getvalue()
+
+    def _write_stable_source(self, name: str, payload: bytes) -> Path:
+        path = self.watch_dir / name
+        path.write_bytes(payload)
+        aged = path.stat().st_mtime - 10
+        os.utime(path, (aged, aged))
+        return path
+
+    def _write_plan(self, source_name: str) -> dict[str, object]:
+        plan = stt_main.build_single_job_plan(self.config, source_name)
+        manifest_path = self.root / "single-job.json"
+        manifest_path.write_text(json.dumps(plan), encoding="utf-8")
+        return {"plan": plan, "path": manifest_path}
+
+    def _write_retry_plan(
+        self,
+        *,
+        name: str = "retry-cli.m4a",
+    ) -> dict[str, object]:
+        audio_path = self.audio_dir / name
+        audio_path.write_bytes(b"retry-cli-audio")
+        conn = stt_main.db.init_db(str(self.db_path))
+        try:
+            job_id = stt_main.db.create_job(
+                conn,
+                status=stt_main.STATUS_PENDING,
+                orig_inbox_path=str(self.watch_dir / name),
+                orig_name=name,
+                canonical_base=Path(name).stem,
+                canonical_audio_path=str(audio_path),
+                transcript_txt_path=str(
+                    self.transcript_dir / f"{Path(name).stem}.txt"
+                ),
+                transcript_json_path=str(
+                    self.transcript_dir / f"{Path(name).stem}.json"
+                ),
+                engine_params={
+                    "transcription_failures": 1,
+                    "transcription_max_retries": 2,
+                },
+                current_step="전사 재시도 대기 1/2",
+                progress_pct=18,
+            )
+        finally:
+            conn.close()
+        plan = stt_main.build_retry_job_plan(self.config, job_id=job_id)
+        manifest_path = self.root / "retry-job.json"
+        manifest_path.write_text(json.dumps(plan), encoding="utf-8")
+        return {"plan": plan, "path": manifest_path, "job_id": job_id}
+
+    def test_plan_single_job_produces_closed_manifest_json(self) -> None:
+        source = self._write_stable_source("cli-source.m4a", b"audio")
+        stdout, _ = self._run_main(
+            "--config",
+            str(self.config_path),
+            "--plan-single-job",
+            source.name,
+        )
+        payload = json.loads(stdout)
+        self.assertEqual(payload["expected_count"], 1)
+        self.assertEqual(payload["source"]["relative_path"], source.name)
+
+    def test_plan_single_job_uses_read_only_config_validation(self) -> None:
+        source = self._write_stable_source("read-only-plan.m4a", b"audio")
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "lecture-stt",
+                    "--config",
+                    str(self.config_path),
+                    "--plan-single-job",
+                    source.name,
+                ],
+            ),
+            mock.patch.object(stt_main, "load_config", return_value=self.config),
+            mock.patch.object(
+                stt_main,
+                "validate_config",
+                return_value=self.config,
+            ) as mocked_validate,
+            redirect_stdout(stdout),
+        ):
+            stt_main.main()
+
+        mocked_validate.assert_called_once_with(
+            str(self.config_path),
+            self.config,
+            check_writable=False,
+        )
+
+    def test_plan_single_job_rejects_execution_flags(self) -> None:
+        source = self._write_stable_source("cli-source.m4a", b"audio")
+
+        with self.assertRaises(SystemExit) as exc:
+            self._run_main(
+                "--config",
+                str(self.config_path),
+                "--plan-single-job",
+                source.name,
+                "--enable-single-job",
+            )
+        self.assertIsInstance(exc.exception.code, str)
+
+    def test_plan_retry_job_produces_closed_manifest_with_read_only_validation(self) -> None:
+        retry_ref = self._write_retry_plan()
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "lecture-stt",
+                    "--config",
+                    str(self.config_path),
+                    "--plan-retry-job",
+                    str(retry_ref["job_id"]),
+                ],
+            ),
+            mock.patch.object(stt_main, "load_config", return_value=self.config),
+            mock.patch.object(
+                stt_main,
+                "validate_config",
+                return_value=self.config,
+            ) as mocked_validate,
+            redirect_stdout(stdout),
+        ):
+            stt_main.main()
+
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["expected_count"], 1)
+        self.assertEqual(payload["retry_job"]["job_id"], retry_ref["job_id"])
+        mocked_validate.assert_called_once_with(
+            str(self.config_path),
+            self.config,
+            check_writable=False,
+        )
+
+    def test_plan_next_retry_job_returns_empty_or_oldest_candidate_read_only(self) -> None:
+        conn = stt_main.db.init_db(str(self.db_path))
+        conn.close()
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "lecture-stt",
+                    "--config",
+                    str(self.config_path),
+                    "--plan-next-retry-job",
+                ],
+            ),
+            mock.patch.object(stt_main, "load_config", return_value=self.config),
+            mock.patch.object(
+                stt_main,
+                "validate_config",
+                return_value=self.config,
+            ) as mocked_validate,
+            redirect_stdout(stdout),
+        ):
+            stt_main.main()
+
+        empty_payload = json.loads(stdout.getvalue())
+        self.assertEqual(empty_payload["schema_version"], "lecture-stt/controller-next-retry@1")
+        self.assertEqual(empty_payload["status"], "empty")
+        self.assertIsNone(empty_payload["plan"])
+        mocked_validate.assert_called_once_with(
+            str(self.config_path),
+            self.config,
+            check_writable=False,
+        )
+
+        first = self._write_retry_plan(name="older-retry.m4a")
+        second = self._write_retry_plan(name="newer-retry.m4a")
+        conn = stt_main.db.init_db(str(self.db_path))
+        try:
+            stt_main.db.update_job(conn, int(first["job_id"]), updated_at="2026-07-27T08:00:00+09:00")
+            stt_main.db.update_job(conn, int(second["job_id"]), updated_at="2026-07-27T09:00:00+09:00")
+        finally:
+            conn.close()
+
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "lecture-stt",
+                    "--config",
+                    str(self.config_path),
+                    "--plan-next-retry-job",
+                ],
+            ),
+            mock.patch.object(stt_main, "load_config", return_value=self.config),
+            mock.patch.object(
+                stt_main,
+                "validate_config",
+                return_value=self.config,
+            ),
+            redirect_stdout(stdout),
+        ):
+            stt_main.main()
+
+        planned_payload = json.loads(stdout.getvalue())
+        self.assertEqual(planned_payload["status"], "planned")
+        self.assertEqual(planned_payload["plan"]["retry_job"]["job_id"], first["job_id"])
+
+    def test_retry_job_manifest_requires_all_guards_and_kill_switch(self) -> None:
+        retry_ref = self._write_retry_plan()
+        plan = retry_ref["plan"]
+        base_args = (
+            "--config",
+            str(self.config_path),
+            "--retry-job-manifest",
+            str(retry_ref["path"]),
+        )
+
+        with self.assertRaises(SystemExit) as disabled:
+            self._run_main(*base_args)
+        self.assertEqual(disabled.exception.code, 2)
+
+        with self.assertRaises(SystemExit) as missing_switch:
+            self._run_main(
+                *base_args,
+                "--enable-retry-job",
+                "--allow-write",
+                "--expected-count",
+                "1",
+                "--expected-plan-sha256",
+                str(plan["plan_sha256"]),
+            )
+        self.assertEqual(missing_switch.exception.code, 2)
+
+        with self.assertRaises(SystemExit) as wrong_digest:
+            self._run_main(
+                *base_args,
+                "--enable-retry-job",
+                "--allow-write",
+                "--expected-count",
+                "1",
+                "--expected-plan-sha256",
+                "0" * 64,
+                "--controller-kill-switch",
+                str(self.root / "controller.stop"),
+            )
+        self.assertEqual(wrong_digest.exception.code, 2)
+
+    def test_disabled_retry_manifest_is_rejected_before_writable_validation(self) -> None:
+        retry_ref = self._write_retry_plan()
+        with (
+            mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "lecture-stt",
+                    "--config",
+                    str(self.config_path),
+                    "--retry-job-manifest",
+                    str(retry_ref["path"]),
+                ],
+            ),
+            mock.patch.object(stt_main, "load_config", return_value=self.config),
+            mock.patch.object(
+                stt_main,
+                "validate_config",
+                side_effect=AssertionError("writable validation must not run"),
+            ),
+            redirect_stderr(io.StringIO()),
+        ):
+            with self.assertRaises(SystemExit) as exc:
+                stt_main.main()
+
+        self.assertEqual(exc.exception.code, 2)
+
+    def test_retry_job_manifest_active_kill_switch_rejects_before_pipeline(self) -> None:
+        retry_ref = self._write_retry_plan()
+        plan = retry_ref["plan"]
+        kill_switch = self.root / "controller.stop"
+        kill_switch.write_text("stop\n", encoding="utf-8")
+
+        with mock.patch.object(stt_main, "STTPipeline") as pipeline_type:
+            with self.assertRaises(SystemExit) as exc:
+                self._run_main(
+                    "--config",
+                    str(self.config_path),
+                    "--retry-job-manifest",
+                    str(retry_ref["path"]),
+                    "--enable-retry-job",
+                    "--allow-write",
+                    "--expected-count",
+                    "1",
+                    "--expected-plan-sha256",
+                    str(plan["plan_sha256"]),
+                    "--controller-kill-switch",
+                    str(kill_switch),
+                )
+
+        self.assertEqual(exc.exception.code, 2)
+        pipeline_type.assert_not_called()
+
+    def test_retry_job_manifest_pause_rejects_before_pipeline(self) -> None:
+        retry_ref = self._write_retry_plan()
+        plan = retry_ref["plan"]
+        stt_main.utils.set_paused(True, self.config)
+
+        with mock.patch.object(stt_main, "STTPipeline") as pipeline_type:
+            with self.assertRaises(SystemExit) as exc:
+                self._run_main(
+                    "--config",
+                    str(self.config_path),
+                    "--retry-job-manifest",
+                    str(retry_ref["path"]),
+                    "--enable-retry-job",
+                    "--allow-write",
+                    "--expected-count",
+                    "1",
+                    "--expected-plan-sha256",
+                    str(plan["plan_sha256"]),
+                    "--controller-kill-switch",
+                    str(self.root / "controller.stop"),
+                )
+
+        self.assertEqual(exc.exception.code, 2)
+        pipeline_type.assert_not_called()
+
+    def test_main_dispatches_retry_job_manifest_to_exact_pipeline_path(self) -> None:
+        retry_ref = self._write_retry_plan()
+        plan = retry_ref["plan"]
+        kill_switch = self.root / "controller.stop"
+        pipeline_mock = mock.Mock()
+        pipeline_mock.process_retry_job_plan.return_value = {
+            "schema_version": "lecture-stt/retry-job-result@1",
+            "expected_count": 1,
+            "plan_sha256": plan["plan_sha256"],
+            "status": "completed",
+            "job_id": retry_ref["job_id"],
+        }
+        with mock.patch.object(
+            stt_main,
+            "STTPipeline",
+            return_value=pipeline_mock,
+        ):
+            stdout, _ = self._run_main(
+                "--config",
+                str(self.config_path),
+                "--retry-job-manifest",
+                str(retry_ref["path"]),
+                "--enable-retry-job",
+                "--allow-write",
+                "--expected-count",
+                "1",
+                "--expected-plan-sha256",
+                str(plan["plan_sha256"]),
+                "--controller-kill-switch",
+                str(kill_switch),
+            )
+
+        result = json.loads(stdout)
+        self.assertEqual(result["status"], "completed")
+        pipeline_mock.process_retry_job_plan.assert_called_once_with(
+            plan,
+            kill_switch_path=stt_main.normalize_controller_kill_switch_path(
+                kill_switch
+            ),
+        )
+
+    def test_retry_job_lock_contention_returns_busy_exact_job_result(self) -> None:
+        retry_ref = self._write_retry_plan()
+        plan = retry_ref["plan"]
+
+        class _BusyLock:
+            def __init__(self, path: Path, blocking: bool = False):
+                pass
+
+            def __enter__(self):
+                raise BlockingIOError("busy")
+
+            def __exit__(self, exc_type, exc, tb):
+                return None
+
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "lecture-stt",
+                    "--config",
+                    str(self.config_path),
+                    "--retry-job-manifest",
+                    str(retry_ref["path"]),
+                    "--enable-retry-job",
+                    "--allow-write",
+                    "--expected-count",
+                    "1",
+                    "--expected-plan-sha256",
+                    str(plan["plan_sha256"]),
+                    "--controller-kill-switch",
+                    str(self.root / "controller.stop"),
+                ],
+            ),
+            mock.patch.object(stt_main, "load_config", return_value=self.config),
+            mock.patch.object(stt_main, "validate_config", return_value=self.config),
+            mock.patch.object(stt_main, "setup_logging", return_value=self.logger),
+            mock.patch.object(stt_main, "SingleInstanceLock", _BusyLock),
+            redirect_stdout(stdout),
+        ):
+            with self.assertRaises(SystemExit) as exc:
+                stt_main.main()
+
+        self.assertEqual(exc.exception.code, 75)
+        result = json.loads(stdout.getvalue())
+        self.assertEqual(result["status"], "busy")
+        self.assertEqual(result["job_id"], retry_ref["job_id"])
+
+    def test_single_job_manifest_requires_all_guards(self) -> None:
+        source = self._write_stable_source("manifest.m4a", b"audio")
+        plan_ref = self._write_plan(source.name)
+        manifest_path = plan_ref["path"]
+        plan = plan_ref["plan"]
+        kill_switch = self.root / "controller.stop"
+
+        with self.assertRaises(SystemExit):
+            self._run_main(
+                "--config",
+                str(self.config_path),
+                "--single-job-manifest",
+                str(manifest_path),
+            )
+
+        with self.assertRaises(SystemExit):
+            self._run_main(
+                "--config",
+                str(self.config_path),
+                "--single-job-manifest",
+                str(manifest_path),
+                "--enable-single-job",
+                "--allow-write",
+                "--expected-count",
+                "2",
+                "--expected-plan-sha256",
+                str(plan["plan_sha256"]),
+                "--controller-kill-switch",
+                str(kill_switch),
+            )
+
+        with self.assertRaises(SystemExit):
+            self._run_main(
+                "--config",
+                str(self.config_path),
+                "--single-job-manifest",
+                str(manifest_path),
+                "--enable-single-job",
+                "--allow-write",
+                "--expected-count",
+                "1",
+                "--expected-plan-sha256",
+                str(plan["plan_sha256"]),
+            )
+
+        with self.assertRaises(SystemExit):
+            self._run_main(
+                "--config",
+                str(self.config_path),
+                "--single-job-manifest",
+                str(manifest_path),
+                "--enable-single-job",
+                "--allow-write",
+                "--expected-count",
+                "1",
+                "--expected-plan-sha256",
+                "0" * 64,
+                "--controller-kill-switch",
+                str(kill_switch),
+            )
+
+    def test_disabled_manifest_is_rejected_before_writable_config_validation(self) -> None:
+        source = self._write_stable_source("disabled-before-config.m4a", b"audio")
+        plan_ref = self._write_plan(source.name)
+        with (
+            mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "lecture-stt",
+                    "--config",
+                    str(self.config_path),
+                    "--single-job-manifest",
+                    str(plan_ref["path"]),
+                ],
+            ),
+            mock.patch.object(stt_main, "load_config", return_value=self.config),
+            mock.patch.object(
+                stt_main,
+                "validate_config",
+                side_effect=AssertionError("writable validation must not run"),
+            ),
+            redirect_stderr(io.StringIO()),
+        ):
+            with self.assertRaises(SystemExit) as exc:
+                stt_main.main()
+
+        self.assertEqual(exc.exception.code, 2)
+
+    def test_main_dispatches_single_job_manifest_to_pipeline(self) -> None:
+        source = self._write_stable_source("dispatch.m4a", b"audio")
+        plan_ref = self._write_plan(source.name)
+        manifest_path = plan_ref["path"]
+        plan = plan_ref["plan"]
+        kill_switch = self.root / "controller.stop"
+        pipeline_mock = mock.Mock()
+        pipeline_mock.process_single_job_plan.return_value = {
+            "schema_version": "lecture-stt/single-job-result@1",
+            "expected_count": 1,
+            "plan_sha256": plan["plan_sha256"],
+            "status": "completed",
+            "job_id": 123,
+        }
+        with (
+            mock.patch.object(stt_main, "STTPipeline", return_value=pipeline_mock),
+        ):
+            stdout, _ = self._run_main(
+                "--config",
+                str(self.config_path),
+                "--single-job-manifest",
+                str(manifest_path),
+                "--enable-single-job",
+                "--allow-write",
+                "--expected-count",
+                "1",
+                "--expected-plan-sha256",
+                plan["plan_sha256"],
+                "--controller-kill-switch",
+                str(kill_switch),
+            )
+
+        result = json.loads(stdout)
+        self.assertEqual(result["status"], "completed")
+        pipeline_mock.process_single_job_plan.assert_called_once_with(
+            plan,
+            kill_switch_path=stt_main.normalize_controller_kill_switch_path(
+                kill_switch,
+                operation="controller single-job execution",
+            ),
+        )
+
+    def test_single_job_manifest_pause_rejects_before_pipeline(self) -> None:
+        source = self._write_stable_source("paused-cli-single.m4a", b"audio")
+        plan_ref = self._write_plan(source.name)
+        stt_main.utils.set_paused(True, self.config)
+
+        with mock.patch.object(stt_main, "STTPipeline") as pipeline_type:
+            with self.assertRaises(SystemExit) as exc:
+                self._run_main(
+                    "--config",
+                    str(self.config_path),
+                    "--single-job-manifest",
+                    str(plan_ref["path"]),
+                    "--enable-single-job",
+                    "--allow-write",
+                    "--expected-count",
+                    "1",
+                    "--expected-plan-sha256",
+                    str(plan_ref["plan"]["plan_sha256"]),
+                    "--controller-kill-switch",
+                    str(self.root / "controller.stop"),
+                )
+
+        self.assertEqual(exc.exception.code, 2)
+        pipeline_type.assert_not_called()
+
+    def test_retry_pending_result_uses_temporary_failure_exit(self) -> None:
+        source = self._write_stable_source("retry-pending.m4a", b"audio")
+        plan_ref = self._write_plan(source.name)
+        plan = plan_ref["plan"]
+        pipeline_mock = mock.Mock()
+        pipeline_mock.process_single_job_plan.return_value = {
+            "schema_version": "lecture-stt/single-job-result@1",
+            "expected_count": 1,
+            "plan_sha256": plan["plan_sha256"],
+            "status": "retry_pending",
+            "job_id": 123,
+        }
+        with mock.patch.object(stt_main, "STTPipeline", return_value=pipeline_mock):
+            with self.assertRaises(SystemExit) as exc:
+                self._run_main(
+                    "--config",
+                    str(self.config_path),
+                    "--single-job-manifest",
+                    str(plan_ref["path"]),
+                    "--enable-single-job",
+                    "--allow-write",
+                    "--expected-count",
+                    "1",
+                    "--expected-plan-sha256",
+                    str(plan["plan_sha256"]),
+                    "--controller-kill-switch",
+                    str(self.root / "controller.stop"),
+                )
+        self.assertEqual(exc.exception.code, 75)
+
+    def test_lock_contention_returns_busy_result_and_temporary_failure_exit(self) -> None:
+        source = self._write_stable_source("busy.m4a", b"audio")
+        plan_ref = self._write_plan(source.name)
+        plan = plan_ref["plan"]
+
+        class _BusyLock:
+            def __init__(self, path: Path, blocking: bool = False):
+                pass
+
+            def __enter__(self):
+                raise BlockingIOError("busy")
+
+            def __exit__(self, exc_type, exc, tb):
+                return None
+
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "lecture-stt",
+                    "--config",
+                    str(self.config_path),
+                    "--single-job-manifest",
+                    str(plan_ref["path"]),
+                    "--enable-single-job",
+                    "--allow-write",
+                    "--expected-count",
+                    "1",
+                    "--expected-plan-sha256",
+                    str(plan["plan_sha256"]),
+                    "--controller-kill-switch",
+                    str(self.root / "controller.stop"),
+                ],
+            ),
+            mock.patch.object(stt_main, "load_config", return_value=self.config),
+            mock.patch.object(stt_main, "validate_config", return_value=self.config),
+            mock.patch.object(stt_main, "setup_logging", return_value=self.logger),
+            mock.patch.object(stt_main, "SingleInstanceLock", _BusyLock),
+            redirect_stdout(stdout),
+        ):
+            with self.assertRaises(SystemExit) as exc:
+                stt_main.main()
+
+        self.assertEqual(exc.exception.code, 75)
+        self.assertEqual(json.loads(stdout.getvalue())["status"], "busy")

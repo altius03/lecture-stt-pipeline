@@ -1,46 +1,141 @@
 # Lecture STT Architecture
 
-기준일: 2026-05-20
+기준일: 2026-09-28
+
+현재 로컬 설정은 `app.execution_owner: python`이다. 2026-09-28 초기화 후 iCloud 녹음 경로는 비어 있고 운영 DB·로그·LaunchAgent는 없다. 아래 흐름도는 설정에 따라 선택할 수 있는 실행 경로까지 함께 나타낸다.
 
 ## 목적
-- iCloud inbox에 들어오는 강의 음성 파일을 자동으로 전사한다.
+- iCloud inbox에 들어오는 강의·회의·대화·개인 메모 음성 파일을 자동으로 전사한다.
 - 전사 결과를 TXT/JSON과 metadata-only quality sidecar로 저장한다.
-- 사람이 검토한 교정·요약 산출물을 별도 워커가 과목별 폴더로 전달한다.
+- 품질 검사를 통과한 전사 원본을 보존하면서 Codex CLI로 교정·요약하고 학기·과목별 Obsidian 경로로 안전하게 자동 전달한다.
+- 현재 운영 호환성을 유지하면서 향후 시간표 기반 분류·자동 제목·모바일 대시보드·온디맨드 워커 구조로 이행한다.
+
+## 시스템 경계
+
+```mermaid
+flowchart LR
+    PHONE["iPhone 단축어"] --> ICLOUD["iCloud inbox"]
+    ICLOUD --> PYOWNER["Python PollingWatcher 기본 실행 주체"]
+    ICLOUD -. "controller 설정 시" .-> GOOWNER["Go controller 실행 소유자"]
+    GOOWNER --> GOSHADOW["Go/Python lockstep 안정화 확인"]
+    ICLOUD -. "bounded scan" .-> GOSHADOW
+    ICLOUD --> WATCHER["Python canonical PollingWatcher probe"]
+    WATCHER -. "canonical scan oracle" .-> GOSHADOW
+    GOSHADOW --> SINGLEPLAN["Python single/retry exact plan CLI"]
+    SINGLEPLAN --> GOOWNER
+    PYOWNER --> STAGING
+    GOOWNER --> STAGING
+    CTRLEVID["Temporary-only attempt evidence wrapper"] -. "exact read-only run" .-> GOSHADOW
+    GOSHADOW -. "report@4" .-> CTRLEVID
+    CTRLEVID -. "final consecutive success suffix" .-> CTRLREADY["20 runs / 100 verified readiness"]
+    CTRLBUNDLE["Evidence-aware temporary review bundle"] -. "wrapper-only candidate plist" .-> CTRLEVID
+    CTRLBUNDLE -. "hash-locked immutable version" .-> CTRLACT["Temporary offline activation ledger"]
+    STAGING["로컬 inbox staging"]
+    STAGING --> PIPELINE["Python STT pipeline"]
+    PIPELINE --> PROFILE["버전 전사 프로필"]
+    PROFILE --> ENGINE["faster-whisper"]
+    ENGINE --> POST["후처리 + 품질 점검"]
+    POST --> V1["현행 v1 원본·전사 보관소 / 학기·과목 scoped"]
+    POST --> DB["현행 jobs.sqlite3"]
+    SEMCFG["학기별 course-route manifest"] -. "plan" .-> SEMACTIVE["검증된 active semester snapshot"]
+    V2DB -. "선택된 timetable 검증" .-> SEMACTIVE
+    DB --> TQUEUE["transcript_postprocess_jobs"]
+    SEMACTIVE --> TQUEUE
+    V1 --> TDWORKER["Codex postprocess worker"]
+    TQUEUE --> TDWORKER
+    TDWORKER --> CODEX["Codex CLI / saved ChatGPT auth / read-only sandbox"]
+    CODEX --> STAGINGOUT["학기·과목별 03_correction TXT/JSON + 04_summarize Markdown"]
+    STAGINGOUT --> ARCHIVE
+    DB --> PANEL["React 웹 패널"]
+    PANEL -. "launchctl + kill switch" .-> GOOWNER
+
+    DB -. "일관된 SQLite backup" .-> SNAPSHOT["독립 legacy DB snapshot"]
+    SNAPSHOT -. "immutable read-only plan" .-> IMPORTER["Storage v2 preserve-first importer"]
+    V1 -. "원본 변경 없는 hash/copy" .-> IMPORTER
+    SNAPSHOT -. "ownerless delivery 원장" .-> RECON["Read-only archive reconciliation"]
+    ARCHIVE["현행 GH archive"] -. "현재 route 경로·해시" .-> RECON
+    OLDARCHIVE["명시적으로 허용한 과거 archive root"] -. "과거 revision 경로·해시" .-> EVIDENCEPLAN["Archive evidence plan"]
+    RECON -. "정본 선택 없는 보존 후보" .-> EVIDENCEPLAN
+    ARCHIVE -. "현재 revision 재검증" .-> EVIDENCEPLAN
+    EVIDENCEPLAN -. "count + plan SHA + allow-write" .-> EVIDENCE["별도 archive-evidence root"]
+    EVIDENCEPLAN -. "case/capture/revision/observation" .-> V2DB
+    V2DB -. "on-demand metadata API" .-> REVIEWAPI["Archive review API"]
+    REVIEWAPI -. "explicit guarded promotion" .-> V2DB
+    TIMETABLE["학기별 CSV/JSON 시간표"] -. "CLI-only plan/apply" .-> TTPLAN["Timetable import + classification plan"]
+    TTPLAN -. "count + plan SHA + allow-write" .-> V2DB
+    V2DB -. "on-demand metadata API" .-> TTREVIEW["Timetable review API"]
+    TTREVIEW -. "audit-only explicit confirmation" .-> V2DB
+    TTREVIEW -. "confirmed proposal" .-> TTMAT["CLI-only canonical materialization"]
+    TTMAT -. "disabled gate + count + plan SHA + allow-write" .-> V2DB
+    TTMAT -. "atomic replace + forward recovery" .-> V2
+    V2 -. "verified latest transcript bytes" .-> TITLEPLAN["CLI-only content title suggestion"]
+    V2DB -. "recorded time + selected context + active timetable proposal" .-> TITLEPLAN
+    TITLEPLAN -. "disabled gate + count + hidden-evidence plan SHA + allow-write" .-> V2DB
+    TITLEPLAN -. "audit-only explicit confirm/reject" .-> V2DB
+    V2DB -. "on-demand metadata API" .-> TITLEREVIEW["Title suggestion review API"]
+    TITLEREVIEW -. "guarded reject + audit-only confirmation" .-> V2DB
+    TITLEREVIEW -. "fresh gated detail" .-> TITLEWORKBENCH["React title review workbench"]
+    TITLEWORKBENCH -. "exact title deep link" .-> PANEL
+    V2DB -. "confirmed content-title proposal" .-> TITLEMAT["CLI-only content-title materialization"]
+    TITLEMAT -. "disabled gate + count + plan SHA + allow-write" .-> V2DB
+    TITLEMAT -. "title-only atomic replace + forward recovery" .-> V2
+    V2DB -. "bounded current-job metadata" .-> ANALYTICS["Read-only transcription analytics"]
+    V2 -. "bounded quality scorecard metadata" .-> ANALYTICS
+    ANALYTICS -. "day/week/month on-demand" .-> PANEL
+    ANALYTICS -. "Prometheus text scrape" .-> METRICS["Prometheus/Grafana-compatible metrics"]
+    V2DB -. "bounded recording/job/artifact/review metadata" .-> LIBRARYAPI["Read-only recording library API"]
+    V2 -. "verified current DONE transcript TXT" .-> LIBRARYAPI
+    LIBRARYAPI -. "list/detail + opt-in click preview" .-> PANEL
+    V2DB -. "single read transaction" .-> UNIFIEDAPI["Read-only unified review feed API"]
+    UNIFIEDAPI -. "exact totals + canonical pagination" .-> UNIFIEDREVIEW["React unified review queue"]
+    UNIFIEDREVIEW -. "exact hash deep link" .-> PANEL
+    IMPORTER -. "명시적 apply 전용" .-> V2["Storage v2 records/<storage_key>"]
+    IMPORTER -. "운영 DB에는 아직 미적용" .-> V2DB["별도 Storage v2 DB"]
+    V2 --> V2DB
+```
 
 ## 최상위 디렉터리
 - `src/`: 애플리케이션 본체
 - `frontend/`: React 웹 패널 소스(Vite 기반)
+- `controller/`: Python 정본 watcher/plan 계약을 대조하고 guarded single/retry apply를 한정 dispatch하는 Go controller와 독립 read-only shadow
 - `scripts/`: 수동 실행, 설치, 운영 보조 스크립트
 - `launchd/`: macOS launchd 서비스 정의 템플릿
-- `config/`: YAML 설정 템플릿. 운영 `config.yaml`은 gitignore 대상이다.
+- `config/`: YAML 설정 템플릿과 학기별 manifest. 운영 `config.yaml`은 gitignore 대상이다.
 - `tests/`: Python unittest suite
 - `docs/`: 운영 runbook, architecture, worklog, 모델 문서
+- `migrations/v2/`: 운영 DB와 분리해 검증하는 additive storage/DB v2 SQL migration
 - `.github/workflows/`: GitHub Actions CI
 - `.codex/agents/`: project-local Codex subagent 설정
-- `state/`: gitignored repo-local SQLite DB, reports, lock/pause files
+- `state/`: gitignored repo-local SQLite DB, active semester snapshot, reports, lock/pause files
 - `tmp/`: gitignored legacy/local fallback tmp. 현재 운영 STT tmp/cache 기본값은 `~/Library/Caches/lecture_stt/tmp`다.
 
 ## 현재 소스 구조
 - 실제 구현 코드는 `src/lecture_stt/` 패키지 아래에 정리되어 있다.
 - `src/lecture_stt/stt/`: 메인 STT 파이프라인
 - `src/lecture_stt/shared/`: 공용 DB, 유틸
+- `src/lecture_stt/storage_v2/`: immutable legacy snapshot discovery, record manifest, preserve-first importer, timetable classification/materialization, transcript-content title suggestion/materialization, library snapshot/verifier, bounded recording library/transcript-preview/analytics adapter
 - `src/lecture_stt/correction/`: 수동/provider-neutral correction 대기 상태 조회와 correction prompt helper
-- `src/lecture_stt/downstream/`: correction/summary 배포 파이프라인
+- `src/lecture_stt/downstream/`: 학기 activation, Codex CLI 교정·요약, 단계별 큐와 과목별 전달 파이프라인. 과거 `deliveries` 원장은 archive 호환 전용이다.
+- `src/lecture_stt/downstream/course_storage.py`: STT와 downstream이 공유하는 단일 과목 route 결정과 안전한 `<semester>/<course_dir>` 하위 경로 생성 계약
 - `src/lecture_stt/ui/`: 웹 제어판
 - 운영 스크립트는 `PYTHONPATH=<repo>/src python -m lecture_stt...` 방식으로 패키지를 직접 실행한다.
+- `src/lecture_stt/stt/profiles.py`가 버전이 있는 전사 프로필과 설정 hash를 관리한다.
 
 ## 메인 STT 파이프라인
 - 메인 진입점 모듈은 `src/lecture_stt/stt/main.py`다.
 - `load_config()`와 `validate_config()`가 설정 파일을 읽고 경로, ffmpeg, 쓰기 권한을 검증한다.
 - `STTPipeline`이 전체 작업을 오케스트레이션한다.
-- `PollingWatcher`가 inbox 폴더를 polling하면서 일정 시간 이상 변하지 않은 파일만 안정 파일로 판단한다.
+- `PollingWatcher`가 inbox 폴더를 polling하면서 일정 시간 이상 변하지 않은 일반 파일만 안정 파일로 판단하고 심볼릭 링크는 제외한다.
 - 안정 파일은 먼저 로컬 `tmp/inbox_staging`으로 선점 이동한 뒤 `01_audio`로 옮겨, iCloud rename/sync 영향이 전사 중간 단계로 번지지 않게 한다.
-- 워커 시작 시 `tmp/inbox_staging`에 남아 있던 중단 파일과 `01_audio`에만 남은 pre-claim pending 오디오는 다시 inbox로 되돌려 재처리하고, 대응되는 stale job row도 정리한다.
-- 같은 SHA-256의 완료 작업이 있으면 기존 결과를 복제해 dedupe 처리한다.
+- 워커 시작 시 `tmp/inbox_staging`의 파일은 과거 완료 작업과 이름이 같아도 inbox로 되돌린다. 실제로 되돌린 staging 파일에 대응하는 job row만 지우고, DB가 가리키는 staging 파일이 없으면 행을 `NEEDS_REVIEW`로 남겨 고립된 canonical 오디오를 조사할 수 있게 한다. 중단된 `PROCESSING`을 먼저 복구한 뒤 미완성 일반 작업의 `01_audio`를 inbox로 되돌린다.
+- 같은 SHA-256의 `DONE` 또는 `NEEDS_REVIEW` 작업이 있으면 기존 결과를 복제해 dedupe 처리한다. 복제 전에 새 job을 `PROCESSING`으로 claim하고 복제 계보와 결과 metadata를 먼저 기록하므로 산출물 완성 직후 중단된 작업도 이력을 유지하며 복구한다. 복제 실패 후 일반 전사로 대체하면 계보와 원래 engine 설정을 즉시 복원한다. 원본 작업이 검토 상태라면 새 작업도 성공으로 승격하지 않고 `NEEDS_REVIEW`를 유지한다.
+- 입력 stem은 NFC로 정규화하고 Unicode 문자·숫자를 보존한다. macOS/iCloud의 NFD 한글 파일명도 더 이상 `audio`로 붕괴하지 않는다.
+- `profiles.active`가 있으면 선택한 프로필의 transcribe override, 후처리 교정표, 품질 임계값을 적용한다. 프로필 설정이 없는 기존 config는 처리 동작을 바꾸지 않는 `legacy/unversioned` 프로필로 기록한다.
 - 중복이 아니면 `STTWorker`가 ffmpeg로 WAV 전처리 후 faster-whisper 전사를 수행한다.
-- 전사 결과는 `postprocess()`로 반복/노이즈/오인식 용어를 정리한다.
-- `quality_gate.evaluate()`가 반복도 기반 건강도를 계산해 메타데이터에 포함한다.
-- 최종 산출물은 `02_transcripts` 아래 `{base}.txt`, `{base}.json`으로 저장되고, 품질 메타데이터가 있으면 `{base}.quality.json` scorecard sidecar도 함께 저장된다. Scorecard는 transcript 본문과 segment 배열을 제외한 metadata-only artifact다.
+- 전사 결과는 `postprocess()`로 세그먼트와 전체 텍스트의 반복/노이즈/오인식 용어를 정리한다. 프로필의 `corrections: {}`는 범용 녹음에서 기존 강의 용어 교정을 끈다.
+- `quality_gate.evaluate()`가 반복도와, 길이를 알 수 있는 오디오의 전사 밀도·시간 커버리지를 계산해 메타데이터에 포함한다.
+- active semester에서 과목 route가 확정된 최종 산출물은 `02_transcripts/<semester>/<course_dir>/{base}.txt`, `{base}.json`으로 저장되고, 품질 메타데이터가 있으면 같은 폴더에 `{base}.quality.json` scorecard sidecar도 함께 저장된다. 과목 미확정·비강의 결과와 기존 평면 artifact는 `02_transcripts` 루트 호환 경계를 유지한다. Scorecard는 transcript 본문과 segment 배열을 제외한 metadata-only artifact이며 profile `key/version/config_sha256` snapshot을 포함할 수 있다.
+- 품질 `bad` 결과는 산출물을 보존하되 정상 성공으로 알리지 않고 DB 상태를 `NEEDS_REVIEW`로 기록하며 별도 review 알림을 보낸다.
 - STT 실행 실패는 기본 2회까지 retryable 상태(`전사 재시도 대기 n/2`)로 DB에 남기고, 다음 scan에서 즉시 재시도한다.
 - retry 한도 초과 후 terminal failure가 되면 오디오는 `99_errors`로 이동하고 DB 상태는 `ERROR`로 기록된다.
 - DB `engine_params`에는 `transcription_failures`, `transcription_max_retries`, `last_error_message`를 secret-redacted 형태로 남긴다.
@@ -49,21 +144,287 @@
 
 ## 메인 파이프라인 핵심 모듈
 - `src/lecture_stt/stt/main.py`: 설정 로드, 파이프라인 오케스트레이션, 상태 전이, 복구
+- `src/lecture_stt/stt/single_job.py`: controller가 생성할 수 있는 단일-job manifest의 닫힌 schema, digest, source/config evidence 검증
+- `src/lecture_stt/stt/retry_job.py`: 기존 Python retry queue에서 명시적으로 선택한 row 1건을 위한 read-only plan, DB/audio/transcript/config evidence 재검증과 exact claim fence
+- `src/lecture_stt/stt/terminal_error_recovery.py`: `99_errors`에 보존된 terminal transcription `ERROR` 한 건을 원본 보존 copy와 exact DB fence로 기존 retry queue에 명시적으로 되돌리는 기본 비활성 복구 경계
+- `src/lecture_stt/stt/controller_gate.py`: controller 경유 single/retry 실행에 필수인 fail-closed kill-switch와 pause 검사
+- `src/lecture_stt/stt/controller_topology.py`: 운영 LaunchAgents를 열거나 변경하지 않고 repo launchd topology와 분리된 shadow 후보 template를 검증하는 install-free preflight
+- `src/lecture_stt/stt/controller_readiness.py`: 연속 Go shadow report ledger의 실행 identity·시간 순서·non-overlap·scan/plan 증거를 검증하는 metadata-only readiness verifier
+- `src/lecture_stt/stt/controller_evidence.py`: system temporary directory 안에서만 Go shadow 실행 전 start와 실행 후 finish를 별도 immutable record로 남기고 마지막 연속 성공 suffix를 검증하는 기본 비활성 evidence wrapper
+- `src/lecture_stt/stt/controller_activation.py`: prepared review bundle을 system temporary directory의 불변 version과 append-only install/uninstall/rollback 상태로만 검증하는 offline activation ledger
+- `src/lecture_stt/stt/shadow_probe.py`: worker lifecycle과 분리된 최소 설정 projection과 bounded canonical watcher scan
 - `src/lecture_stt/stt/watcher.py`: 안정 파일 감시
 - `src/lecture_stt/stt/transcribe.py`: ffmpeg 전처리, Whisper 전사
 - `src/lecture_stt/stt/postprocess.py`: 반복/점 노이즈 제거, 용어 교정
+- `src/lecture_stt/stt/profiles.py`: 프로필 스키마 검증, 활성 프로필 병합, 버전/hash snapshot
 - `src/lecture_stt/stt/quality_gate.py`: 품질 보고서와 metadata-only quality scorecard 생성
 - `src/lecture_stt/stt/notifier.py`: Telegram/Discord notifier, 중복 방지 마커, provider 팩토리
-- `src/lecture_stt/shared/utils.py`: 파일 이동, atomic write, hash, pause flag 등 공용 함수
+- `src/lecture_stt/shared/utils.py`: macOS/Linux의 원자적 no-clobber rename으로 대상 파일을 덮어쓰지 않는 이동, atomic write, hash, pause flag 등 공용 함수. 장치가 다른 경로는 원본을 보존하고 이동을 거부한다.
 - 메인 워커는 `state/stt.lock` 파일 락으로 단일 인스턴스를 보장하고, claim 전에 원본이 사라진 경우는 다른 워커 선점 또는 외부 rename 가능성으로 보고 경고 후 skip한다.
+- `--plan-single-job RELATIVE_PATH`는 watch root 직속 regular single-link
+  파일 중 mtime age가 `stable_for_sec` 이상인 항목 하나의
+  inode/stat/SHA-256과 active profile/worker config fingerprint를 담은
+  metadata-only `lecture-stt/single-job-plan@1`을 출력한다. 이 보수적 age
+  gate는 controller의 반복 size/mtime 관측을 대체하지 않으므로 Go shadow는
+  현재 `PollingWatcher`의 안정화 결정을 별도로 비교한다. 실행은
+  `--single-job-manifest`와 함께 기본 비활성 `--enable-single-job`,
+  `--allow-write`, `--expected-count 1`, exact `--expected-plan-sha256`를 모두
+  요구한다. Worker lock 안에서 startup recovery 전후와 staging claim 직전에
+  source/profile/config를 다시 검증한 뒤 기존 `process_job()`만 호출한다.
+  Digest 입력은 UTF-8, Unicode non-ASCII를 escape하지 않은 key-sort/no-whitespace
+  JSON이며 plan digest에서는 `plan_sha256` 필드 자체를 제외한다. Worker config
+  fingerprint는 정규화된 6개 runtime path, `stable_for_sec`/
+  `stale_processing_hours`/`transcribe_max_retries`, ffmpeg path, engine mapping,
+  active profile을 merge한 transcribe config와 profile snapshot으로 구성한다.
+  따라서 향후 Go shadow도 같은 closed field set과 canonicalization으로 digest를
+  독립 재현할 수 있다.
+  결과는 `completed`, `needs_review`, `retry_pending`, `busy`, `skipped`,
+  `failed` 중 하나인 `lecture-stt/single-job-result@1`로 반환된다.
+  `retry_pending`은 기존 DB retry queue에 남았음을, `busy`는 worker lock을
+  얻지 못했음을 명시하며 둘은 임시 실패 exit 75다. Controller-owned 실행도
+  이 Python 결과 계약과 기존 retry queue를 그대로 사용한다.
+  이 경계는 새 이동/rename 정책을 만들지 않고 기존 local staging, DB
+  lifecycle, retry/error 처리를 그대로 사용한다.
+- retry queue에는 fresh source plan을 재사용하지 않는다. Canonical audio로
+  이동된 `PENDING` row 중 exact `전사 재시도 대기 n/N` 1건만
+  `--plan-retry-job [JOB_ID]`로 계획한다. Metadata-only
+  `lecture-stt/retry-job-plan@1`은 DB path hash와 inode/mode/link identity,
+  stable-audio/transcript root hash, row의 id/status/step/updated-at/name/
+  canonical base, canonical audio의 root-relative path와 stat/content digest,
+  canonical transcript TXT/JSON direct-child path, worker/profile fingerprint를
+  exact SHA-256 아래 닫는다. Plan은 SQLite `mode=ro` + `query_only`로 만들며
+  DB path가 다른 inode로 교체되거나 row/audio/output/config가 바뀌면
+  fail-closed다.
+- 실행은 기본 비활성 `--retry-job-manifest`, `--enable-retry-job`,
+  `--allow-write`, `--expected-count 1`, exact plan SHA-256와 필수
+  `--controller-kill-switch` absent marker가 모두 맞아야 한다. 기존
+  `state/stt.lock`을 얻은 뒤 startup recovery 전후와 claim 직전에 evidence와
+  kill switch를 다시 확인한다. 실제 ownership 전이는 status, updated-at,
+  current-step, name/base, audio/output path, engine params가 모두 plan 직후
+  값인 경우에만 성공하는 단일 conditional SQLite UPDATE다. Claim 이후
+  전사/quality/output/retry/error 처리는 기존 Python
+  `_process_retryable_transcription_job()`만 사용한다. Interrupted
+  `PROCESSING`은 기존 `recover_processing_jobs()`가 persisted retry counters로
+  다시 `PENDING`에 놓으며, 이전 plan은 updated-at drift로 재실행할 수 없고
+  새 plan이 필요하다. Kill switch는 새 work 시작을 막는 failback 경계이며
+  이미 시작된 전사를 강제 rollback하지 않는다.
+- Terminal transcription `ERROR`는 자동으로 retry queue에 복귀하지 않는다.
+  운영자가 `--plan-terminal-error-recovery JOB_ID`로 정확히 한 행을
+  read-only 계획한 뒤에만
+  `lecture-stt/terminal-error-recovery-plan@1` manifest를 만들 수 있다.
+  Plan은 DB path/inode, `ERROR + 실패: 전사 실행` 행의 상태와 주요 문자열
+  digest, `99_errors` direct-child single-link source의 stat/content SHA-256,
+  `01_audio`의 비어 있는 direct-child target, transcript path와 retry limit를
+  exact SHA-256 아래 닫는다.
+- Apply는 `--terminal-error-recovery-manifest`,
+  `--enable-terminal-error-recovery`, `--allow-write`,
+  `--expected-count 1`, exact `--expected-plan-sha256`, 기존
+  `state/stt.lock`, 그리고 **active** controller kill switch를 모두 요구한다.
+  Source는 rename/move/delete하지 않고 `01_audio`에 no-overwrite copy하며
+  short write를 끝까지 처리하고 target file/root를 fsync한다. Copy 전후와
+  DB `BEGIN IMMEDIATE` 직전에 source·target·행·config binding을 다시
+  확인한 뒤, 행을 `PENDING / 전사 재시도 대기 1/N`으로 단일 conditional
+  update한다. 기존 오류 metadata는 plan digest와 함께
+  `terminal_error_recovery` audit object에 보존한다. Copy 뒤 DB commit 전
+  crash는 동일 manifest가 forward-complete하고, copy와 DB 전이가 모두
+  끝난 exact replay는 `skipped`다. 다른 상태·source/target/DB drift는
+  fail-closed하며 복구가 새 전사를 직접 실행하거나 자동 승격하지는 않는다.
+- `controller/cmd/lecture-stt-shadow`는 작업을 소유하지 않는 read-only Go
+  shadow다. Go가 bounded cadence를 소유하고, closed stdin/stdout
+  `shadow-scan-request@1`/`shadow-scan-result@1` lockstep protocol로 하나의
+  long-lived canonical `PollingWatcher`를 scan마다 한 번씩 전진시킨다. 독립 Go
+  size/mtime tracker와 scan별 direct-child filename set을 대조하고, 양쪽에서
+  같은 scan에 안정 파일로 관측된 교집합은 다음 churn 전에 즉시 Python
+  `--plan-single-job`으로 계획한다. `controller-shadow-report@4`는 반복 관측을
+  합치지 않고 plan check마다 원래 `scan_index`를 남기며, random 128-bit
+  `run_id`와 UTC `started_at`/`completed_at`으로 각 실행 경계를 닫는다. Go는
+  closed schema/중복 key/unknown field, UTF-8 canonical JSON SHA-256,
+  root-bound no-follow single-link source FD의 device/inode/size/mtime/ctime와
+  content SHA-256을 독립 재검증한다. JSON 보고서는 상대 파일명과 plan digest만
+  포함하며 absolute watch path, source content hash, transcript/audio 본문을
+  내보내지 않는다. 선택적 `--kill-switch` marker는 각 subprocess/scan/plan/
+  close 경계에서 확인하며 regular single-link marker가 생기면 중단하고
+  symlink/directory/hardlink는 invalid로 거부한다. SIGINT/SIGTERM은 context를
+  취소하고 exit 130의 `interrupted` report를 남기며, 별도 process group으로
+  실행한 Python probe와 descendant를 함께 종료·reap한다. 이 binary에는
+  apply, DB open, claim, rename/move, worker restart 진입점이 없다. 따라서
+  결과는 관측 자료일 뿐 Python polling 정본을 승격하거나 작업을 자동
+  실행하지 않는다.
+- `controller/cmd/lecture-stt-controller`는 운영 cadence와 dispatch를 소유한다.
+  실행에는 `--enable-execution`, `--allow-write`, 필수 kill-switch,
+  owned mode-0700 state dir, `--max-fresh-jobs 1`이 모두 필요하다. Process
+  시작 시 state dir의 0600 `controller.lock`에 nonblocking flock을 얻어
+  controller 인스턴스를 하나로 fence하고, symlink/hardlink/다른 소유자/
+  permissive lock은 변경하지 않고 거부한다.
+- 매 cycle은 Python의 닫힌 `controller-next-retry@1` envelope를 먼저 읽어
+  exact retry plan이 있으면 guarded retry apply로 한 건 dispatch한다. 그 뒤
+  standalone shadow와 같은 lockstep scan/plan 검증을 수행하고, mutually
+  stable fresh source를 apply 직전에 다시 계획해 digest가 동일한 최대 한
+  건만 guarded single apply로 넘긴다. Go는 jobs DB를 직접 열거나 claim하지
+  않으며, Python apply가 worker lock 안에서 pause/kill-switch와 DB/source/
+  output/config evidence를 recovery 전후와 claim 직전에 재검증한다.
+- Controller manifest는 state dir에 0600으로 쓰고 file/root fsync 뒤
+  `expected_count=1`과 exact SHA-256으로 소비한다. 정상/실패 뒤 삭제와 root
+  fsync를 수행하며 crash로 남은 known manifest만 다음 cycle 시작 때
+  owner/mode/link를 확인하고 forward cleanup한다. 알 수 없는 state entry는
+  자동 삭제하지 않고 cycle을 fail-closed한다. SIGINT/SIGTERM은 Go context를
+  취소하고 별도 process group의 Python probe/apply descendant를 함께
+  terminate/reap한다.
+- 운영 전환 뒤 legacy `com.geonha.lecture-stt` Python polling LaunchAgent는
+  내려가고 Go controller만 inbox/retry dispatch authority를 가진다.
+  Python은 controller가 metadata projection, exact plan, guarded apply를
+  요청할 때만 단기 실행되는 pipeline engine이다. 운영 Darwin에서 새
+  LaunchAgent가 iCloud Documents의 FileProvider metadata 조회를 block하는
+  것이 확인되어, `app.controller_runtime: console`은 이미 접근 권한을 가진
+  로컬 웹 콘솔이 exact SHA-256/0500 binary를 별도 process group으로 실행한다.
+  0600 PID file은 controller recovery state 밖의 별도 owned 0700 directory에
+  두며 `lecture-stt/controller-pid@2` canonical JSON의 PID와 Darwin
+  `proc_pidinfo(PROC_PIDTBSDINFO)` kernel birth `(tv_sec,tv_usec)`를 함께
+  fsync한다. 시작/채택/중지는 kernel birth, exact executable/argv,
+  `pbi_pgid == pid`를 같은 live identity predicate로 재검증하고 kill-switch를
+  먼저 적용한다. SHA-256
+  이름의 version directory와 그 상위 `versions` store는 모두 owner-only
+  0500과 Darwin user-immutable flag로 봉인해 writable ancestor를 통한 rename
+  및 hash 검증과 path exec 사이의 교체를 차단한다. `launchd` runtime은 계속
+  지원하지만 해당 macOS 권한이 준비된 환경에서만 사용한다. 두 runtime 모두
+  Python long-running worker를 spawn하지 않으며, controller 설정이 없으면
+  기존 Python behavior가 기본값이다. `scripts/setup_launchd.sh`는 Python
+  실행 주체 전용으로, `execution_owner`가 다르면 서비스 등록 전에 중단한다.
+- 운영 console runtime의 stability 비교는 Python `stat-scan`이 반환한 닫힌
+  direct-child `(name,size,mtime)` projection을 Go tracker와 canonical
+  `PollingWatcher` 양쪽에 공급한다. Ownership report
+  `controller-ownership-report@2`는
+  `observation_mode=python_stat_projection_go_stability_tracker`와
+  `plan_verification=go_contract_then_python_live_replan_apply`를 명시한다.
+  Go는 plan schema/digest를 검증하고 Python apply는 직전에 source/config/
+  profile/DB/output/kill-switch/pause를 live re-plan/revalidate한다. 독립 Go
+  filesystem open은 standalone shadow acceptance에만 남고, 운영에서
+  FileProvider 접근 가능성을 가장한 이중 관측으로 기록하지 않는다.
+- `python -m lecture_stt.stt.controller_readiness --input <jsonl>`은
+  `controller-shadow-report@4` JSONL ledger를 read-only로 검사한다. Ledger는
+  stable single-link regular file, bounded size/count, strict UTF-8, 닫힌
+  schema와 trailing newline을 요구한다. 각 성공 report의 scan/check/count
+  일관성, safe direct-child path와 verified plan digest를 다시 검증하고,
+  ledger 순서대로 unique run ID, strictly increasing start, non-overlap을
+  강제한다. 기본 기준은 20 runs와 100 verified plans이며 출력은 aggregate
+  count와 ledger SHA-256만 포함한다. 이 digest는 변경 감지용이지 서명이나
+  provenance 증명이 아니며, 통과 결과도 controller 실행 권한이나 cutover
+  승인을 부여하지 않는다.
+- `python -m lecture_stt.stt.controller_evidence run|verify`는 raw launchd
+  stdout나 copy-truncate log를 readiness 원장으로 재사용하지 않고, system
+  temporary directory의 기존 real directory에 attempt journal을 만든다.
+  `run`은 기본 비활성이며 `--enable-observation`, `--allow-write`,
+  `--expected-count 1`을 모두 요구한다. Exclusive 0600 lock 아래 controller,
+  config, Python, repo, absent kill-switch 입력을 검증하기 전에 요청 binding을
+  담은 0400 start record를 owned 0700 root에 O_EXCL로 쓰고 file/root
+  `fsync`를 마친 뒤에만 exact read-only Go command를 시작한다. 실행 후 같은
+  입력 identity/content와 kill-switch 부재를 다시 확인하고, bounded stdout
+  hash/size, runner status, exit code, 닫힌 success/failure `report@4`를
+  0400 finish record에 남긴다.
+  SIGINT/SIGTERM은 child exit code나 report와 무관하게 짧은 polling 경계에서
+  `interrupted` barrier와 전체 process group terminate/reap으로 수렴하며
+  timeout·spawn failure·invalid/missing report·input drift도 성공과 구분된
+  finish outcome이다. 실행 후 입력이 바뀌면 유효 report는 진단용으로
+  보존할 수 있지만 outcome은 `input_changed`라 readiness에는 포함되지 않는다.
+  각 record는 이전 record SHA-256을 포함하는 append-only hash chain이며
+  symlink/hardlink/unknown entry, mode·canonical JSON·sequence·record hash
+  drift를 fail-closed한다. Crash로 finish가 없는 start는 삭제·덮어쓰기하지
+  않고 failure barrier로 남으며 이후 새 attempt는 다음 sequence에서
+  이어진다. `verify`는 마지막 failure/incomplete 이후의 성공 suffix만 세고,
+  그 안에서 unique run ID, strictly increasing start, non-overlap과 기본
+  20 runs/100 verified를 재검증한다.
+  Journal은 최대 10,000 attempt에서 자동 rotation 없이 닫히고 경로·본문을
+  출력하지 않는 metadata-only summary만 반환한다. Candidate review plist는
+  Go binary를 직접 실행하지 않고 이 wrapper의 exact CLI만 실행하도록
+  연결되지만, 모든 rendered input과 journal은 계속 TemporaryDirectory canary
+  전용이다. LaunchAgents, 운영 root/DB와는 연결되지 않는다. Hash chain은
+  우발적 변경 검출용이지 외부 서명·신뢰 시각·악의적 재서명 방지는 아니며,
+  통과 결과도 operational install/cutover 권한을 부여하지 않는다.
+- `python -m lecture_stt.stt.controller_topology --repo-root <repo>`는 repo의
+  기존 `launchd/*.plist` 4개, `scripts/setup_launchd.sh`, 분리된
+  `controller/launchd/com.geonha.lecture-stt-controller-shadow.plist.template`
+  만 읽는 정적 preflight다. 기존 label·전체 template digest·stdout/stderr
+  충돌과 setup script의 설치 목록을 검사하고, 후보는 Python
+  `-m lecture_stt.stt.controller_evidence run`, owned 0700 journal root,
+  Go/Python/repo/config/kill-switch, 1800초 timeout, count/write guard로 이루어진
+  exact ProgramArguments와 `PYTHONDONTWRITEBYTECODE=1`, bundle 내부
+  `python-runtime`를 가리키는 `PYTHONPATH`와 `WorkingDirectory`, bounded
+  `StartInterval`, background/low-priority, no `RunAtLoad`/`KeepAlive`
+  계약만 허용한다. 따라서 `python -m`의 cwd 우선 import도 mutable repo
+  최상위 package로 돌아갈 수 없다. Repo 내부 parent symlink와 leaf
+  symlink/hardlink/non-regular/unstable/oversize file, duplicate plist key와
+  placeholder drift를 fail-closed한다.
+  Metadata-only summary는 `mode=read_only`, `install_supported=false`,
+  template/topology SHA-256만 노출한다. 이 모듈에는 plist render/copy,
+  `launchctl`, LaunchAgents 조회나 변경 기능이 없고 기존
+  `setup_launchd.sh`도 후보 template를 찾지 못한다.
+- `python -m lecture_stt.stt.controller_bundle plan|prepare`는 위 topology가
+  통과한 경우에만 system temporary directory 하위에 review bundle 하나를
+  만든다. Plan은 repo/topology/template, evidence wrapper source, source Go
+  binary, Python binary, config, absent kill-switch, owned 0700 evidence root,
+  home/output directory identity, 그리고 `src/lecture_stt/__init__.py`,
+  `src/lecture_stt/stt/__init__.py`,
+  `src/lecture_stt/stt/controller_evidence.py`,
+  `src/lecture_stt/stt/controller_readiness.py` 네 파일을 복제한 immutable
+  `python-runtime` tree의 ordered source identity/content digest와 rendered
+  plist digest를 exact SHA-256으로 닫는다. 이때 rendered plist에 직접 박히는
+  source Go binary, config, kill-switch, evidence root, home, output root는
+  모두 system temporary directory의 실제 하위 경로여야 하고, 기존 Python
+  interpreter만 예외적으로 외부 regular executable을 허용한다.
+  `.venv/bin/python` 같은 leaf symlink는 resolved executable target으로
+  정규화한다. Source/config/kill-switch/home/output 경계는 계속 no-follow
+  real-path 계약을 유지한다.
+  Prepare는 기본 비활성이며
+  `--enable-prepare`, `--allow-write`, `--expected-count 1`, exact
+  `--expected-plan-sha256`을 모두 요구하고 쓰기 직전에 같은 증거를 다시
+  계산한다. Bundle directory와 binary/plist/manifest, 0500 sealed
+  `python-runtime` tree는 no-follow exclusive create 후 file/directory
+  `fsync`하며 manifest를 마지막에 기록한다. 완성된 동일 bundle replay만
+  `skipped`이고 partial/extra/tampered artifact나 runtime tree drift는
+  `recovery_required`로 자동 정리하지 않는다. Manifest는
+  `execution/install/uninstall/rollback_supported=false`,
+  `evidence_wrapper_connected=true`, `launchd_install_supported=false`,
+  `operational_install_supported=false`,
+  `python_polling_authority=true`, `stdout_is_readiness_ledger=false`와
+  runtime tree SHA-256/source file contract를 고정한다. Rendered plist는
+  `.plist.review`이고 후보 stdout도 `*.evidence-result.jsonl` metadata-only
+  wrapper 결과이므로 readiness ledger나 운영 설치 산출물로 취급할 수 없다.
+  이 CLI에는 LaunchAgents 복사, `launchctl`, 실행, 삭제, rollback, DB/root
+  접근 경로가 없다.
+- `python -m lecture_stt.stt.controller_activation
+  plan-install|apply-install|plan-uninstall|apply-uninstall|plan-rollback|apply-rollback`
+  은 위 prepared bundle을 실제 LaunchAgents에 설치하는 도구가 아니라
+  TemporaryDirectory 안의 offline lifecycle 검증기다. Owned 0700 activation
+  root, 0600 nonblocking lock, plan SHA별 0700 immutable version directory,
+  0500 binary와 0400 plist/manifest, 그리고 review bundle과 같은
+  0500 immutable `python-runtime` tree, 0400 append-only action record를
+  no-follow/O_EXCL/fsync로 닫는다. 각 record는 이전 record와 이전/목표 active
+  plan SHA를 포함하며 install은 inactive 상태에서 한 version을 활성화하고,
+  uninstall은 파일을 삭제하지 않는 inactive tombstone, rollback은 과거에
+  install된 검증 version으로만 전환한다. Apply는 기본 비활성
+  `--enable-activation`, `--allow-write`, `--expected-count 1`, exact plan
+  SHA-256을 모두 요구하고 lock 아래 bundle/version/journal을 다시 계산한다.
+  이때 manifest/runtime tree SHA와 exact runtime file set도 함께 재검증한다.
+  동일 상태 replay는 `skipped`이고, complete orphan version은 새 exact
+  plan으로 forward recovery할 수 있지만 partial/tampered/unknown evidence는
+  자동 삭제·덮어쓰기 없이 recovery-required다. 결과는
+  `scope=temporary_offline`, `launchctl_invoked=false`,
+  `operational_install_supported=false`, `python_polling_authority=true`를
+  고정한다. 이 모듈에는 subprocess, LaunchAgents/launchctl, 운영 DB/root,
+  worker 제어 경로가 없다.
 - scheduled cleanup은 `tmp/`를 정리하되 `tmp/inbox_staging`은 보존해 복구 대기 중인 claimed input을 삭제하지 않는다.
+- scheduled cleanup은 DB의 미해결 `NEEDS_REVIEW` canonical stem을 먼저 읽어 해당 원본·전사·quality 세트를 보존한다. 이 보호 목록을 읽을 수 없으면 apply를 거부한다.
+- 설치된 scheduled cleanup은 인자 없는 기본 dry-run으로만 실행된다. 보존 기간 경과만으로는 “미사용”을 증명하지 못하므로 운영 apply 근거로 사용하지 않는다. Legacy 파일을 정리하려면 Storage v2와 archive-evidence verifier issue 0, active/problem/postprocess row 0, 각 파일의 single-link regular metadata와 SHA-256 보존 사본을 함께 확인해야 한다.
+- 2026-08-09에는 위 별도 검증으로 Storage v2에 exact copy가 있고 운영 파일 참조가 없는 과거 audio 41개, summary 97개와 disposable metadata 5개, 합계 143개만 iCloud 휴지통으로 이동했다. `DONE`/`NEEDS_REVIEW` job의 legacy transcript TXT/JSON 경로는 같은 SHA 입력의 dedupe replay가 직접 읽으므로 Storage v2 사본이 있어도 활성 의존성이다. 이 경로가 Storage v2 read로 전환되기 전에는 transcript와 같은 stem의 quality sidecar를 cleanup하지 않는다. 같은 bytes여도 실패 원위치나 historical filename provenance가 다른 자료도 중복으로 취급하지 않는다. Active v1 디렉터리는 새 입력·전사·Codex staging을 위해 그대로 유지하며, 검증 사본이 없는 transcript/correction/prompt/recovery/manual-review 자료는 보존한다.
 
 ## 상태 저장
 - `src/lecture_stt/shared/db.py`가 SQLite 스키마와 접근 로직을 담당한다.
 - `jobs` 테이블은 STT 메인 파이프라인 상태를 저장한다.
-- 주요 상태는 `PENDING`, `PROCESSING`, `DONE`, `ERROR`다.
+- 주요 상태는 `PENDING`, `PROCESSING`, `DONE`, `NEEDS_REVIEW`, `ERROR`다.
+- `NEEDS_REVIEW`는 전사 산출물은 유효하지만 자동 후속 처리 전에 사용자가 품질을 확인해야 하는 상태다. 시스템 실패인 `ERROR`와 구분한다.
 - 진행률, ETA, dedupe 정보, 에러 메시지, 처리 시간까지 함께 저장한다.
 - 시작 시 `recover_processing_jobs()`가 중단된 `PROCESSING` 작업을 복구한다.
+- 복구 시 transcript metadata에 품질 보고서가 있는데 scorecard sidecar만 없는 저장 직후 crash window라면 metadata-only scorecard를 결정적으로 재생성한 뒤 검증한다. Sidecar가 malformed이거나 재생성할 수 없으면 산출물을 삭제하지 않고 `NEEDS_REVIEW`로 격리한다.
 
 ## 제어 계층
 - 현재 주 제어 UI는 `src/lecture_stt/ui/web_panel.py`다.
@@ -71,49 +432,87 @@
 - 내장 HTTP 서버가 워커 시작, 일시정지, 재개, 중지, 로그 tail, DB 상태 조회를 제공한다.
 - 웹 제어 계층은 `config.yaml`의 `notification` 섹션도 수정할 수 있으며, 패널에서 텔레그램/디스코드/둘 다/끄기 선택을 저장한다.
 - React 빌드 산출물이 있으면 내장 HTTP 서버가 `/`에서 메인 웹 패널과 정적 자산을 서빙한다.
-- React 소스는 `frontend/web-panel/`에 있으며, Vite + React + TypeScript 기반으로 유지한다.
+- React 소스는 `frontend/web-panel/`에 있으며, Vite + React + TypeScript 기반으로 유지한다. 현재 client는 typed decoder, TanStack Query, Vitest와 Python static serving 경계가 이미 분리되어 있어 언어/프레임워크 재작성으로 확인된 리소스 이득이 없다. Controller/worker 경계와 idle I/O를 먼저 개선한다.
 - 프론트 데이터 계층은 `src/lib/panelApi.ts`, `src/lib/panelEvents.ts`, `src/lib/decodePanelState.ts`, `src/lib/logParser.ts`, `src/hooks/usePanelState.ts`, `src/hooks/usePanelLogs.ts`로 나뉜다.
 - 패널 UI는 `src/components/panel/`과 `src/components/ui/`의 로컬 재사용 컴포넌트로 나누고, `App.tsx`는 화면 조합만 담당한다.
+- 웹 패널의 시각 시스템은 루트 `DESIGN.md`와 `frontend/web-panel/tokens.css`를 정본으로 사용한다. 모든 화면은 같은 Pretendard/telemetry-mono 역할, cool cobalt light/dark palette, 4px spacing scale, focus/motion token을 공유하며 화면별 CSS에서 별도 palette나 font를 만들지 않는다.
+- 운영 shell은 장식적 번호 index가 아니라 hash route와 실제 대기 건수를 표시하는 command rail, 현재 화면·런타임·갱신·연결 상태를 묶은 상단 runtime strip, 화면별 workbench로 구성한다. 이 구조는 기존 API/DTO, TanStack Query, SSE/polling, guarded mutation 계약과 독립인 표시 계층이다.
 - panel state 조회와 action 이후 refetch/invalidation은 TanStack Query가 담당한다.
 - 상단 알림 토글은 `.env` secret 존재 여부를 기준으로 선택 가능한 알림 채널만 순환 표시하고, 선택 시 `/api/notification`으로 `config.yaml`을 갱신한다.
 - 실행 중 워커가 있으면 알림 채널 저장 요청이 같은 API 호출 안에서 워커 재시작까지 이어져 즉시 반영된다.
 - 실시간 갱신은 `GET /api/events` SSE를 우선 사용하며, 서버는 `state`, `log_chunk`, `log_reset` 이벤트를 스트리밍한다.
 - 클라이언트는 SSE가 연결되어 있는 동안 polling을 멈추고, 스트림이 실패하거나 브라우저가 `EventSource`를 지원하지 않으면 기존 `/api/state`, `/api/logs` polling으로 fallback 한다.
+- `/api/events`의 bare 요청은 기존처럼 state+logs를 함께 제공한다. 화면별 절전 경계에서는 `?streams=state`를 사용하며, 이 연결은 서버에서 `_log_stream_delta()`를 호출하지 않는다. `streams`는 `state`, `logs` 또는 둘의 쉼표 조합만 허용하고 빈 값·중복·알 수 없는 값은 400으로 거부한다.
+- React 패널은 hash 기반 `홈`, `처리 현황`, `녹음 보관함`, `검토 큐`, `시간표`, `설정` 화면 경계를 가진다. `처리 현황`에서만 Activity 로그 훅과 combined SSE를 활성화하고, 다른 화면은 state-only SSE를 사용한다. 처리 화면으로 전환할 때는 화면 상태에서 combined endpoint를 동기적으로 계산한 뒤 state/log 훅이 같은 singleton에 합류해 state-only와 combined `EventSource`가 중복 생성되지 않게 한다. Storage v2 패널은 해당 화면에서만 mount하며 analytics, recording library, archive review, timetable, title review와 unified feed query를 SSE snapshot에 합치지 않는다.
+- command rail은 60rem 이상에서 workbench 왼쪽에 sticky하게 유지하고 그 아래에서는 상단 grid로 풀린다. 40rem 미만에서는 설명을 접은 2열 route grid로 바뀌며, clickable label은 한 줄을 유지한다. 문서 root는 `overflow-x: clip`을 사용하고 긴 storage path와 표 overflow는 각 evidence surface 안에 가둔다.
+- 화면이 바뀌어도 패널 state query와 기존 worker action 계약은 유지한다. 녹음 보관함은 legacy 운영 job count·folder 경계가 아니라 별도 Storage v2 list/detail API를 on-demand로 읽는다. List의 additive `capabilities.transcript_preview`는 구 응답·기본 비활성에서 false로 닫히고 explicit opt-in일 때만 true가 되어 미리보기 affordance를 노출한다. 전사 본문은 목록·상세에 포함하지 않고, 완료된 current job의 latest raw transcript에만 `미리보기 열기`로 요청한다. 추정 데이터나 웹 업로드 UI는 만들지 않는다.
 - 최근 작업과 로그는 분리 카드 대신 하나의 Activity 패널로 묶어, 최근 작업 행 선택과 해당 작업 중심의 한국어 운영 로그 확인을 한 흐름으로 제공한다.
+- 현재 패널은 `NEEDS_REVIEW`를 `확인 필요`로 집계·표시하며 `ERROR`와 분리한다. 구형 schema v2 payload에 해당 count가 없으면 0으로 해석한다.
 - Activity 패널의 로그 영역은 raw log를 그대로 유지하되, `logParser.ts`가 반복 패턴을 파싱해 과목/날짜/요일/교시를 포함한 한국어 운영 로그 뷰와 오류 전용 뷰를 함께 제공한다.
 - pause/resume는 별도 IPC 대신 `state/paused` 플래그 파일로 제어한다.
 - Tk 기반 구형 GUI는 제거했고, 운영 제어면은 웹 패널로 단일화한다.
+- Archive evidence 검토 API는 평시 SSE snapshot에 포함하지 않고 `/api/storage-v2/archive-evidence/cases` 아래 on-demand endpoint로 분리한다. 목록/상세는 metadata-only이며 revision 본문, evidence source 상대경로, 원본 root를 반환하지 않는다.
+- 상태 변경은 `storage_v2.archive_review.status_writes_enabled`와 요청의 `allow_write`가 모두 참이어야 한다. Canonical 제안은 ledger 일치 revision이 유일할 때 우선하고, 그렇지 않으면 최신 capture의 current revision이 유일할 때만 제안하며 자동 확정하지 않는다.
+- Canonical promotion은 evidence 파일을 복사·이동하거나 새 recording을 자동 생성하지 않는다. 사용자가 고른 revision을 기존 Storage v2 recording에 감사 가능한 metadata로 연결하며, `promotions_enabled`, `allow_write`, `expected_count`, 정확한 plan SHA-256을 모두 요구한다. 기본 설정은 비활성화다.
+- 시간표 파일 입력은 웹 업로드가 아니라 `plan-timetable`/`apply-timetable` CLI만 사용한다. UTF-8 CSV/JSON의 학기·과목명·요일·시작/종료 시각·교시·강의실을 NFC 정규화하고, source path/원문은 DB/API에 남기지 않는다. Apply는 현재 file digest에서 다시 만든 count·plan SHA-256과 `allow_write`를 모두 요구한다.
+- 녹음 분류는 지정 학기의 timetable과 `recorded_at` 요일/시각을 보수적으로 대조한다. 유일 후보도 `recording_classification_proposals.status=suggested`와 open `review_items`만 만들며, 후보 없음·복수·녹음 시각 부재/오류도 같은 검토 큐로 보낸다. 이 단계에서는 transcript 본문을 추론 입력으로 사용하지 않는다.
+- `/api/storage-v2/timetable/entries`와 `/api/storage-v2/timetable/classifications`는 평시 SSE에 넣지 않는 on-demand metadata API다. 웹 업로드나 자동 분류 실행 endpoint는 없고, proposal 목록·상세·명시적 reject와 confirmation plan/apply만 제공한다. API, status write, confirmation은 각각 actual YAML boolean 설정으로 기본 비활성화한다.
+- React 패널의 `TimetablePanel`도 이 on-demand API를 별도 TanStack Query로 읽는다. 학기 필터가 없으면 active 학기들을 학기 열로 구분하고, review row는 `status=suggested`만 조회하며 confirmed/rejected는 집계에만 표시한다. 900px 이하에서 한 열로 전환하고 표 overflow는 카드 내부에 가둔다. UI는 proposal 상세에서 명시적 보류(rejected/dismissed)와 confirmation plan/apply를 노출하지만, reject는 별도 inline 확인 단계를 거치고 confirmation도 먼저 read-only plan을 본 뒤 exact `expected_count=1`과 plan SHA-256으로만 apply한다.
+- `rejected` 전이는 suggested proposal과 연결된 review를 `dismissed`로 함께 바꾸며 title/context/manifest에는 쓰지 않는다. Rejected 이력은 보존하되 같은 recording+semester의 새 active suggestion은 다시 만들 수 있다. 반대로 동일한 suggested/confirmed 제안은 분류 재실행에서 멱등하게 건너뛴다.
+- Confirmation은 suggested와 confirmed 상태를 명시적으로 분리하고 review를 resolved로 전환하는 audit-only 결정이다. `confirmations_enabled`, `allow_write`, `expected_count=1`, 정확한 plan SHA-256을 모두 요구하며 그 자체로는 `recording_titles.is_current`, `recording_contexts.is_selected`, `manifest.json`을 바꾸지 않는다.
+- Confirmed `unique_time_match`를 정본에 반영하는 별도 `plan-timetable-materialization`/`apply-timetable-materialization` CLI가 있다. 웹/API에서는 노출하지 않고 apply는 기본 비활성 `--enable-materialization`, `--allow-write`, `expected_count=1`, exact plan SHA-256을 모두 요구한다. 새 title/context row와 `prepared` journal을 먼저 commit하고 같은 디렉터리 임시 파일을 `fsync`한 뒤 manifest를 `os.replace`하며, 마지막 transaction에서 current/selected와 journal을 `applied`로 전환한다. 두 transaction 사이에서 중단되면 old/new manifest digest 중 정확히 하나만 인정해 같은 plan으로 forward recovery한다.
+- `/api/storage-v2/title-suggestions`는 평시 SSE에 넣지 않는 제목 proposal 목록·상세 metadata API다. `storage_v2.title_review.enabled`가 실제 YAML boolean `true`일 때만 DB를 열고 기본값은 `false`다. 목록은 suggested/confirmed/rejected 집계와 bounded proposal metadata만, 상세는 제안 당시 분류 상태와 현재 linked classification만 반환한다. Transcript 본문·발췌, artifact 경로·digest, recording/job/artifact numeric id는 반환하지 않으며 내부 오류는 경로를 숨긴 503으로 닫는다.
+- 제목 보류는 `status_writes_enabled`와 요청 `allow_write`가 모두 참일 때 proposal을 rejected, review를 dismissed로 전환한다. Confirmation plan은 exact transcript와 현재 inference metadata를 재검증한 `expected_count=1`/SHA-256을 반환하고 apply는 별도 `confirmations_enabled`와 `allow_write`까지 요구한다. Confirmation은 audit-only로 proposal/review만 confirmed/resolved로 바꾸며 current title, selected context, storage key와 manifest를 바꾸지 않는다. 웹에는 proposal 생성·canonical materialization·upload endpoint가 없다.
+- Confirmed content-title을 정본 제목에 반영하는 경로는 웹/API와 분리된 `plan-title-materialization`/`apply-title-materialization` CLI뿐이다. Apply는 기본 비활성 `--enable-materialization`, `--allow-write`, `expected_count=1`, exact plan SHA-256을 요구한다. 현재 title, transcript bytes·artifact, inference 입력, linked review, proposal, manifest를 prepare 직전과 finalize 직전에 다시 검증하고, 새 `system` title revision과 `prepared` journal을 먼저 commit한 뒤 같은 디렉터리 temp의 `fsync`·`os.replace`와 마지막 `applied` transaction으로 전진 복구한다. Storage key, selected context, 원본·artifact 경로는 바꾸지 않으며 timetable materialization 이력과의 혼합 chain은 현재 revision에서 fail-closed한다.
+- React `TitleSuggestionPanel`은 `#review/title/<canonical-positive-id>`에서 suggested 목록과 metadata-only 상세를 별도 TanStack Query로 읽는다. Mount 뒤 fresh 목록이 `available=true`를 증명하기 전에는 detail을 열지 않아 warm cache와 기본 비활성 deep link를 fail-closed한다. 첫 8건 밖의 exact deep link는 별도 detail로 유지하고, 보류는 2단계 확인, confirmation은 read-only plan을 먼저 표시한 뒤 capability가 켜진 경우에만 exact count/digest로 적용한다. 900px 이하에서는 선택 상세가 bounded 8건 목록보다 먼저 오는 실제 DOM 순서로 전환하고, 560px 이하 목록은 한 열로 표시한다.
+- 녹음 보관함 API는 `/api/storage-v2/library/recordings?limit=<0..200>&offset=<0..100000>` 목록과 `/api/storage-v2/library/recordings/<storage_key>` 상세로 분리한다. `storage_v2.library.enabled`가 실제 YAML boolean `true`일 때만 열리고 example config는 기본 `false`다. 목록은 비활성 payload를 반환하며 detail은 403으로 닫힌다. Query key·중복·빈 값·canonical decimal과 detail path segment를 엄격히 검사하고, valid-but-missing key는 404, 내부 장애는 경로를 숨긴 503으로 반환한다.
+- `src/lecture_stt/storage_v2/library.py`는 SQLite `mode=ro`와 Storage v2 schema 검증만 사용한다. 목록은 표시 이름/NFC 원본명, current title/selected context/current job, 상태·열린 review·artifact count를 반환한다. 상세는 최대 job 50개, artifact 500개, review 100개를 반환하며 실제 전체 count와 truncation을 함께 표시한다. Artifact 상한은 current/newest job 순위를 먼저 적용해 오래된 revision이 현재 job lane을 밀어내지 못하게 한다. Archived job/artifact는 revision lane과 correlation에서 제외하고, archived 연결을 가진 review 자체는 감사 이력으로 남기되 job/artifact 참조를 `null`로 닫는다.
+- API는 numeric DB id, source/artifact 상대·절대경로, digest, transcript/correction/summary/scorecard 본문, review detail JSON, job config/error를 반환하지 않는다. React decoder도 NFC, 표시 이름, enum, JS-safe count, kind→stage, latest/current 유일성, 고정 detail 상한을 재검증한다. Detail query는 화면 mount 뒤 fresh list 응답이 `available=true`를 다시 증명한 경우에만 열리므로 warm cache나 기본 비활성 deep link가 metadata를 먼저 노출하거나 추가 403 요청을 만들지 않는다.
+- React `RecordingLibraryPanel`은 hash `#library/<storage_key>`를 사용해 첫 페이지 목록과 선택 detail을 독립적으로 유지한다. 내부 `storage_key`와 사용자 표시 이름을 분리하고, 원본·전사·교정·요약·지원 artifact를 job별 revision lane으로 보여 주되 복잡한 폴더 구조는 노출하지 않는다. Hash는 한 개의 canonical ASCII key segment만 허용하며 malformed percent encoding과 extra segment는 detail을 열지 않는다.
+- `/api/storage-v2/review-feed?limit=<0..200>&offset=<0..100000>`는 `storage-v2/unified-review-feed@2` 계약으로 archive case, suggested timetable proposal, suggested content-title proposal, recording-level open review 네 source를 서버에서 정본화하는 on-demand metadata-only API다. Source별 실제 YAML boolean gate를 그대로 따르고, Storage v2 DB를 `mode=ro`로 연 단일 read transaction에서 exact source total과 stable page를 계산한다. 알 수 없는·중복·빈 query와 비정규 decimal은 400, schema/query 내부 장애는 경로를 숨긴 503으로 fail-closed한다.
+- 서버는 timetable/title proposal과 recording summary가 같은 `review_item_id`를 가리키는 경우 두 full-table link set의 합집합을 `DISTINCT`로 만든 뒤 recording rollup에서 먼저 차감한다. 따라서 현재 page 밖 proposal도 recording review로 중복 계산하지 않으며, 한 recording의 서로 다른 미연결 review도 각각 집계한다. Python 응답 메모리는 page 크기로 제한하고 source ledger의 `visible_count`, exact `total_count`, `truncated`를 함께 반환한다. ID, hash route, timestamp, JS-safe count와 표시 문자열은 응답 전에 검증·NFC 정규화하며 본문·경로·digest·numeric DB ID는 내보내지 않는다.
+- React `UnifiedReviewPanel`은 검토 화면이 mount된 동안 이 endpoint 한 개만 page당 최대 100건 조회한다. Retry·window focus·reconnect polling을 하지 않고, 서버가 정렬한 순서를 그대로 표시하며 이전/다음 pagination과 source ledger를 제공한다. Warm cache는 mount 뒤 fresh 성공 또는 실패가 확인되기 전까지 숨긴다. 선택 대상이 있으면 실제 DOM을 source ledger → 선택 workbench → unified queue 순서로 두고 세 영역을 전폭 한 열로 표시하며, 선택 대상이 없을 때만 desktop ledger/queue 두 열을 유지한다.
+- 통합 큐의 stable id와 native route는 `archive:<case_key>`→`#review/archive/<case_key>`, `timetable:<proposal_id>`→`#review/timetable/<canonical-positive-id>`, `title:<proposal_id>`→`#review/title/<canonical-positive-id>`, `recording:<storage_key>`→`#review/recording/<storage_key>`다. Malformed percent encoding, encoded slash, extra segment, unknown source와 비정규·JS-safe 범위 밖 proposal decimal은 검토 기본 화면으로 fail-closed한다. Exact route는 목록 첫 페이지 밖 대상도 기존 source panel의 별도 detail query로 열며 browser back/forward에서 선택을 복원한다.
+- 상태 변경·reject·confirmation·canonical promotion은 unified feed에 새 mutation을 만들지 않고 기존 source workbench를 사용한다. 기본 비활성 설정과 plan/count/digest/allow-write guard도 그대로 유지한다.
+- 전사 관제 지표는 `/api/storage-v2/analytics/transcriptions?period=day|week|month`의 독립 read-only endpoint로 제공한다. `/api/state`나 SSE payload에는 넣지 않고 홈 화면에서 선택한 기간 하나만 on-demand로 요청하므로, 다른 화면과 평시 대기 중에는 Storage v2 DB/root 집계를 만들지 않는다.
+- 같은 집계를 `/api/storage-v2/analytics/transcriptions/metrics?period=day|week|month`에서 Prometheus text exposition으로 제공한다. 상태·품질 구간·확정 분류·양·coverage·freshness를 gauge family로 노출하고 HELP/TYPE은 family당 한 번만 출력한다. 별도 background exporter나 polling을 만들지 않으며 analytics gate가 꺼져 있으면 기존 read-only 비활성 경계를 그대로 따른다.
+- `storage_v2.analytics.enabled`는 실제 YAML boolean `true`일 때만 열리고 example config 기본값은 `false`다. 활성화할 때도 운영 legacy DB가 아니라 별도 `storage_v2.db_path`와 명시적 `storage_v2.records_root`만 사용한다. 이번 변경은 설정 예시와 코드 경계만 추가했으며 운영 DB/root에는 연결하거나 migration/cutover하지 않았다.
+- 집계 대상은 archive되지 않은 recording의 current transcription job이며, event 시각은 유효한 `recorded_at` → `received_at` → `queued_at` 순으로 선택한다. 같은 parser를 SQLite deterministic UDF와 최종 row 변환에 사용해 기간 필터를 `row_limit + 1`보다 먼저 적용한다. 미래·극단 offset·invalid timestamp가 상한을 선점하지 않으며 `Asia/Seoul` 기준 오늘 24개 시간 bucket, 최근 7일/30일의 일 bucket을 만든다.
+- 품질 점수는 latest non-archived `quality_scorecard` artifact만 읽는다. Storage key와 상대경로를 검증하고 records root dirfd 아래 각 path component를 `O_NOFOLLOW`로 열어 regular single-link 파일인지 확인한 뒤 최대 256KiB(호출 상한 1MiB)를 stable metadata 상태에서 읽는다. 실제 bytes/SHA-256을 DB artifact metadata와 대조하고 exact integer schema version을 포함한 scorecard 계약을 검증하며, 깊은 JSON·변조·malformed·비현실적으로 큰 duration은 해당 row의 `quality_invalid`로 격리한다. Optional audio/processing duration은 부분합과 함께 각각의 known/jobs 표본 수를 노출한다. Scorecard의 transcript/correction/summary 본문, summary 문구, artifact 경로, digest, error message와 engine parameter는 API에 반환하지 않는다.
+- Analytics DB 연결은 SQLite `mode=ro`로 table/schema write를 금지하면서 WAL-visible current row를 읽는다. Main DB와 WAL의 bytes·size·mtime·ctime은 읽기 전후 불변이어야 한다. SQLite가 read lock을 조정하며 `-shm` bytes/mtime/ctime을 바꿀 수 있으므로 이 sidecar는 identity·mode·link count·size 불변만 보장하며, filesystem byte-for-byte immutable snapshot 계약으로 표현하지 않는다.
+- 점수가 없는 artifact와 malformed/unsafe scorecard는 각각 `quality_missing`, `quality_invalid`로 분리하고 평균 점수 분모에서 숨기지 않는다. 분류는 `recording_contexts.is_selected=1`만 확정 분류로 계산하며, suggested classification은 합치지 않고 `미분류` bucket과 coverage로 남긴다.
+- React 홈은 Grafana식 기간·분포·추이 요약과 Falcon식 attention triage를 결합한 관제 화면으로 구성한다. 전사량·완료율·검토/오류·평균 품질 KPI, 처리량 추이, 품질 histogram, 상태/확정 분류 분포, 데이터 coverage/freshness, 최근 확인 항목을 표시한다. Attention 행은 같은 `storage_key`의 recording library detail로 명시적으로 연결하고, detail이 목록 첫 페이지 밖에 있어도 별도 read-only query로 유지한다. 새 chart/runtime 의존성이나 웹 업로드 UI는 추가하지 않고 기존 React+TypeScript, TanStack Query, semantic table/CSS bar 경계를 유지한다.
 
-## Downstream 배포 파이프라인
-- API-backed 자동 correction provider는 현재 비활성화되어 있으며, `src/lecture_stt/correction/worker.py`는 `02_transcripts`의 pending pair를 manual correction 대기 상태로만 보고한다.
-- `CorrectionConfig`에는 API key/model/max token 필드가 없고, `correction.mode: manual`을 기본 운영 모드로 둔다.
-- `src/lecture_stt/correction/corrector.py`는 외부 API 호출 구현을 갖지 않는 compatibility/helper 모듈이며, 자동 correction 시도는 명시적으로 실패한다.
-- 진입점은 `src/lecture_stt/downstream/worker.py`다.
-- correction 입력은 `03_correction` 폴더의 `{stem}.txt + {stem}.json` pair다.
-- summary 입력은 `04_summarize` 폴더의 `{stem}.md`다.
-- `src/lecture_stt/downstream/lib.py`가 stem 해석, 과목 라우팅, 무손실 복사, conflict 처리, cleanup, deliveries 상태 갱신을 담당한다.
-- correction은 GH archive의 `06_lecture_notes/02_origin`으로 배포된다.
-- summary는 GH archive의 `01_summarize`와 Obsidian 노트 경로 둘 다로 배포된다.
-- summary는 correction 전달 완료가 확인된 경우에만 배포된다.
-- 동일 내용은 hash 비교로 idempotent하게 처리하고, 다른 내용이 있으면 overwrite하지 않고 conflict로 남긴다.
-- 반복되는 invalid/incomplete/blocked/conflict/error 이벤트는 같은 worker 프로세스 안에서 bounded suppression cache의 동일 key 기준 1회만 stdout/JSONL에 남겨 로그 폭주를 줄인다.
-- scan 통계 로그는 최초, 통계 변화, 설정된 heartbeat 주기 때만 JSONL에 남기고 routine stdout은 기본적으로 끈다.
-- `downstream.log_jsonl_max_bytes`를 0보다 크게 설정하면 `state/logs/downstream.jsonl`에 size guard/rotation을 적용한다. `downstream.log_suppression_max_keys`는 장기 실행 중 suppression cache 상한을 정한다. `downstream.log_routine_scan_events: false`이면 routine `scan_started`는 stdout/JSONL 모두 생략하고, routine `scan_completed`는 최초/변경/heartbeat만 JSONL에 남긴다. 기존 `downstream.out.log` truncate/delete나 launchd 재시작은 운영 승인 후 별도 절차로 처리한다.
+## 학기 manifest와 전사 자동 후처리
+- 현재 generator는 저장된 ChatGPT 로그인 세션의 `codex exec`만 사용하며 별도 LLM API 키나 직접 HTTP API 경로가 없다. 다만 교정·요약 입력인 전사 내용은 Codex 서비스로 전송된다.
+- STT가 생성한 `02_transcripts/<semester>/<course_dir>/{stem}.txt`, `{stem}.json`, `{stem}.quality.json` 중 job 상태가 `DONE`인 TXT/JSON pair만 후보가 된다. 기존 root 직속 경로도 DB에 pin된 절대경로로 계속 읽는다. `NEEDS_REVIEW`와 `ERROR`는 자동 후처리하지 않는다.
+- `config/semesters/<semester>.yaml`은 semester, vault/current-semester root, Storage v2 timetable DB, 교정·요약 목적 subdirectory, 과목 코드·이름·폴더·파일명 alias를 선언한다. `state/active-semester.json`은 plan/apply로 검증·활성화한 `@2` machine-local snapshot이다.
+- activation plan은 vault의 `.obsidian`, vault→semester root containment, 모든 경로 component의 symlink 부재, 각 course의 `06_lecture_notes/02_origin`과 `06_lecture_notes/01_summarize` 선존재, course dir 중복 부재, 선택된 Storage v2 timetable의 학기·과목 집합 일치를 확인한다. Course code·course name·alias는 정규화된 전역 routing token namespace 하나에서 충돌을 검사하므로 서로 다른 종류의 token이 겹쳐도 활성화를 거부한다. 폴더는 자동 생성하지 않는다.
+- apply는 동일 candidate를 다시 plan하고 exact course count와 plan SHA-256, `--allow-write`를 요구한다. jobs DB에서 `BEGIN IMMEDIATE`로 controller/downstream write와 직렬화한 뒤 STT `PENDING`/`PROCESSING`, postprocess `PENDING`, 현재 cutoff 이후 `DONE`이지만 아직 queue row가 없는 작업이 모두 0일 때만 active snapshot을 같은 directory temporary file과 `fsync`/`os.replace`로 원자 교체한다. STT 입장도 source를 staging으로 옮긴 뒤 같은 `BEGIN IMMEDIATE` fence 안에서 active snapshot과 목적 경로를 다시 읽고 `PENDING`을 등록하므로, 학기 전환과 신규 작업 등록 사이에 구 학기 경로가 끼어들 수 없다. DONE commit과 enqueue 사이의 좁은 구간은 unqueued DONE 검사로 닫고, queue가 없고 완료 시각도 해석 불가능한 DONE은 `invalid_unqueued_done_jobs`로 분리해 전환을 차단한다.
+- 이전 학기 backlog cutoff는 별도 config에 중복하지 않고 active snapshot의 timezone-aware `activated_at`을 단일 기준으로 사용한다. STT raw route, 실시간 enqueue와 reconciliation이 같은 snapshot을 다시 읽으므로 학기 전환 뒤 수동 cutoff 동기화가 필요 없다. Queue에 들어간 작업은 당시 cutoff와 snapshot hash를 계속 pin한다.
+- STT와 downstream은 `course_storage.resolve_course_route()` 하나를 공유한다. route는 `YYMMDDAlias[_N]` 형태의 explicit alias를 우선하고, alias가 없을 때는 profile key가 `lecture`인 녹음만 recorded timestamp와 시간표의 유일 후보를 ±manifest margin 안에서 비교한다. 일반/회의/메모 profile은 시간표와 겹쳐도 추측하지 않는다. 원본 이름과 시간표는 분류 신호로만 사용하고, 최종 transcript·교정·요약 stem은 충돌 회피가 끝난 canonical base를 유지한다. route가 확정되지 않으면 과목 폴더를 만들지 않고 raw를 평면 경로에 보존하며, 강의는 `UNROUTED`, 비강의는 `SKIPPED`로 기록한다.
+- STT 완료 hook은 운영 `jobs.status=DONE`을 보존한 뒤 같은 DB의 `transcript_postprocess_jobs`에 source hash, active snapshot hash, cutoff, semester/course/root, staging·final 경로와 generator provenance를 고정한다. 학기 전환과 설정 변경이 이미 큐잉된 작업의 목적지나 generator를 바꾸지 못한다.
+- `src/lecture_stt/downstream/postprocess.py`는 한 강의당 교정 호출 1회와 검증된 교정본 기반 요약 호출 1회를 수행한다. Codex는 격리 temporary directory에서 `--ephemeral --sandbox read-only --ignore-user-config --ignore-rules --output-schema`로 실행되고 shell/unified-exec/apps/plugins/browser/computer/multi-agent feature를 끈다. Allowlist 환경에는 API key를 전달하지 않는다. Codex는 구조화 결과만 반환하며 실제 파일 생성·이동은 Python 부모가 담당한다.
+- 교정 결과는 source segment의 정수 ID·개수·순서를 유지해야 한다. Python이 segment text만 교체해 source JSON의 timing/language/metadata를 보존하고 TXT를 재구성한다. 요약은 고정 JSON 계약을 검증한 뒤 7개 heading의 Markdown으로 렌더링한다. transcript 본문이나 생성 본문은 DB, JSONL, error message에 기록하지 않는다.
+- 단계는 과목별 `02_transcripts/<semester>/<course_dir>` 정본 보존 → `03_correction/<semester>/<course_dir>/{stem}.txt/.json` → `04_summarize/<semester>/<course_dir>/{stem}.md` → 같은 과목의 `02_origin` 교정 pair와 `01_summarize` 요약이다. 기존 평면 source와 이미 pin된 평면 staging row는 그대로 호환한다. 생성 hash intent를 DB에 먼저 commit하고 correction JSON을 먼저 쓰므로 stage file 생성 뒤 `READY` 전 crash도 pinned bytes를 재검증해 이어간다. Transcript·staging·final 산출물은 최초 생성부터 `0600`으로 제한한다. Course-scoped parent는 설정 root 아래에서만 필요 시 생성하며 traversal, symlink, 비-directory component를 거부한다. 같은 hash는 멱등 성공, 다른 bytes는 `CONFLICT`이며 overwrite하지 않는다.
+- Worker는 launchd 별도 프로세스로 큐를 polling한다. 실행·파일시스템 오류는 기본 3회까지 해당 단계에서 재시도하고, 구조 계약 위반은 `NEEDS_REVIEW`, 반복 실행 오류는 `ERROR`로 닫는다. Queue가 없는 DONE의 완료 시각이 손상됐으면 `INVALID_COMPLETION_TIMESTAMP` reconciliation error로 행 단위 격리한다. Reconciliation batch limit은 스캔한 행 수가 아니라 실제 enqueue 성공 수에 적용하므로 앞선 불량 행이 뒤의 정상 작업을 기아 상태로 만들지 않는다. Destination 장애가 STT 성공을 되돌리지는 않는다. Dry-run은 SQLite `mode=ro/query_only`에서 route만 계산하고 lock, table/row, JSONL, staging/final 파일을 만들지 않는다.
 
-## Downstream 상태 저장
-- downstream 상태는 `deliveries` 테이블에 기록된다.
-- correction/summary 각각의 상태, 대상 경로, hash, last error, 완료 플래그를 저장한다.
-- `src/lecture_stt/downstream/status.py`가 요약 조회, 목록 조회, 상세 조회, row 삭제 CLI를 제공한다.
+## 전달 상태 저장
+- 새 runtime 원장은 `transcript_postprocess_jobs`다. `source_job_id`를 유일 key로 사용하고 전체 상태와 correction/summary/delivery 단계 상태, 단계별 attempt, source/staging/final hash, bounded error code, generator provenance와 completion timestamp를 기록한다. 전체 상태는 `PENDING`, `DELIVERED`, `SKIPPED`, `UNROUTED`, `CONFLICT`, `NEEDS_REVIEW`, `ERROR`다.
+- 기존 DB에 transcript 원장 테이블이 일부만 존재하면 nullable 또는 default가 있는 컬럼만 additive migration한다. `source_job_id`는 단일 primary key 또는 non-partial unique key인지까지 검증한다. 비어 있는 비호환 partial table은 canonical schema로 다시 만들고, 행이 있는 상태에서 충돌 key 제약이 없거나 primary key·default 없는 `NOT NULL` 컬럼이 빠졌다면 데이터를 추측해 바꾸지 않고 명시적인 compatibility error로 중단한다.
+- 과거 `transcript_deliveries` 직접 전달 원장과 `deliveries` correction/summary 원장은 감사·Storage v2 archive evidence를 위해 보존하지만 active worker는 읽거나 갱신하지 않는다.
+- status CLI는 `transcript_postprocess_jobs`를 기본 조회하며 `--only-problems`에는 `UNROUTED`, `CONFLICT`, `NEEDS_REVIEW`, `ERROR`가 포함된다. 기본 summary는 active semester/effective cutoff, STT active/problem, cutoff 이후 queue 미적재 DONE, postprocess pending/problem count를 함께 읽기 전용 집계하고 `HEALTHY`/`BUSY`/`ATTENTION`으로 표시한다.
 
 ## 운영 스크립트와 서비스
 - `scripts/run_worker.sh`: 메인 워커 상시 실행
 - `scripts/run_once.sh`: 메인 워커 1회 실행
 - `scripts/run_gui.sh`: 웹 제어판 실행
 - `scripts/run_distribute.sh`: downstream 워커 실행
-- `scripts/distribute_status.sh`: deliveries 상태 CLI 래퍼
+- `scripts/distribute_status.sh`: postprocess 상태 CLI 래퍼
 - `scripts/benchmark_models.py`: baseline/current model과 승인된 후보 STT 모델을 비교하는 benchmark CLI 초안
 - `scripts/setup_launchd.sh`: venv, 의존성, 모델, 폴더, launchd를 한 번에 설정
-- `scripts/cleanup.py`: 오래된 audio/transcript/tmp 정리
+- `scripts/cleanup.py`: 오래된 audio/transcript/tmp 정리. 중첩 transcript는 상대 parent+stem 단위로 묶어 서로 다른 과목의 동명 stem을 합치지 않는다.
+- `python -m lecture_stt.downstream.semester`: 학기 manifest plan/apply activation CLI
 - `launchd/com.geonha.lecture-stt.plist`: 메인 워커 상시 실행
 - `launchd/com.geonha.lecture-stt-webpanel.plist`: 웹 제어판 상시 실행
 - `launchd/com.geonha.lecture-stt-distribute.plist`: downstream 워커 상시 실행
@@ -121,15 +520,95 @@
 
 ## 경로/설정 규칙
 - 프로젝트 내부 리소스(`config/`, `state/`, `tmp/`, `frontend/web-panel/dist`)는 `repo_root()` 기준 상대경로로 해석한다.
-- 사용자 데이터 경로(iCloud inbox, correction/summary, GH archive, Obsidian vault)는 코드 기본값으로 두지 않고 로컬 `config/config.yaml`에서 지정한다.
+- iCloud 입력 경로는 로컬 `config/config.yaml`, Obsidian/GH archive의 활성 학기 경로는 검증된 active semester snapshot에서 지정한다.
 - `config/config.yaml`의 경로 값은 `~`와 `${VAR}` 환경변수 치환을 지원하고, 상대경로는 저장소 루트 기준으로 해석한다.
-- `.env`는 secret뿐 아니라 운영 환경별 경로 override에도 사용할 수 있지만, 실제 외부 저장소 위치의 정본은 `config/config.yaml`이다.
+- `.env`는 secret과 iCloud root override에 사용한다. 학기 archive 위치의 정본은 active semester snapshot 하나다.
 - launchd plist는 저장소에 절대경로를 고정하지 않고 `scripts/setup_launchd.sh`가 현재 repo 위치로 템플릿을 렌더링해 등록한다.
+- 현재 단계의 NFC 처리는 한국어 파일명·시간표 metadata·제안 제목 깨짐을 막는다. 내부 immutable storage key와 사용자 표시 이름은 분리되어 있다. 시간표+녹음 시각 기반 수업 분류와 검증된 transcript 내용 기반 제목은 서로 다른 proposal로만 제안되며 자동으로 정본이 되지 않는다. 두 confirmation 자체는 audit-only이고, confirmed proposal을 실제 정본에 반영하려면 각각의 기본 비활성 CLI materialization을 별도로 실행해야 한다.
+
+## 리팩터링 이행 경계
+- 2026-07-23 1차 단계는 기존 Python polling/launchd 운영을 유지한 채 filename 정규화, 버전 프로필, 품질 검토 상태와 현행 패널 호환성을 먼저 안정화한 것이다.
+- storage v2 foundation은 `migrations/v2/0001_recording_store.sql`과 `docs/STORAGE_V2.md`에 별도 추가했다. 운영 DB에는 적용하지 않았으며, 임시 SQLite에서만 idempotency·FK·path·immutable key 제약을 검증한다. Migration은 legacy `jobs`/`deliveries` 테이블을 감지하면 persistent DDL 전에 중단하고, 적용 후 migration 파일 checksum과 table/index/trigger 정규화 서명을 모두 검증한다.
+- v2 물리 정본은 `records/<storage_key>/` 한 곳에 녹음 1건의 `manifest.json`, 원본, job별 전사·교정·요약 revision을 묶는다. 한국어 제목·과목·날짜·교시는 경로가 아니라 title/context metadata다.
+- 과거 보관본에서 발견한 누락 transcript pair는
+  `plan/apply-historical-transcript-recovery` CLI로만 복구한다. 대상은
+  `needs_review`인 current legacy-import job 하나와, 두 transcript 파일이
+  모두 없었다는 open `legacy_import_review` 증거가 정확히 남아 있는 recording
+  하나다. 기존 job/title/context/review/status와 immutable `storage_key`는
+  바꾸지 않고 selected engine에 연결된 transcript artifact revision 1 두 개와
+  manifest artifact index/job ownership만 추가한다.
+- transcript recovery는 새 migration 없이 기존 `job_events`에 closed
+  metadata-only plan을 `prepared`/`applied` 두 event로 남긴다. DB artifact
+  prepare commit, journal-owned same-directory temporary file의 durable write,
+  no-overwrite atomic link publish와 temporary cleanup, atomic manifest replace,
+  applied finalize 순서로 진행한다. Publish 직후 cleanup 전 crash는 같은 inode
+  pair를 확인해 forward-recovery한다. Expected bytes가 완성되지 않은 temp는
+  ownership을 증명할 수 없으므로 삭제하지 않고 recovery-required conflict로
+  보존한다. 과거 importer snapshot을
+  다시 적용해 post-import recovery를 덮어쓰거나 자동 병합하지 않으며, exact
+  replay가 아니면 기존 importer의 strict mismatch로 중단한다.
+- `src/lecture_stt/storage_v2/`는 명시적으로 지정한 독립 legacy DB snapshot만 `immutable=1` read-only로 연다. regular file·single link·`quick_check`·본체 stat/hash·WAL/journal/SHM 안정성을 연결 전후와 조회 뒤에 확인한다. Snapshot identity는 plan digest에 포함하고 root lock 뒤와 commit 직전에도 재검증한다. 모든 legacy job을 먼저 조사해 source/artifact path·inode·delivery lineage를 전역 비교한 뒤에만 선택 필터를 적용한다.
+- 신규 v2 DB와 root는 legacy root 밖에 둔다. 기존 DB는 non-mutating schema/checksum preflight 뒤 target pathname↔SQLite opened inode 및 main/WAL/SHM/journal link safety를 확인하고 writable 설정한다. Exclusive root lock, DB↔records-root binding, closed root inventory를 확인한 뒤 no-overwrite staging copy·file/directory/root/DB-parent `fsync`·manifest 작성·DB 등록 순서로 promote한다. Commit 결과가 불명확해도 이미 promote한 record를 지우지 않고 다음 실행에서 manifest/hash/tree/DB provenance를 정확히 검증해 복구한다.
+- legacy delivery는 `deliveries.source_job_id`를 소유권 정본으로 사용한다. 같은 canonical base/path를 여러 job이 공유하면 명확한 owner에만 downstream artifact를 붙이고, 비소유 job에서는 제외한다. source-vs-transcript/correction/summary 역할 충돌이나 모호한 owner는 fail-closed다. `DELIVERED`의 SHA 불일치는 차단하지만 비성공 상태의 stale SHA는 실제 파일을 보존하고 review로 보낸다. 현재 source file이 모두 사라진 ownerless/unmatched delivery 125건은 임의 귀속하지 않고 목적지 아카이브 reconciliation 대상으로 남긴다.
+- `reconcile-archive`는 이 125건만 독립 snapshot에서 읽어 현재 configured archive route와 대조한다. DB에 남은 과거 iCloud GH/Obsidian 절대경로는 직접 열지 않고 relocation provenance로만 기록하며, 현재 route 아래의 single-link regular file을 `O_NOFOLLOW`로 열어 같은 FD에서 해시한다. 출력은 경로·해시·상태만 포함하고 파일 본문은 포함하지 않는다.
+- 2026-07-24 실데이터 대조에서는 125건 중 1건만 과거 delivery SHA와 현재 archive가 전부 일치했다. 교정 txt/json 123건, `DELIVERED` 요약 56건은 현재 파일과 저장 SHA가 달랐고, `MISSING` 요약 22건 중 9건은 현재 route에 파일이 존재했다. 따라서 124건은 자동 cut-over를 차단하고, 현재본과 남은 과거 revision을 함께 보존하는 후속 revision migration 대상으로 둔다.
+- `archive_evidence_cases`는 recording FK 없이 ownerless delivery를 open review queue에 보존한다. 각 실행 관측은 immutable capture, 서로 다른 실제 바이트는 content-addressed revision, 현재 GH/Obsidian/과거 root의 발견 위치는 observation으로 분리한다. `blocked` classification은 revision copy를 막지 않고 canonical 승격만 막는다.
+- `archive_evidence_canonical_selections`는 명시적으로 확정한 case별 artifact-kind revision과 promotion plan SHA-256을 immutable audit row로 남긴다. 승격은 기존 recording FK 연결과 case resolved 전이를 하나의 `BEGIN IMMEDIATE` transaction에서 수행하며 evidence/records filesystem에는 쓰지 않는다.
+- `plan-archive-evidence`는 current route와 `--historical-root LABEL=PATH`로 명시적으로 허용한 과거 root만 연다. 모든 source는 root-bound single-link regular file인지 같은 FD에서 다시 해시하고, apply 직전에도 inode/크기/mtime/ctime/hash와 legacy DB snapshot이 plan과 같은지 확인한다. 허용하지 않은 recorded 절대경로는 metadata로만 남고 I/O 대상이 아니다.
+- `apply-archive-evidence`는 운영 archive와 겹치지 않는 별도 root에 `cases/<case_key>/revisions/<kind>/<sha256>.<ext>`와 immutable capture manifest를 no-overwrite로 적재한다. exclusive root lock, closed tree inventory, `BEGIN IMMEDIATE`, count/plan SHA/write guard, pre/post full verifier를 거치며 파일이 먼저 promote되고 DB commit이 불명확한 경우 exact manifest/hash로만 recovery한다.
+- archive evidence verifier는 DB quick/FK/canonical schema, case-capture-revision-observation 소속, canonical path, metadata-only manifest, 모든 revision hash와 closed root tree를 교차 확인한다. Capture snapshot은 고정 key와 status/classification/flag/token domain, canonical SHA-256, 절대 artifact path·확장자 계약만 허용하고, observation metadata는 single-link regular source의 고정 stat 7개만 허용한다. 자유 형식 issue message/expected/actual과 transcript/correction/summary 본문은 저장하지 않으며 DB와 manifest를 함께 변조한 경우에도 verifier가 거부한다. Dashboard용 snapshot은 case/review/capture/revision 집계만 내보내고 source 절대 root나 본문은 내보내지 않는다.
+- Storage v2 write 경로는 운영과 분리된 `/private/tmp` canary에서 legacy job 290 한 건만 검증했다. 신규 recording 1건과 artifact 5개를 import한 뒤 전체 verifier가 issue 0을 반환했고, 같은 plan 재적용은 새 파일 없이 `skipped`로 끝났다. 운영 v2 DB, launchd, worker, iCloud v1 보관소는 바꾸지 않았다.
+- archive evidence write 경로도 `/private/tmp/lecture-stt-archive-evidence-canary-final3-20260724.DbCe3d`에서 `260430DStr_2` 한 건만 검증했다. 현재 correction 2개, 현재 summary 1개, 과거 Obsidian의 서로 다른 summary 1개를 revision 4개와 observation 5개로 보존했고 verifier issue 0, DB-only snapshot open case 1, 재적용 `skipped`를 확인했다. Batch plan SHA-256은 `4f5db6f29dac82009817b3ce17a5d474caf924e5913ec8fab34cd045ae3cead0`이며 이 canary는 운영 v2 DB나 기존 archive를 수정하지 않았다.
+- `schedule_imports`/`schedule_entries`는 학기별 source/normalized-entry digest와 정규화된 수업 시간을 보존하고, `schedule_semester_selections`가 과거 import를 삭제하지 않은 채 학기별 active import 하나를 가리킨다. 분류와 API 목록은 active import만 사용한다. `recording_classification_proposals`는 timetable entry와 recording/review 소속을 composite FK로 묶고 suggested/confirmed/rejected 상태, 제안 제목, 학기/과목/교시/강의실 metadata, confirmation plan SHA-256을 분리 저장한다. Partial unique index는 recording+semester당 suggested/confirmed active decision 하나만 허용하고 rejected 이력 뒤 재제안을 허용한다. Verifier는 import row count/entry digest/semester/active-selection plan digest, proposal↔schedule denormalized metadata, proposal↔review lifecycle과 닫힌 detail JSON을 교차 확인한다.
+- `recording_title_proposals`는 학기 필수인 timetable classification과 분리된 범용 제목 감사 원장이다. Current job의 exact `transcript_raw_text` artifact, 선택적으로 내용에서 과목명/경계가 일치하는 과목 코드가 확인된 classification proposal, 전용 review item을 composite FK로 연결하고 recording당 active suggested/confirmed 제목 하나만 허용한다. `title_suggestions.py`는 records root lock 아래 모든 path component를 `O_NOFOLLOW`로 열어 regular single-link, bounded stable stat, DB bytes/SHA-256, strict UTF-8을 확인한다. 외부 모델 없이 exact course signal 또는 2~3개 bounded keyword만 사용하며 manual/schedule current title은 건너뛴다.
+- 제목 plan 응답과 snapshot에는 제안 제목·NFC storage key·revision·상태·confidence만 남고 transcript 원문/발췌, artifact path, content digest, artifact/job/recording numeric id는 나오지 않는다. Apply plan digest에는 반환하지 않는 artifact identity/path/hash/bytes뿐 아니라 recorded timestamp, current title, selected context, active classification metadata를 포함해 결과 제목이 우연히 같아도 inference 입력 변경을 stale plan으로 거부한다. Apply는 독립 enable, allow-write, expected count, exact digest를 요구하고 read-only preflight 뒤 `BEGIN IMMEDIATE` 안에서 plan을 다시 만들며 commit 직전 파일/DB를 한 번 더 읽는다. Confirmation도 records root를 필수로 받고 현재 metadata와 transcript로 원래 제목 제안을 다시 계산해 proposal과 대조한다. 이 재계산 digest와 linked review/artifact/classification evidence는 lifecycle 전이 뒤에도 재구성 가능하게 구성해 read-only/exclusive/pre-commit 및 confirmed 멱등 replay에서 모두 검증한다. 생성·confirm·reject는 proposal/review만 바꾸고 canonical title/context/manifest는 바꾸지 않는다.
+- `recording_classification_materializations`는 confirmation과 별개의 canonical-write journal이다. 이전/새 title·context row, confirmation/materialization plan digest, old/new manifest digest, 닫힌 metadata-only plan JSON과 `prepared`/`applied` 상태를 기록한다. Proposal touch trigger는 recursive trigger에서도 재귀하지 않으며 materialization은 plan의 target을 현재 proposal에서 다시 계산해 같은 시각의 stale mutation도 쓰기 전에 차단한다. 후속 materialization으로 대체된 applied journal의 재실행은 successor chain 전체와 최신 manifest를 검증한 뒤 `skipped`로 끝난다. Storage v2 read-only 연결도 main DB의 symlink·hardlink·비정규 파일과 unsafe sidecar를 거부하고 SQLite가 연 inode를 재확인한다.
+- `recording_title_materializations`는 confirmed content-title에 대한 별도 canonical-write journal이다. 이전 title row는 비-current 이력으로 그대로 두고 새 `system` title row만 current로 전환하며, closed private plan에는 confirmation digest, proposal/review identity와 resolved 시각, transcript artifact locator/hash/bytes/revision, old/new manifest digest를 보존한다. Replay는 이 증거와 현재 recorded time/context/classification으로 inference를 다시 계산한다. Public plan은 제목·storage key·count·digest만 내보낸다. `prepared`는 old/new manifest 중 하나만 허용하고 `applied`는 새 manifest와 새 current title만 허용한다. 일반 confirmed replay는 materialization 뒤 current-title drift로 거부되지만 journal 기반 materialized replay는 원래 current-title evidence를 재구성한 뒤 실제 target title/manifest를 별도로 검증해 `skipped`로 끝난다.
+- 현재 React web panel은 runtime SSE `PanelState` 계약과 Storage v2 on-demand query를 분리한다. 기존 `/api/state`·`/api/events` 흐름은 그대로 유지하고, analytics, recording library, archive evidence review, 시간표·분류와 content-title 검토는 각각의 별도 API를 직접 조회한다. Timetable/title review UI는 suggested proposal 상세, guarded reject, confirmation plan/apply를 연결하고 archive evidence UI도 bounded case/revision metadata와 guarded status/promotion 흐름을 연결한다. 검토 index만 server-canonical unified feed를 한 번 조회하며 exact deep link 뒤의 상세와 mutation은 기존 source workbench를 다시 사용한다. Transcript preview는 별도 query로만 읽고 녹음 선택 변경·닫기·unmount에서 요청과 캐시를 제거하며, Clipboard API가 제한되는 Tailscale HTTP 접속에서는 브라우저의 legacy copy fallback을 사용한다.
+- 실제 원본이 이미 정리된 과거 recording은 `source_state=missing`과 metadata marker로 파생 이력을 보존한다. Plan과 manifest는 transcript/content 계열 key를 어느 깊이에서도 허용하지 않는다. CLI apply는 write/count/plan SHA-256/missing-source 확인 플래그를 요구하며 현재 운영 데이터에는 실행하지 않았다.
+- `verify_library()`는 exclusive records-root lock과 단일 SQLite read transaction 안에서 canonical schema/checksum, `quick_check`, foreign key, manifest↔recording/title/context/all-active-jobs/selected-engine/artifact/review/import-map을 비교한다. Materialization journal의 closed plan/digest/proposal/revision chain/selection 상태와 latest manifest digest도 교차 검증하며 `prepared`는 복구가 필요한 비정상 완료 상태로 보고한다. Recording-level source와 ingest hash/size/MIME, job artifact ownership과 `jobs/<job_key>/` namespace도 직접 확인한다. 파일은 record-root dirfd 기준 `openat` + `O_NOFOLLOW`로 열어 같은 descriptor에서 inode/link/size/hash를 확인하며, root identity 교체와 DB에 없는 file/directory/symlink/special entry, orphan record, stale staging, 예상하지 않은 lock을 오류로 보고한다. 재귀 검사는 깊이·entry 상한을 둔다. `read_library_snapshot()`은 verifier/CLI용 요약 projection으로 유지하고, 웹 패널의 `library.py`는 metadata-only list/detail과 별도 gated transcript preview를 제공한다. Preview는 DB가 records root 안에 있으면 거부하고 shared root lock과 SQLite read snapshot을 함께 유지한 채 canonical `jobs/<job_key>/transcript.txt`와 `text/plain` MIME essence를 요구한다. 모든 path component를 `O_NOFOLLOW`로 열어 single-link regular file, stable stat, configured size 상한, DB bytes/SHA-256, strict UTF-8과 NUL 부재를 확인하며 historical recovery의 charset/provenance MIME parameter는 허용한다. 응답에는 artifact path/hash와 내부 numeric id를 포함하지 않는다.
+- manifest 기반 단일 작업 Python worker 계약과 작업을 소유하지 않는 Go
+  controller shadow를 추가했다. 격리 churn fixture는 create/append/reset/
+  delete-before-stable/temp ignore/rename/Unicode 흐름을 lockstep으로 재현하고,
+  안정 관측 직후 plan을 검증한다. 이 단일 fixture 통과는 ownership 승격
+  근거가 아니며 `controller/README.md`의 target Darwin 20회 연속·100 stable
+  observation·mismatch 0·safe-plan rejection 0, unsafe-source 100% 거부,
+  liveness timeout/child cleanup과 별도 retry/fencing/rollback/kill-switch
+  계약을 모두 만족해야 한다. Opt-in target-Darwin gate와 command-level
+  SIGTERM descendant cleanup test, guarded exact Python retry 계약은 이
+  기준을 반복 검증한다. Target-Darwin gate는 20개의 `@4` report를 JSONL
+  ledger로 모아 readiness verifier까지 통과시키며 macOS CI도 같은 Python
+  contract, Go race/vet, 20x100 gate를 실행한다. 2026-07-27 로컬
+  target-Darwin 격리 검증은 20회 연속·100건 verified와 mismatch/rejection
+  0건을 통과했고, 같은 실제 Go binary를 evidence wrapper로 20회 실행한
+  immutable journal도 success 20·verified 100·`ready=true`로 닫혔다. 이
+  결과만으로 운영 ownership 승격이나 cutover를 승인한 것은 아니다. Static topology candidate,
+  install-free preflight, evidence-aware temporary review bundle, offline
+  install/uninstall/rollback ledger에 더해 별도 명시적 운영 controller
+  구현·검증·전환을 수행했다. Read-only shadow와 과거 evidence artifact는
+  계속 실행 권한을 갖지 않는다.
+- iCloud 이벤트는 controller가 소유하는 bounded polling + Python canonical
+  안정화 창 + 기존 로컬 staging 흐름이 정본이다. 향후 파일 이벤트는 즉시
+  깨우는 힌트로만 사용하고 주기적 reconcile을 유지한다.
+- 웹 패널 백엔드는 localhost bind를 기본으로 한다. GET/POST는 로컬 Host(`127.0.0.1`·`localhost`와 서버 포트) 또는 `.env`의 쉼표 구분 `WEB_PANEL_ALLOWED_HOSTS`에 명시한 Host만 받는다. Tailscale Serve가 외부 Host를 보존한다면 재개 전에 해당 도메인을 허용 목록에 추가해야 한다. POST는 `Origin`과 `Sec-Fetch-Site`도 검사한다. 애플리케이션 자체의 사용자별 인증은 없으므로 허용된 tailnet 접속자는 preview opt-in이 켜진 동안 전사 본문을 읽을 수 있다. 공개 인터넷 노출 전에는 identity 검증과 mutating API audit가 필요하다.
 
 ## 테스트 범위
-- 현재 자동 테스트는 STT pipeline, downstream, web panel state/backend, script entrypoints, cleanup/log retention을 함께 검증한다.
-- `tests/test_stt_main.py`: pause/resume/status control command, STT retry/failure, dedupe/replay, quality scorecard sidecar 회귀 테스트
+- 현재 자동 테스트는 STT pipeline, 학기 activation/direct transcript delivery, legacy archive compatibility, web panel state/backend, script entrypoints, cleanup/log retention을 함께 검증한다.
+- `tests/test_stt_main.py`, `tests/test_single_job_contract.py`, `tests/test_retry_job_contract.py`, `tests/test_retry_job_cli_canary.py`: pause/resume/status control command, STT retry/failure, dedupe/replay, quality scorecard sidecar, closed single-job/retry manifest, exact claim fence, stale evidence, kill switch, crash recovery와 명시적 결과 회귀 테스트
+- `tests/test_controller_topology.py`: real-repo/TemporaryDirectory static topology, candidate read-only args/schedule/log/placeholder, setup auto-install 분리, label/log collision, full-template digest와 symlink/hardlink/unstable/oversize/duplicate-plist fail-closed 검증
+- `tests/test_controller_bundle.py`: TemporaryDirectory-only exact plan/prepare guard, exclusive durable artifact, completed replay, partial/extra/tampered bundle recovery-required, source/config/template/kill-switch drift와 metadata-only CLI 회귀 테스트
+- `tests/test_controller_activation.py`: TemporaryDirectory offline install/uninstall/rollback exact plan/apply/replay, immutable version/action hash chain, busy lock, complete-orphan forward recovery와 partial/tampered evidence fail-closed 회귀 테스트
+- `tests/test_controller_readiness.py`: closed `@4` ledger, unique/ordered/non-overlap run identity, scan/plan link와 count, safe path, file identity/size/UTF-8/newline, metadata-only CLI summary의 fail-closed 회귀 테스트
+- `tests/test_shadow_probe.py`, `controller/internal/shadow/*_test.go`: 최소 read-only config/scan projection, closed lockstep protocol과 persistent Python watcher, Python/Go stability parity, scan-indexed immediate plan, 격리 filesystem churn, plan digest/source evidence와 symlink/hardlink/tamper fail-closed 검증
 - `tests/test_transcribe_worker.py`, `tests/test_transcribe_progress.py`, `tests/test_quality_gate.py`: transcribe worker/progress/quality scoring 회귀 테스트
+- `tests/test_profiles.py`, `tests/test_utils_and_postprocess.py`: legacy/profile 설정 계약, profile hash, 한글 NFC stem, 후처리 회귀 테스트
+- `tests/test_storage_v2_schema.py`: 별도 임시 DB에 storage v2 migration을 적용해 immutable storage/job key, 상대경로, JSON, 상태, partial unique, job/artifact/review composite FK, legacy DB 오적용, migration checksum 및 canonical schema drift 차단을 검증한다.
+- `tests/test_storage_v2_importer.py`, `tests/test_storage_v2_cli.py`, `tests/test_storage_v2_verifier.py`, `tests/test_storage_v2_reconciliation.py`, `tests/test_storage_v2_archive_evidence.py`: strict snapshot read, preserve-first copy/recovery, delivery 소유권, archive relocation/hash reconciliation, ownerless revision 보존 queue, manifest privacy, plan digest 승인, manifest↔DB↔file 교차 검증을 검증한다.
+- `tests/test_storage_v2_archive_review.py`: archive evidence 목록/상세 privacy, revision 비교와 보수적 canonical 제안, 상태 전이 write guard, metadata-only promotion의 count/digest/config/allow-write guard와 멱등성을 검증한다.
+- `tests/test_storage_v2_timetable.py`: CSV/JSON 정규화, 한국어 NFC, timetable import count/digest/write guard와 멱등성, 시간 기반 suggested/needs-review 분기, rejected/dismissed 재제안 lifecycle, confirmed 재분류 멱등성, audit-only confirmation guard, source path/body 비보존, timetable verifier tamper detection을 검증한다.
+- `tests/test_storage_v2_classification_materialization.py`: metadata-only plan, 기본 비활성/count/digest/allow-write guard, title/context/manifest 정본 반영, journal 변조 검증, manifest 전후 crash replay, stale proposal, superseded revision chain 멱등성, preflight/post-commit verifier 오류 구분, hardlink와 CLI recovery-required 계약을 격리 DB/root에서 검증한다.
+- `tests/test_storage_v2_unified_review.py`: 단일 read transaction의 source total/page 계약, page 밖 suggested review ID 중복 차감, stable pagination, gate별 ledger, metadata-only/NFC, timestamp·count·pagination fail-closed와 large proposal volume의 bounded 응답을 검증한다.
+- `tests/test_storage_v2_title_suggestions.py`, `tests/test_web_panel.py`, `tests/test_web_panel_state.py`: 제목 proposal metadata-only 목록/상세와 lifecycle tamper 차단, 기본 비활성 capability, guarded reject/confirmation HTTP 계약과 sanitized error boundary를 검증한다.
 - `tests/test_distribute_lib.py`: pair 처리, block/unblock, idempotency, conflict, cleanup failure, 반복 문제 로그 suppression, JSONL rotation
 - `tests/test_downstream_worker.py`: scan stats heartbeat/suppression 회귀 테스트
 - `tests/test_correction_manual.py`: 자동 correction provider 제거, API key 불필요, manual mode pending skip 회귀 테스트

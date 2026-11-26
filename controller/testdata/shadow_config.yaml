@@ -1,0 +1,27 @@
+app:
+  polling_interval_sec: 1
+  stable_for_sec: 1
+  stale_processing_hours: 1
+  transcribe_max_retries: 0
+
+paths:
+  watch_folder: "${LECTURE_STT_SHADOW_ROOT}/watch"
+  stable_audio_folder: "${LECTURE_STT_SHADOW_ROOT}/audio"
+  transcript_folder: "${LECTURE_STT_SHADOW_ROOT}/transcripts"
+  error_folder: "${LECTURE_STT_SHADOW_ROOT}/errors"
+  tmp_dir: "${LECTURE_STT_SHADOW_ROOT}/tmp"
+  db_path: "${LECTURE_STT_SHADOW_ROOT}/state/jobs.sqlite3"
+
+transcribe:
+  model_size: tiny
+  device: cpu
+  compute_type: int8
+  language: ko
+  task: transcribe
+  beam_size: 1
+  vad_filter: false
+  word_timestamps: false
+  condition_on_previous_text: false
+
+ffmpeg:
+  binary_path: /usr/bin/true

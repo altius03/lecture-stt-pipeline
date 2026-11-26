@@ -3,10 +3,11 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 
 import { usePanelLogs } from "../src/hooks/usePanelLogs"
 import { subscribePanelEvents } from "../src/lib/panelEvents"
-import { fetchLogs } from "../src/lib/panelApi"
+import { fetchLogs, PANEL_EVENTS_ENDPOINT } from "../src/lib/panelApi"
 
 vi.mock("../src/lib/panelApi", () => ({
   fetchLogs: vi.fn(),
+  PANEL_EVENTS_ENDPOINT: "/api/events",
 }))
 
 vi.mock("../src/lib/panelEvents", () => ({
@@ -39,6 +40,63 @@ describe("usePanelLogs", () => {
     fetchLogsMock.mockReset()
     subscribePanelEventsMock.mockReset()
     subscribePanelEventsMock.mockReturnValue(() => {})
+  })
+
+  it("does not open SSE nor poll logs when disabled", () => {
+    const { result } = renderHook(() =>
+      usePanelLogs({
+        endpoint: "/api/logs",
+        pollIntervalSec: 1,
+        enabled: false,
+        resetKey: 0,
+      }),
+    )
+
+    expect(result.current.logs.text).toBe("")
+    expect(fetchLogsMock).not.toHaveBeenCalled()
+    expect(subscribePanelEventsMock).not.toHaveBeenCalled()
+  })
+
+  it("uses fetch fallback when logs endpoint is omitted", async () => {
+    fetchLogsMock.mockResolvedValue({ offset: 9, text: "alpha\n" })
+
+    const { result } = renderHook(() =>
+      usePanelLogs({
+        endpoint: "/api/logs",
+        eventsEndpoint: null,
+        pollIntervalSec: 1,
+        enabled: true,
+        resetKey: 0,
+      }),
+    )
+
+    attachScrollablePre(result.current.logRef as { current: HTMLPreElement | null })
+
+    await waitFor(() => {
+      expect(fetchLogsMock).toHaveBeenCalledWith("/api/logs", null)
+      expect(subscribePanelEventsMock).not.toHaveBeenCalled()
+    })
+  })
+
+  it("passes the combined events endpoint into SSE subscription when active", () => {
+    fetchLogsMock.mockResolvedValue({ offset: 0, text: "" })
+
+    renderHook(() =>
+      usePanelLogs({
+        endpoint: "/api/logs",
+        eventsEndpoint: PANEL_EVENTS_ENDPOINT,
+        pollIntervalSec: 1,
+        enabled: true,
+        resetKey: 0,
+      }),
+    )
+
+    expect(subscribePanelEventsMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        onEvent: expect.any(Function),
+      }),
+      PANEL_EVENTS_ENDPOINT,
+    )
   })
 
   it("loads the first chunk and appends later polling results", async () => {

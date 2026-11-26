@@ -99,6 +99,14 @@ def correct_terms(text: str, corrections: Dict[str, str] | None = None) -> str:
     return text
 
 
+def _clean_segment_text(text: str, corrections: Dict[str, str] | None = None) -> str:
+    if not text:
+        return ""
+    cleaned = remove_repeated_phrases(text)
+    cleaned = correct_terms(cleaned, corrections)
+    return cleaned.strip()
+
+
 # ── 통합 후처리 진입점 ──────────────────────────────────────────
 
 def postprocess(
@@ -113,20 +121,20 @@ def postprocess(
     # Step 1: 세그먼트 레벨 점 노이즈 제거
     segments = remove_dot_noise(segments)
 
-    # Step 2: 전체 텍스트에서 반복 제거
-    text = remove_repeated_phrases(text)
-
-    # Step 3: 용어 교정
-    text = correct_terms(text, corrections)
-
-    # Step 4: 세그먼트별 텍스트에도 용어 교정 적용
+    # Step 2: 세그먼트별 반복/용어 정리
     for seg in segments:
         if seg["text"]:
-            seg["text"] = correct_terms(seg["text"], corrections)
+            seg["text"] = _clean_segment_text(seg["text"], corrections)
 
-    # Step 5: 텍스트를 세그먼트 기반으로 재조립 (후처리 후 동기화)
+    # Step 3: 텍스트를 세그먼트 기반으로 재조립한다.
     non_empty = [seg["text"] for seg in segments if seg["text"]]
     if non_empty:
         text = "\n".join(non_empty).strip()
+    else:
+        text = ""
+
+    # Step 4: 전체 텍스트에서 교차 세그먼트 반복을 한 번 더 정리한다.
+    text = remove_repeated_phrases(text)
+    text = correct_terms(text, corrections)
 
     return segments, text

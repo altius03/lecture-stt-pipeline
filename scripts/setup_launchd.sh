@@ -6,6 +6,7 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CONFIG_PATH="$REPO/config/config.yaml"
 LAUNCH_AGENTS="$HOME/Library/LaunchAgents"
 uid=$(id -u)
 
@@ -46,10 +47,9 @@ PY
 }
 
 resolve_ffmpeg() {
-  local config_path="${LECTURE_STT_CONFIG:-$REPO/config/config.yaml}"
   local config_candidate=""
-  if [ -f "$config_path" ]; then
-    config_candidate="$("$REPO/.venv/bin/python" - "$config_path" <<'PY' 2>/dev/null || true
+  if [ -f "$CONFIG_PATH" ]; then
+    config_candidate="$("$REPO/.venv/bin/python" - "$CONFIG_PATH" <<'PY' 2>/dev/null || true
 import sys
 from pathlib import Path
 
@@ -102,6 +102,28 @@ print_step "패키지 설치 확인"
 "$REPO/.venv/bin/python" -m pip install -q -r "$REPO/requirements.txt"
 print_ok "패키지 설치 완료"
 
+# 이 스크립트는 legacy Python worker 전용이다. Controller owner 전환 뒤
+# 다시 실행해 두 실행 주체가 함께 뜨는 것을 막는다.
+if [ ! -f "$CONFIG_PATH" ]; then
+  print_fail "설정 파일 없음: $CONFIG_PATH"
+  exit 1
+fi
+EXECUTION_OWNER="$("$REPO/.venv/bin/python" - "$CONFIG_PATH" <<'PY'
+import sys
+from pathlib import Path
+
+import yaml
+
+config = yaml.safe_load(Path(sys.argv[1]).read_text(encoding="utf-8")) or {}
+app = config.get("app") or {}
+print(str(app.get("execution_owner", "python")).strip().lower())
+PY
+)"
+if [ "$EXECUTION_OWNER" != "python" ]; then
+  print_fail "execution_owner=$EXECUTION_OWNER: 이 설치 스크립트는 Python worker 전용입니다"
+  exit 1
+fi
+
 # ── 3. ffmpeg 확인 ───────────────────────────────────────────
 print_step "ffmpeg 확인"
 if FFMPEG_BIN="$(resolve_ffmpeg)"; then
@@ -119,7 +141,7 @@ print_ok "모델 준비 완료"
 # ── 5. iCloud 폴더 생성 ──────────────────────────────────────
 print_step "iCloud 녹음 폴더 생성"
 ICLOUD_BASE="$HOME/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings"
-for dir in 00_inbox 01_audio 02_transcripts 03_correction 04_summarize 05_prompt 99_errors; do
+for dir in 00_inbox 01_audio 02_transcripts 03_correction 04_summarize 99_errors; do
   mkdir -p "$ICLOUD_BASE/$dir"
   print_ok "$dir"
 done

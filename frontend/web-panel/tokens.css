@@ -1,0 +1,182 @@
+/* Hallmark · genre: modern-minimal · macrostructure: Workbench · theme: Cobalt · enrichment: none · contrast: pass · designed-as-app */
+:root {
+  color-scheme: light;
+
+  --color-paper: oklch(98.3% 0.006 252);
+  --color-paper-2: oklch(96.4% 0.009 252);
+  --color-paper-3: oklch(93.8% 0.012 252);
+  --color-ink: oklch(22% 0.022 258);
+  --color-ink-2: oklch(31% 0.021 258);
+  --color-rule: oklch(88% 0.014 254);
+  --color-rule-2: oklch(72% 0.018 255);
+  --color-muted: oklch(46% 0.018 257);
+  --color-neutral: oklch(36% 0.02 258);
+  --color-accent: oklch(50% 0.2 256);
+  --color-accent-strong: oklch(43% 0.18 256);
+  --color-accent-soft: oklch(93% 0.035 255);
+  --color-accent-ink: oklch(98.5% 0.006 252);
+  --color-focus: oklch(20% 0.025 258);
+  --color-graphite: oklch(20% 0.018 260);
+  --color-graphite-2: oklch(25% 0.02 260);
+  --color-graphite-ink: oklch(94% 0.01 252);
+  --color-overlay: oklch(18% 0.02 258 / 0.58);
+  --color-grid: oklch(28% 0.02 258 / 0.04);
+
+  --color-success: oklch(43% 0.105 164);
+  --color-success-soft: oklch(93% 0.035 164);
+  --color-review: oklch(46% 0.11 74);
+  --color-review-soft: oklch(94% 0.04 82);
+  --color-error: oklch(47% 0.14 26);
+  --color-error-soft: oklch(94% 0.035 26);
+  --color-info: oklch(47% 0.115 248);
+  --color-info-soft: oklch(93% 0.035 248);
+
+  --font-display: "Pretendard Variable", "Pretendard", "SF Pro Display", "Noto Sans KR", ui-sans-serif, sans-serif;
+  --font-body: "Pretendard Variable", "Pretendard", "SF Pro Text", "Noto Sans KR", ui-sans-serif, sans-serif;
+  --font-mono: "SFMono-Regular", "Cascadia Mono", "Roboto Mono", ui-monospace, monospace;
+  --font-outlier: var(--font-mono);
+  --display-weight: 700;
+  --body-weight: 500;
+  --tracking-display: -0.025em;
+  --tracking-label: 0.035em;
+
+  --text-xs: 0.75rem;
+  --text-sm: 0.875rem;
+  --text-base: 1rem;
+  --text-md: 1.125rem;
+  --text-lg: 1.375rem;
+  --text-xl: 1.75rem;
+  --text-2xl: 2.25rem;
+  --text-display: clamp(2.25rem, 4vw + 0.5rem, 4rem);
+
+  --space-3xs: 0.25rem;
+  --space-2xs: 0.5rem;
+  --space-xs: 0.75rem;
+  --space-sm: 1rem;
+  --space-md: 1.5rem;
+  --space-lg: 2rem;
+  --space-xl: 3rem;
+  --space-2xl: 4.5rem;
+  --space-3xl: 7rem;
+
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-in: cubic-bezier(0.7, 0, 0.84, 0);
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+  --dur-micro: 120ms;
+  --dur-short: 220ms;
+  --dur-long: 420ms;
+
+  --rule-hair: 1px;
+  --rule-fine: 2px;
+  --radius-card: 10px;
+  --radius-input: 6px;
+  --radius-pill: 999px;
+  --shadow-card: 0 1px 2px oklch(20% 0.02 258 / 0.05);
+  --layout-max: 97.5rem;
+  --rail-min: 13.75rem;
+  --rail-max: 15.5rem;
+  --control-compact: 3.25rem;
+  --control-roomy: 3.5rem;
+  --period-tabs-min: 18.375rem;
+  --sticky-rail-top: 5.85rem;
+
+  --z-base: 1;
+  --z-raised: 10;
+  --z-dropdown: 100;
+  --z-sticky: 200;
+  --z-modal: 400;
+  --z-toast: 500;
+  --z-tooltip: 600;
+
+  /* Compatibility roles used by the existing panel while it adopts Hallmark tokens. */
+  --background: var(--color-paper-2);
+  --surface: var(--color-paper);
+  --surface-muted: var(--color-paper-2);
+  --surface-strong: var(--color-paper-3);
+  --surface-inset: var(--color-paper-3);
+  --text: var(--color-ink);
+  --muted: var(--color-muted);
+  --muted-strong: var(--color-neutral);
+  --border: var(--color-rule);
+  --border-strong: var(--color-rule-2);
+  --primary: var(--color-accent);
+  --primary-hover: var(--color-accent-strong);
+  --primary-contrast: var(--color-accent-ink);
+  --secondary-bg: var(--color-paper);
+  --secondary-hover: var(--color-paper-3);
+  --secondary-text: var(--color-ink-2);
+  --danger-bg: var(--color-error-soft);
+  --danger-hover: var(--color-paper-3);
+  --danger-text: var(--color-error);
+  --danger-border: var(--color-error);
+  --status-chip-bg: var(--color-paper);
+  --progress-track-bg: var(--color-paper-3);
+  --table-head-bg: var(--color-paper-2);
+  --row-hover: var(--color-paper-2);
+  --row-selected: var(--color-accent-soft);
+  --terminal-bg: var(--color-graphite);
+  --terminal-text: var(--color-graphite-ink);
+  --terminal-border: var(--color-graphite-2);
+  --error-bg: var(--color-error-soft);
+  --error-text: var(--color-error);
+  --error-border: var(--color-error);
+  --analytics-accent: var(--color-success);
+  --analytics-accent-soft: var(--color-success-soft);
+  --analytics-review: var(--color-review);
+  --analytics-review-soft: var(--color-review-soft);
+  --analytics-error: var(--color-error);
+  --analytics-error-soft: var(--color-error-soft);
+  --analytics-blue: var(--color-info);
+  --analytics-blue-soft: var(--color-info-soft);
+  --shadow: var(--shadow-card);
+  --shadow-soft: var(--shadow-card);
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --color-paper: oklch(17% 0.014 258);
+  --color-paper-2: oklch(14% 0.012 258);
+  --color-paper-3: oklch(21% 0.016 258);
+  --color-ink: oklch(94% 0.009 252);
+  --color-ink-2: oklch(84% 0.012 253);
+  --color-rule: oklch(29% 0.018 258);
+  --color-rule-2: oklch(43% 0.02 258);
+  --color-muted: oklch(70% 0.014 255);
+  --color-neutral: oklch(80% 0.012 254);
+  --color-accent: oklch(68% 0.17 254);
+  --color-accent-strong: oklch(75% 0.15 252);
+  --color-accent-soft: oklch(25% 0.055 256);
+  --color-accent-ink: oklch(15% 0.018 258);
+  --color-focus: oklch(94% 0.012 252);
+  --color-graphite: oklch(11% 0.012 260);
+  --color-graphite-2: oklch(24% 0.018 260);
+  --color-graphite-ink: oklch(94% 0.009 252);
+  --color-overlay: oklch(8% 0.01 258 / 0.72);
+  --color-grid: oklch(90% 0.012 252 / 0.045);
+
+  --color-success: oklch(72% 0.095 164);
+  --color-success-soft: oklch(24% 0.045 164);
+  --color-review: oklch(78% 0.1 82);
+  --color-review-soft: oklch(27% 0.045 82);
+  --color-error: oklch(72% 0.12 26);
+  --color-error-soft: oklch(25% 0.045 26);
+  --color-info: oklch(76% 0.105 248);
+  --color-info-soft: oklch(25% 0.05 248);
+
+  --shadow-card: 0 1px 2px oklch(7% 0.01 258 / 0.42);
+
+  --background: var(--color-paper-2);
+  --surface: var(--color-paper);
+  --surface-muted: var(--color-paper-3);
+  --surface-strong: oklch(25% 0.017 258);
+  --surface-inset: var(--color-paper-2);
+  --secondary-bg: var(--color-paper-3);
+  --secondary-hover: oklch(26% 0.018 258);
+  --danger-hover: oklch(30% 0.045 26);
+  --status-chip-bg: var(--color-paper-3);
+  --progress-track-bg: oklch(27% 0.018 258);
+  --table-head-bg: var(--color-paper-3);
+  --row-hover: oklch(22% 0.016 258);
+  --row-selected: var(--color-accent-soft);
+}

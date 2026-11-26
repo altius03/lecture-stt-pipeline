@@ -9,6 +9,7 @@ interface PanelHeroProps {
   runtimeState: RuntimeState
   summary: PanelSummary
   realtimeConnected: boolean
+  currentScreenLabel: string
   notification: NotificationState
   pendingNotificationSelection: NotificationSelection | null
   pendingNotificationApplyNow: boolean
@@ -30,6 +31,7 @@ export function PanelHero({
   runtimeState,
   summary,
   realtimeConnected,
+  currentScreenLabel,
   notification,
   pendingNotificationSelection,
   pendingNotificationApplyNow,
@@ -64,13 +66,19 @@ export function PanelHero({
 
       <div className="panel-header-center" aria-label="현재 패널 상태">
         <div className="header-meta-item">
+          <span>현재 화면</span>
+          <strong>{currentScreenLabel}</strong>
+          <em>{runtimeState.label}</em>
+        </div>
+        <div className="header-meta-item">
           <span>마지막 갱신</span>
           <strong>{summary.updated_at}</strong>
+          <em>{realtimeConnected ? "SSE 연결" : "Polling"}</em>
         </div>
         <div className="header-meta-item">
           <span>현재 시간</span>
           <strong>{currentTime}</strong>
-          <em>{realtimeConnected ? "SSE 연결" : "Polling"}</em>
+          <em>{summary.refresh_hint}</em>
         </div>
         <div className="header-meta-item header-notice">
           <span>안내</span>
@@ -78,7 +86,7 @@ export function PanelHero({
         </div>
       </div>
 
-      <div className="panel-command-bar">
+      <div className="panel-command-bar" role="group" aria-label="빠른 제어">
         <NotificationToggle
           notification={notification}
           pendingSelection={pendingNotificationSelection}
@@ -97,7 +105,7 @@ export function PanelHero({
           title={theme === "dark" ? "라이트 모드" : "다크 모드"}
         >
           <span className="theme-switch-icon theme-switch-icon-light" aria-hidden="true">
-            <svg viewBox="0 0 24 24" focusable="false">
+            <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true">
               <circle cx="12" cy="12" r="4.25" fill="none" stroke="currentColor" strokeWidth="1.8" />
               <path
                 d="M12 2.75v2.5M12 18.75v2.5M21.25 12h-2.5M5.25 12h-2.5M18.54 5.46l-1.77 1.77M7.23 16.77l-1.77 1.77M18.54 18.54l-1.77-1.77M7.23 7.23L5.46 5.46"
@@ -109,7 +117,7 @@ export function PanelHero({
             </svg>
           </span>
           <span className="theme-switch-icon theme-switch-icon-dark" aria-hidden="true">
-            <svg viewBox="0 0 24 24" focusable="false">
+            <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true">
               <path
                 d="M14.6 3.35a8.65 8.65 0 1 0 6.05 14.95 8.95 8.95 0 0 1-10.6-10.6A8.6 8.6 0 0 0 14.6 3.35Z"
                 fill="none"
