@@ -72,7 +72,20 @@ func TestMainSIGTERMEmitsInterruptedReportAndReapsDescendants(t *testing.T) {
 	command := exec.Command(testBinary, args...)
 	command.Env = append(os.Environ(), "GO_WANT_SHADOW_MAIN_HELPER=1")
 	detachedPIDPath := filepath.Join(t.TempDir(), "detached.pid")
+	var unrelated *exec.Cmd
 	if runtime.GOOS == "darwin" {
+		// Identical executable and separate PGID, but outside the helper's tree.
+		unrelatedPIDPath := filepath.Join(t.TempDir(), "unrelated.pid")
+		unrelated = exec.Command(testBinary, "-test.run=^TestShadowDetachedFixtureProcess$")
+		unrelated.Env = append(os.Environ(), "SHADOW_DETACHED_PID="+unrelatedPIDPath)
+		if err := unrelated.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			_ = unrelated.Process.Kill()
+			_ = unrelated.Wait()
+		}()
+		waitForPIDFile(t, unrelatedPIDPath)
 		command.Env = append(command.Env, "SHADOW_FIXTURE_BINARY="+testBinary, "SHADOW_DETACHED_PID="+detachedPIDPath)
 	}
 	var stdout bytes.Buffer
@@ -136,6 +149,9 @@ func TestMainSIGTERMEmitsInterruptedReportAndReapsDescendants(t *testing.T) {
 				if member.pid == leader {
 					t.Fatalf("direct helper was not reaped: %+v", member)
 				}
+			}
+			if unrelated != nil && !hasLiveFixtureMember(fixtureProcessStates(t, unrelated.Process.Pid, nil)) {
+				t.Fatal("unrelated fixture in a separate process group was terminated")
 			}
 			if len(members) > 0 {
 				t.Logf("exited fixture descendants awaiting OS reaping: %+v", members)
@@ -218,7 +234,7 @@ func TestShadowDetachedFixtureProcess(t *testing.T) {
 	if err := os.WriteFile(path, []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(5 * time.Second)
+	time.Sleep(15 * time.Second)
 }
 
 func TestShadowMainHelperProcess(t *testing.T) {
