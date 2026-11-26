@@ -5,6 +5,8 @@
 
 ## 2026-11-27
 
+- [이슈 #4](https://github.com/altius03/lecture-stt-pipeline/issues/4) · [이슈별 작업 기록과 PR 검증 절차](work-log/004-issue-pr-workflow.md) · [main PR #5](https://github.com/altius03/lecture-stt-pipeline/pull/5) · [dev PR #6](https://github.com/altius03/lecture-stt-pipeline/pull/6)
+
 - [시스템 개요](SYSTEM_OVERVIEW.md)에 전사와 후처리의 실행 조건, 품질 지표 해석, 대량 녹음의 검토·배포 사례를 기록하고 README에 연결했다.
 
 ## 2026-05-20
