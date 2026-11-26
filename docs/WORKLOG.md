@@ -5,7 +5,7 @@
 
 ## 2026-11-27
 
-- [이슈 #7](https://github.com/altius03/lecture-stt-pipeline/issues/7) · [시스템·운영 이력 인수인계](work-log/007-system-handoff.md)
+- [이슈 #7](https://github.com/altius03/lecture-stt-pipeline/issues/7) · [시스템·운영 이력 인수인계](work-log/007-system-handoff.md) · [main PR #8](https://github.com/altius03/lecture-stt-pipeline/pull/8) · [dev PR #9](https://github.com/altius03/lecture-stt-pipeline/pull/9)
 
 - [이슈 #4](https://github.com/altius03/lecture-stt-pipeline/issues/4) · [이슈별 작업 기록과 PR 검증 절차](work-log/004-issue-pr-workflow.md) · [main PR #5](https://github.com/altius03/lecture-stt-pipeline/pull/5) · [dev PR #6](https://github.com/altius03/lecture-stt-pipeline/pull/6)
 
