@@ -1,5 +1,7 @@
 # Lecture STT Pipeline
 
+**[강의 녹음이 학습 노트가 되기까지](docs/SYSTEM_OVERVIEW.md)** — Mac mini의 전사·품질 검사·교정 흐름과 대량 녹음 운영 사례를 정리했습니다. 아래는 `dev` 버전의 실행 안내입니다. Codex CLI 후처리를 사용하는 버전의 설정은 [운영 코드 README](https://github.com/altius03/lecture-stt-pipeline/blob/8c8c40fdb26a038a7e6bfacf3854cbca0f3aea6c/README.md)를 참고하세요.
+
 현재 기준: `/Users/geonha/DEV/lecture_stt`가 운영 저장소입니다. 예전 `/Users/geonha/lecture_stt` 경로는 2026-05-20 runtime cleanup에서 archive로 보존된 legacy root이며 새 작업 기준이 아닙니다.
 
 Remote: `https://github.com/altius03/lecture-stt-pipeline.git`
