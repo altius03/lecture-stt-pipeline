@@ -1,6 +1,10 @@
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
+import os
 from pathlib import Path
+import shutil
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -63,21 +67,15 @@ class InstallationTests(unittest.TestCase):
                 thread.join()
 
     def test_setup_validates_build_before_registration_and_reports_health_failures(self):
-        import os
-        import shutil
-        import subprocess
-        import sys
-        from scripts.download_model import ROOT
-
-        for failure in ("build", "health", ""):
+        for failure in ("python", "build", "health", ""):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp) / "checkout"
                 (root / "scripts").mkdir(parents=True)
                 (root / "config").mkdir()
                 (root / "frontend/web-panel").mkdir(parents=True)
                 (root / ".venv/bin").mkdir(parents=True)
-                shutil.copytree(ROOT / "launchd", root / "launchd")
-                shutil.copy2(ROOT / "scripts/setup_launchd.sh", root / "scripts")
+                shutil.copytree(download_model.ROOT / "launchd", root / "launchd")
+                shutil.copy2(download_model.ROOT / "scripts/setup_launchd.sh", root / "scripts")
                 (root / "config/config.yaml").write_text("app: {execution_owner: python}\n")
                 (root / "scripts/download_model.py").write_text(
                     "import sys\nassert '--create-folders' in sys.argv\n"
@@ -88,7 +86,10 @@ class InstallationTests(unittest.TestCase):
                 commands = Path(tmp) / "commands"
                 commands.mkdir()
                 wrappers = {
-                    root / ".venv/bin/python": f'if [ "$1" = "-m" ]; then exit 0; fi\nexec "{sys.executable}" "$@"',
+                    root / ".venv/bin/python": (
+                        'if [ "$1" = "-c" ] && [ "$FAIL_STEP" = python ]; then exit 1; fi\n'
+                        f'if [ "$1" = "-m" ]; then exit 0; fi\nexec "{sys.executable}" "$@"'
+                    ),
                     commands / "npm": 'if [ "$1" = "run" ] && [ "$FAIL_STEP" = "build" ]; then exit 1; fi\nexit 0',
                     commands / "launchctl": 'echo "$1" >> "$CAPTURE"\nif [ "$1" = print ]; then echo "pid = 123"; fi',
                     commands / "ffmpeg": "exit 0",
@@ -105,7 +106,7 @@ class InstallationTests(unittest.TestCase):
                 result = subprocess.run(["bash", str(root / "scripts/setup_launchd.sh")],
                                         env=env, text=True, capture_output=True)
                 self.assertEqual(result.returncode == 0, not failure, result.stdout + result.stderr)
-                if failure == "build":
+                if failure in {"build", "python"}:
                     self.assertFalse(capture.exists())
                 else:
                     self.assertEqual(capture.read_text().splitlines().count("bootstrap"), 4)

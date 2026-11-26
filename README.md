@@ -98,9 +98,11 @@ Gitignore 대상 로컬 runtime/build artifact:
 
 ## 4. 처음 설정
 
+Python 3.12로 검증했으며 음성 디코더는 Python 3.11 이상이 필요합니다. 패널 빌드는 Node.js 22.23.5에서 검증했습니다.
+
 ```bash
 cd /Users/geonha/DEV/lecture_stt
-python3 -m venv .venv
+python3.12 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 cp config/config.example.yaml config/config.yaml
 ```

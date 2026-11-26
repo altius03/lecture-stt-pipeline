@@ -42,7 +42,17 @@ func TestMainSIGTERMEmitsInterruptedReportAndReapsDescendants(t *testing.T) {
 	parentPIDPath := filepath.Join(t.TempDir(), "fake-python.pid")
 	childPIDPath := filepath.Join(t.TempDir(), "fake-python-child.pid")
 	grandchildPIDPath := filepath.Join(t.TempDir(), "fake-python-grandchild.pid")
-	fakePython := writeSIGTERMFixturePython(t, watchRoot, parentPIDPath, childPIDPath, grandchildPIDPath)
+	// Release the grandchild's next forks at the cancellation boundary.
+	forkGate := filepath.Join(t.TempDir(), "fork-gate")
+	if err := syscall.Mkfifo(forkGate, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gate, err := os.OpenFile(forkGate, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gate.Close()
+	fakePython := writeSIGTERMFixturePython(t, watchRoot, parentPIDPath, childPIDPath, grandchildPIDPath, forkGate)
 	configPath := writeCommandIntegrationConfig(t, watchRoot, audioRoot, transcriptRoot, errorRoot, tmpRoot, dbPath)
 
 	args := []string{
@@ -74,6 +84,9 @@ func TestMainSIGTERMEmitsInterruptedReportAndReapsDescendants(t *testing.T) {
 	waitForPIDFile(t, grandchildPIDPath)
 
 	cleanupStarted := time.Now()
+	if _, err := gate.WriteString("fork\n"); err != nil {
+		t.Fatal(err)
+	}
 	if err := command.Process.Signal(syscall.SIGTERM); err != nil {
 		t.Fatal(err)
 	}
@@ -98,6 +111,20 @@ func TestMainSIGTERMEmitsInterruptedReportAndReapsDescendants(t *testing.T) {
 	}
 	if report.Mode != "read_only" || report.OK {
 		t.Fatalf("unexpected command report after SIGTERM: %#v", report)
+	}
+
+	// The late-forked sleep processes may already have been reparented. A
+	// vanished shell PID alone cannot prove that its child releases the pipes.
+	groupID := readPIDFile(t, parentPIDPath)
+	for {
+		err := syscall.Kill(-groupID, 0)
+		if errors.Is(err, syscall.ESRCH) {
+			break
+		}
+		if err != nil || time.Since(cleanupStarted) >= 2*time.Second {
+			t.Fatalf("fixture process group survived cancellation: pgid=%d err=%v", groupID, err)
+		}
+		time.Sleep(time.Millisecond)
 	}
 
 	for _, pidPath := range []string{parentPIDPath, childPIDPath, grandchildPIDPath} {
@@ -128,7 +155,7 @@ func TestShadowMainHelperProcess(t *testing.T) {
 	os.Exit(0)
 }
 
-func writeSIGTERMFixturePython(t *testing.T, watchRoot, parentPIDPath, childPIDPath, grandchildPIDPath string) string {
+func writeSIGTERMFixturePython(t *testing.T, watchRoot, parentPIDPath, childPIDPath, grandchildPIDPath, forkGate string) string {
 	t.Helper()
 	descendantPath := filepath.Join(t.TempDir(), "descendant-helper")
 	descendantScript := `#!/bin/sh
@@ -137,13 +164,15 @@ set -eu
 mode="$1"
 if [ "$mode" = "child" ]; then
   echo $$ > "$2"
-  "$0" grandchild "$3" &
+  "$0" grandchild "$3" "$4" &
   while :; do sleep 60; done
 fi
 
 if [ "$mode" = "grandchild" ]; then
   echo $$ > "$2"
-  while :; do sleep 60; done
+  IFS= read -r _ < "$3"
+  for n in 1 2 3 4 5 6 7 8; do sleep 60 & done
+  wait
 fi
 
 exit 2
@@ -168,7 +197,7 @@ JSON
   fi
   if [ "$3" = "lockstep-scan" ]; then
     echo $$ > %q
-    %q child %q %q &
+    %q child %q %q %q &
     while [ ! -s %q ] || [ ! -s %q ]; do
       sleep 0.01
     done
@@ -177,7 +206,7 @@ JSON
 fi
 
 exit 2
-`, shadow.ConfigSchemaVersion, watchRoot, parentPIDPath, descendantPath, childPIDPath, grandchildPIDPath, childPIDPath, grandchildPIDPath)
+`, shadow.ConfigSchemaVersion, watchRoot, parentPIDPath, descendantPath, childPIDPath, grandchildPIDPath, forkGate, childPIDPath, grandchildPIDPath)
 	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -223,8 +252,10 @@ func waitForPIDFile(t *testing.T, path string) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		if _, err := os.Stat(path); err == nil {
-			return
+		if value, err := os.ReadFile(path); err == nil {
+			if pid, err := strconv.Atoi(strings.TrimSpace(string(value))); err == nil && pid > 1 {
+				return
+			}
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("pid file was not published: %s", path)

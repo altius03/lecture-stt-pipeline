@@ -91,9 +91,18 @@ PY
 print_step "가상환경 확인"
 if [ ! -x "$REPO/.venv/bin/python" ]; then
   echo "  가상환경 생성 중..."
-  python3 -m venv "$REPO/.venv"
+  python_bin="$(command -v python3.12 || command -v python3 || true)"
+  if [ -z "$python_bin" ] || ! "$python_bin" -c 'import sys; sys.exit(sys.version_info < (3, 11))'; then
+    print_fail "Python 3.11 이상이 필요합니다. 프로젝트 권장 버전은 Python 3.12입니다."
+    exit 1
+  fi
+  "$python_bin" -m venv "$REPO/.venv"
   print_ok "가상환경 생성 완료"
 else
+  if ! "$REPO/.venv/bin/python" -c 'import sys; sys.exit(sys.version_info < (3, 11))'; then
+    print_fail "기존 .venv의 Python 버전이 낮습니다. Python 3.12 가상환경을 준비하세요."
+    exit 1
+  fi
   print_ok "가상환경 이미 존재"
 fi
 
