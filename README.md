@@ -1,6 +1,8 @@
 # Lecture STT Pipeline
 
-**[강의 녹음이 학습 노트가 되기까지](docs/SYSTEM_OVERVIEW.md)** — Mac mini의 전사·품질 검사·교정 흐름과 대량 녹음 운영 사례를 정리했습니다. 아래는 `dev` 버전의 실행 안내입니다. Codex CLI 후처리를 사용하는 버전의 설정은 [운영 코드 README](https://github.com/altius03/lecture-stt-pipeline/blob/8c8c40fdb26a038a7e6bfacf3854cbca0f3aea6c/README.md)를 참고하세요.
+처음 참여하는 사람과 AI 도구는 [시스템·운영 이력 인수인계서](docs/SYSTEM_HANDOFF.md)에서 처리 흐름, 주요 결정, 운영 확인 순서를 볼 수 있습니다.
+
+**[강의 녹음이 학습 노트가 되기까지](docs/SYSTEM_OVERVIEW.md)** — Mac mini의 전사·품질 검사·교정 흐름과 대량 녹음 운영 사례를 정리했습니다. 아래는 `dev` 버전의 실행 안내입니다. Codex CLI 후처리를 사용하는 버전의 설정은 [운영 코드 README](https://github.com/altius03/lecture-stt-pipeline/blob/main/README.md)를 참고하세요.
 
 현재 기준: `/Users/geonha/DEV/lecture_stt`가 운영 저장소입니다. 예전 `/Users/geonha/lecture_stt` 경로는 2026-05-20 runtime cleanup에서 archive로 보존된 legacy root이며 새 작업 기준이 아닙니다.
 
@@ -16,10 +18,9 @@ CI: `.github/workflows/ci.yml`에서 Python unittest/compileall과 web-panel tes
 2. 안정 시간이 지난 파일을 `01_audio`로 보관하고 faster-whisper로 전사합니다.
 3. raw transcript를 `02_transcripts/{stem}.txt`와 `{stem}.json`으로 저장합니다.
 4. 품질 metadata가 있으면 `02_transcripts/{stem}.quality.json` sidecar를 저장합니다. 이 sidecar는 transcript 본문과 segment 배열을 포함하지 않습니다.
-5. 사람이 검토했거나 Hermes operator가 만든 correction/summary final artifact를 `03_correction`, `04_summarize`에 둡니다.
+5. 사람이 검토한 correction/summary final artifact를 `03_correction`, `04_summarize`에 둡니다.
 6. downstream worker가 GH archive와 Obsidian 목적지로 배포합니다.
 
-앱 내부에는 Claude/Anthropic 같은 API-backed correction provider를 다시 넣지 않습니다. 자동 교정/요약은 별도 Hermes cron/operator 계층에서 수행하고, repo 안 코드는 후보 선택, prompt loading, staging, validation, promote safety 같은 결정적 보조 기능만 제공합니다.
 
 ## 2. 저장소 구조
 
@@ -44,19 +45,16 @@ CI: `.github/workflows/ci.yml`에서 Python unittest/compileall과 web-panel tes
 │   ├── distribute_once.sh            # downstream worker 1회 실행
 │   ├── distribute_status.sh          # downstream 상태 확인
 │   ├── cleanup.py                    # audio/transcript/tmp cleanup helper; 기본 dry-run
-│   ├── rotate_logs.py                # launchd plain log rotation helper; 기본 dry-run
-│   └── hermes_postprocess/           # Hermes postprocess operator helper package
+│   └── rotate_logs.py                # launchd plain log rotation helper; 기본 dry-run
 ├── docs/
 │   ├── OPERATIONS.md                 # 현재 운영 runbook source of truth
 │   ├── ARCHITECTURE.md               # 구조/흐름 문서
 │   ├── MODELS.md                     # 모델/benchmark 정책
-│   ├── WORKLOG.md                    # 누적 변경 기록
-│   └── operators/hermes-postprocess/ # Hermes operator runbook/prompt/output contract
+│   └── WORKLOG.md                    # 누적 변경 기록
 ├── launchd/                          # macOS LaunchAgent 템플릿
 ├── tests/                            # Python unittest suite
 ├── .github/workflows/ci.yml          # GitHub Actions CI
-├── .codex/agents/                    # project-local Codex subagent 설정
-└── .hermes/plans/                    # 승인/작업 계획 기록
+└── .codex/agents/                    # project-local Codex subagent 설정
 ```
 
 Gitignore 대상 로컬 runtime/build artifact:
@@ -84,7 +82,6 @@ Gitignore 대상 로컬 runtime/build artifact:
 - repo-local SQLite DB: `state/jobs.sqlite3`
 - STT tmp/cache: `~/Library/Caches/lecture_stt/tmp`
 - app/downstream/launchd logs: `~/Library/Logs/lecture_stt/`
-- Hermes operator staging/report: `state/hermes_postprocess/`, `state/reports/`
 
 ## 4. 처음 설정
 
@@ -167,40 +164,17 @@ LaunchAgent 등록/재등록은 운영 영향이 있으므로 `docs/OPERATIONS.m
 bash scripts/setup_launchd.sh
 ```
 
-## 6. Hermes postprocess operator
-
-Repo-local helper package:
-
-```bash
-python3 -m scripts.hermes_postprocess dry-run --help
-python3 -m scripts.hermes_postprocess validate-correction --help
-python3 -m scripts.hermes_postprocess validate-summary --help
-python3 -m scripts.hermes_postprocess record-misrecognitions --help
-python3 -m scripts.hermes_postprocess promote --help
-```
-
-핵심 안전 규칙:
-
-- `dry-run`은 후보 metadata/action plan만 출력하고 raw transcript body나 segment 배열을 출력하지 않습니다.
-- staging manifest와 validation report도 metadata-only입니다.
-- `promote`는 기본적으로 비활성화되어 있으며, final write에는 `--allow-promote`가 필요합니다.
-- existing final output overwrite, backlog bulk processing, `05_prompt` 자동 수정은 금지합니다.
-- 현재 Hermes cron job은 `lecture_stt_postprocess_operator`이며, activation-time backlog는 `state/hermes_postprocess/cron-baseline.json`으로 건너뜁니다. no-candidate tick은 stdout 없이 조용히 종료합니다.
-
-자세한 운영 규칙은 `docs/operators/hermes-postprocess/README.md`와 `operator-runbook.md`를 봅니다.
-
-## 7. 운영 문서 우선순위
+## 6. 운영 문서 우선순위
 
 1. `docs/OPERATIONS.md`: 현재 운영 runbook
 2. `docs/ARCHITECTURE.md`: 시스템 구조와 실행 흐름
-3. `docs/operators/hermes-postprocess/`: Hermes operator 규칙
-4. `docs/WORKLOG.md`: 변경 이력
-5. 날짜가 붙은 handoff/inventory/decision 문서: 과거 의사결정 기록. 현재 판단은 위 문서를 우선합니다.
+3. `docs/WORKLOG.md`: 변경 이력
+4. 날짜가 붙은 handoff/inventory/decision 문서: 과거 의사결정 기록. 현재 판단은 위 문서를 우선합니다.
 
-## 8. 안전 원칙
+## 7. 안전 원칙
 
 - raw transcript 본문을 chat, stdout, report, worklog에 그대로 남기지 않습니다.
 - final artifact overwrite는 하지 않습니다. 기존 파일과 내용이 다르면 conflict로 남깁니다.
-- cleanup, DB row 삭제, launchd restart, cron 변경, model/provider 변경은 현재 상태와 rollback 계획을 확인한 뒤 수행합니다.
+- cleanup, DB row 삭제, launchd restart, model/provider 변경은 현재 상태와 rollback 계획을 확인한 뒤 수행합니다.
 - `.venv/`, `node_modules/`, `state/`, `dist/`, iCloud/GH archive/Obsidian runtime payload는 커밋하지 않습니다.
 - 저장소 변경 전후에는 `git status --short --branch`, `git diff --check`, 테스트/compileall을 확인합니다.

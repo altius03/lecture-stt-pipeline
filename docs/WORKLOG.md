@@ -5,6 +5,8 @@
 
 ## 2026-11-27
 
+- [이슈 #7](https://github.com/altius03/lecture-stt-pipeline/issues/7) · [시스템·운영 이력 인수인계](work-log/007-system-handoff.md)
+
 - [이슈 #4](https://github.com/altius03/lecture-stt-pipeline/issues/4) · [이슈별 작업 기록과 PR 검증 절차](work-log/004-issue-pr-workflow.md) · [main PR #5](https://github.com/altius03/lecture-stt-pipeline/pull/5) · [dev PR #6](https://github.com/altius03/lecture-stt-pipeline/pull/6)
 
 - [시스템 개요](SYSTEM_OVERVIEW.md)에 전사와 후처리의 실행 조건, 품질 지표 해석, 대량 녹음의 검토·배포 사례를 기록하고 README에 연결했다.
@@ -12,22 +14,12 @@
 ## 2026-05-20
 
 ### Repository README and structure cleanup
-- Replaced the stale root README with the current `/Users/geonha/DEV/lecture_stt` operating path, remote/branch/CI summary, repository tree, runtime-data boundary, common commands, Hermes postprocess operator entrypoints, documentation priority, and safety rules. The README no longer uses the archived `/Users/geonha/lecture_stt` path for active commands.
+- Replaced the stale root README with the current `/Users/geonha/DEV/lecture_stt` operating path, remote/branch/CI summary, repository tree, runtime-data boundary, common commands, documentation priority, and safety rules. The README no longer uses the archived `/Users/geonha/lecture_stt` path for active commands.
 - Cleaned repository ignore policy by consolidating duplicate `.gitignore` entries and adding explicit root-level ignores for legacy local runtime folders (`/audio/`, `/inbox/`, `/transcripts/`, `/errors/`) plus generated frontend artifacts and `/src/logs/`.
-- Removed the obsolete tracked root `correct_unix.py` one-off hard-coded Unix correction script. Current correction/summary automation lives under `scripts/hermes_postprocess/` with metadata-only staging, validators, explicit promote, and no raw transcript body in reports.
+- Removed the obsolete tracked root `correct_unix.py` one-off hard-coded Unix correction script.
 - Removed local-only ignored clutter from the working tree: `.DS_Store` files, Python `__pycache__/` directories, stale `.bak` files, generated TypeScript build-info/Vite JS artifacts, empty legacy local runtime folders, and stale `src/logs/app.log`. This did not remove `.venv/`, `node_modules/`, `frontend/web-panel/dist/`, `state/`, `models/`, local `config/config.yaml`, or any iCloud/GH archive/Obsidian runtime payload.
-- Updated `docs/ARCHITECTURE.md` to reflect the current 2026-05-20 top-level structure, gitignored runtime boundary, active Hermes operator status, and broadened test coverage.
+- Updated `docs/ARCHITECTURE.md` to reflect the current 2026-05-20 top-level structure, gitignored runtime boundary, and broadened test coverage.
 - Verification passed with static added-line security scan (`0` findings), `git diff --check`, `PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v` (`139` tests), `.venv/bin/python -m compileall -q scripts tests src`, frontend `npm test -- --run` (`21` tests), frontend `npm run build`, and independent pre-commit review with no blockers.
-
-### Hermes postprocess operator Phase 2~4 repo-local implementation
-- Added the repo-local Hermes postprocess helper package under `scripts/hermes_postprocess/` with metadata-only candidate discovery, prompt loading from the existing `05_prompt` surface, canonical path resolution, output contract schemas, correction/summary validators, review-only misrecognition candidate accumulation, metadata-only staging manifest support, and an explicit promote interface that is disabled unless `--allow-promote` is passed. The promote path now also validates candidate destination paths, re-runs deterministic validators before final writes, uses exclusive no-overwrite file creation, and rolls back files created earlier in the same promote attempt after hash verification if a later copy fails.
-- Candidate discovery processes at most one stem per tick and reports only metadata/action-plan fields. It does not print raw transcript bodies or segment arrays. Summary-only candidates can use an existing final correction pair; blocked candidates such as partial final correction output are refused before promote.
-- Added operator docs under `docs/operators/hermes-postprocess/`: README, runbook, correction prompt policy, summary prompt policy, output contract, failure policy, and cron prompt source. The docs keep iCloud `lecture_recordings/05_prompt` as the correction prompt source of truth and keep cron/promote/iCloud final writes behind later approval gates.
-- After later approval in the same session, ran a content staging canary for live stem `260504DS_1`, validated staged correction/summary artifacts, and promoted exactly that one staged candidate to iCloud final paths without overwrite. The metadata-only promote report verified source/final existence, size, and SHA-256 matches for `03_correction/260504DS_1.txt`, `03_correction/260504DS_1.json`, and `04_summarize/260504DS_1.md`; raw transcript and generated bodies were not copied into reports.
-- Registered active Hermes script-only cron job `lecture_stt_postprocess_operator` (`job_id=977667876027`, `every 30m`, `workdir=/Users/geonha/DEV/lecture_stt`, `script=lecture_stt_postprocess_operator.py`, `no_agent=true`, delivery `discord:#운영-보안`). The wrapper records an activation baseline in `state/hermes_postprocess/cron-baseline.json` and skips those backlog stems, processing only future candidates; direct wrapper and scheduled run verification showed no-candidate stdout remains empty.
-- Added fixture-based tests in `tests/test_hermes_postprocess.py` for candidate selection, action planning, path resolution, raw-body leak prevention, prompt loading, staging manifest privacy, review-only misrecognition queue append/dedupe, invalid raw-excerpt rejection without echoing raw values, promote safety, final overwrite prevention, summary-only promote, blocked candidate refusal, candidate destination tamper rejection, stale pass-report revalidation, promote rollback, unresolved `${LECTURE_RECORDINGS_ROOT}` config placeholders, and validator failures such as `segment_metadata_changed`, `correction_non_text_metadata_changed`, and `summary_too_short`.
-- Verification passed with `PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v` (`138` tests), `.venv/bin/python -m unittest tests.test_hermes_postprocess -v` (`20` tests), `.venv/bin/python -m compileall -q scripts tests src`, `git diff --check`, added-line static scan (`0` findings), and explicit read-only iCloud candidate discovery via `PYTHONPATH=src .venv/bin/python -m scripts.hermes_postprocess dry-run --lecture-root "/Users/geonha/Library/Mobile Documents/com~apple~CloudDocs/lecture_recordings" --repo-root /Users/geonha/DEV/lecture_stt --stable-for-sec 60`. The live dry-run returned candidate stem `260504DS_1` with correction and summary both needed; it wrote no iCloud final artifacts.
-- Not performed: launchd changes, existing-output overwrite, bulk backlog processing, `05_prompt` automatic edits, cleanup/delete/move, Hermes provider/privacy changes, push/tag/release.
 
 ### Approved downstream cleanup, runtime archive cleanup, and CI bootstrap
 - Resumed the approved overnight closeout from live state rather than handoff assumptions: `main` and `origin/main` were both at `6392762`, the worktree was clean before this batch, GitHub Actions runs for `main` were still `[]`, DB `integrity_check` was `ok`, `foreign_key_check` was empty, STT jobs were `DONE=31` / `ERROR=1`, and downstream started at total rows `152` with problem rows `4`.
@@ -78,7 +70,6 @@
 - 최종 verification은 `state/reports/verification-unittest-20260519T121554Z.log` 기준 unittest 108개 통과, compileall 통과, `git diff --check` 통과, added-line static scan finding 0건이다. 2차 독립 review도 blocking issue 없이 통과했다.
 
 ### 남은 고도화 사용자 결정 반영
-- 사용자가 지정한 `C/D/R/L/P/B/O` 결정값을 `.hermes/plans/2026-05-19_160615-lecture-stt-remaining-hardening.md`의 `User Decision Snapshot`에 반영했다.
 - 결정 경계는 read-only/dry-run 우선, canary 선행, downstream은 report/manual table만, runtime migration은 canary 이후, log cleanup은 dry-run/manifest만, benchmark 확대는 보류로 정리했다.
 - `P1=2`, `P2=2`, `P3=3`에 따라 `faster-whisper==1.2.1`은 production `.venv` upgrade 후보로 계획/rollback까지 검토하되, 실제 package 변경은 별도 승인 전 금지로 명시했다.
 - canonical STT model은 계속 `large-v3`로 유지하며, DB/file/config/launchd/package/model 변경, local commit, push/tag/release는 수행하지 않았다.
@@ -133,7 +124,6 @@
 - 모델은 변경하지 않았고, launchd/운영 DB/iCloud 실제 artifact에는 손대지 않았다.
 
 ### 운영 결정사항 정리와 OPERATIONS runbook 추가
-- 남은 고도화 workstream의 사용자 결정사항을 `.hermes/plans/2026-05-19_160615-lecture-stt-remaining-hardening.md`에 반영했다.
 - `docs/OPERATIONS.md`를 현재 운영 기준 문서로 추가했다. quick checklist와 상세 runbook을 함께 두고, downstream conflict, retry/failure, log retention, runtime path, model/package, canary 기준을 분리해 정리했다.
 - README 상단에 `docs/OPERATIONS.md` 링크와 legacy 경로 주의 문구를 추가했다.
 - 코드, DB, launchd, production `.venv`는 변경하지 않았다.
