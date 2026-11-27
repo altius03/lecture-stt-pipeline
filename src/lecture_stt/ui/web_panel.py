@@ -36,7 +36,14 @@ from lecture_stt.storage_v2.timetable import (
     TimetableNotFoundError,
     TimetableWriteDisabledError,
 )
-from lecture_stt.ui.web_panel_state import ControlState
+from lecture_stt.ui.web_panel_state import (
+    ControlState,
+    JobPreviewConflictError,
+    JobPreviewDisabledError,
+    JobPreviewNotFoundError,
+    QualityReviewConflictError,
+    QualityReviewNotFoundError,
+)
 
 
 _JS_SAFE_INTEGER_MAX = 9_007_199_254_740_991
@@ -146,6 +153,7 @@ def _state_stream_signature(snapshot: dict) -> str:
         "folders": snapshot.get("folders"),
         "actions": snapshot.get("actions"),
         "jobs_v2": snapshot.get("jobs_v2"),
+        "quality_review_open_count": snapshot.get("quality_review_open_count"),
         "processing_v2": snapshot.get("processing_v2"),
         "summary": {
             "current_job": summary.get("current_job"),
@@ -223,6 +231,8 @@ class RequestHandler(BaseHTTPRequestHandler):
         except UnicodeDecodeError as exc:
             raise ValueError("Invalid form request body") from exc
         parsed = parse_qs(body, keep_blank_values=True)
+        if any(len(values) != 1 for values in parsed.values()):
+            raise ValueError("Repeated form fields are not allowed")
         return {key: values[-1] if values else "" for key, values in parsed.items()}
 
     def _read_json_object(self) -> dict:
@@ -506,6 +516,83 @@ class RequestHandler(BaseHTTPRequestHandler):
         if proposal_id > _JS_SAFE_INTEGER_MAX:
             raise ValueError("proposal_id exceeds the public integer limit")
         return proposal_id, tuple(parts[1:])
+
+    @staticmethod
+    def _job_route(path: str) -> tuple[int, tuple[str, ...]] | None:
+        prefix = "/api/jobs/"
+        if not path.startswith(prefix):
+            return None
+        parts = path[len(prefix):].split("/")
+        if any(not part for part in parts) or not _CANONICAL_POSITIVE_INTEGER_RE.fullmatch(parts[0]):
+            raise ValueError("job_id must be a canonical positive integer")
+        job_id = int(parts[0])
+        if job_id > _JS_SAFE_INTEGER_MAX:
+            raise ValueError("job_id exceeds the public integer limit")
+        return job_id, tuple(parts[1:])
+
+    def _serve_job_transcript_preview(self, job_id: int) -> None:
+        assert STATE is not None
+        try:
+            payload = STATE.transcript_preview(job_id)
+        except JobPreviewDisabledError as exc:
+            self._api_error(403, str(exc))
+            return
+        except JobPreviewNotFoundError as exc:
+            self._api_error(404, str(exc))
+            return
+        except JobPreviewConflictError as exc:
+            self._api_error(409, str(exc))
+            return
+        except ValueError:
+            self._api_error(503, "전사 본문 조회 설정이 유효하지 않습니다.")
+            return
+        except sqlite3.Error:
+            self._api_error(503, "전사 본문을 조회할 수 없습니다.")
+            return
+        self._write_json(200, payload)
+
+    def _serve_job_quality_reviews(self, query: dict[str, list[str]]) -> None:
+        assert STATE is not None
+        try:
+            self._require_exact_query_keys(query, allowed=("limit", "offset"))
+            for values in query.values():
+                if len(values) != 1:
+                    raise ValueError("query parameters must not be repeated")
+            limit_literal = query.get("limit", ["50"])[0]
+            offset_literal = query.get("offset", ["0"])[0]
+            if not self._DECIMAL_RE.fullmatch(limit_literal) or not self._DECIMAL_RE.fullmatch(offset_literal):
+                raise ValueError("limit and offset must be canonical non-negative integers")
+            payload = STATE.quality_review_jobs(
+                limit=int(limit_literal), offset=int(offset_literal)
+            )
+        except ValueError as exc:
+            self._api_error(400, str(exc))
+            return
+        except sqlite3.Error:
+            self._api_error(503, "확인 요청을 조회할 수 없습니다.")
+            return
+        self._write_json(200, payload)
+
+    def _action_job_quality_review(self, job_id: int) -> None:
+        assert STATE is not None
+        try:
+            fields = self._read_form_fields()
+            if set(fields) != {"decision"}:
+                raise ValueError("decision field is required")
+            payload = STATE.record_quality_review_decision(job_id, fields["decision"])
+        except ValueError as exc:
+            self._api_error(400, str(exc))
+            return
+        except QualityReviewNotFoundError as exc:
+            self._api_error(404, str(exc))
+            return
+        except QualityReviewConflictError as exc:
+            self._api_error(409, str(exc))
+            return
+        except sqlite3.Error:
+            self._api_error(503, "확인 결과를 저장할 수 없습니다.")
+            return
+        self._write_json(200, payload)
 
     @staticmethod
     def _require_exact_query_keys(
@@ -1245,6 +1332,28 @@ class RequestHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if parsed.path == "/api/jobs/quality-reviews":
+            self._serve_job_quality_reviews(
+                parse_qs(parsed.query, keep_blank_values=True)
+            )
+            return
+
+        try:
+            job_route = self._job_route(parsed.path)
+        except ValueError as exc:
+            self._api_error(400, str(exc))
+            return
+        if job_route is not None:
+            job_id, action_parts = job_route
+            if parsed.query:
+                self._api_error(400, "job preview does not accept query parameters")
+                return
+            if action_parts == ("transcript-preview",):
+                self._serve_job_transcript_preview(job_id)
+                return
+            self._api_error(404, "Not Found")
+            return
+
         if parsed.path == "/api/storage-v2/title-suggestions":
             self._serve_title_review_list(
                 parse_qs(parsed.query, keep_blank_values=True)
@@ -1471,6 +1580,21 @@ class RequestHandler(BaseHTTPRequestHandler):
         if parsed.path.startswith("/api/"):
             if parsed.path == _RECOVERY_PATH or parsed.path.startswith(_RECOVERY_PATH + "/"):
                 self._handle_recovery(parsed.path, parsed.query, apply=True)
+                return
+            try:
+                job_route = self._job_route(parsed.path)
+            except ValueError as exc:
+                self._api_error(400, str(exc))
+                return
+            if job_route is not None:
+                job_id, action_parts = job_route
+                if parsed.query:
+                    self._api_error(400, "job actions do not accept query parameters")
+                    return
+                if action_parts == ("quality-review",):
+                    self._action_job_quality_review(job_id)
+                    return
+                self._api_error(404, "Not Found")
                 return
             archive_review_route = self._archive_review_case_route(parsed.path)
             if archive_review_route is not None:

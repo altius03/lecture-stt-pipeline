@@ -72,6 +72,25 @@ class QualityReport:
         return payload
 
 
+def requires_blocking_review(quality: Mapping[str, Any]) -> bool:
+    """Block only a missing or clearly truncated transcript; other scores are advisory."""
+    chars = quality.get("nonspace_chars")
+    segments = quality.get("nonempty_segments")
+    if chars == 0 or segments == 0:
+        return True
+    if str(quality.get("health", "")).lower() == "bad" and (
+        type(chars) is not int or chars < 1 or type(segments) is not int or segments < 1
+    ):
+        # Malformed or incomplete scorecards cannot safely distinguish a warning from lost text.
+        return True
+    try:
+        duration = float(quality.get("audio_duration_sec") or 0)
+        coverage = float(quality.get("coverage_ratio") or 0)
+    except (TypeError, ValueError):
+        return True
+    return duration >= 180 and coverage < 0.35
+
+
 def quality_scorecard_path(transcript_json_path: str | Path) -> Path:
     """Return the sidecar path for a transcript JSON quality scorecard."""
     path = Path(transcript_json_path)

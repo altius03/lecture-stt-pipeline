@@ -47,6 +47,10 @@ flowchart LR
     CODEX --> STAGINGOUT["학기·과목별 03_correction TXT/JSON + 04_summarize Markdown"]
     STAGINGOUT --> ARCHIVE
     DB --> PANEL["React 웹 패널"]
+    DB --> QUALITYAPI["완료 후 품질 확인 목록·결정"]
+    QUALITYAPI --> PANEL
+    PIPELINE -. "후속 처리 비활성: STT 완료" .-> TELEGRAM["Telegram 단일 알림"]
+    TDWORKER -. "후속 처리 종료 후 검토" .-> TELEGRAM
     PANEL -. "launchctl + kill switch" .-> GOOWNER
 
     DB -. "일관된 SQLite backup" .-> SNAPSHOT["독립 legacy DB snapshot"]
@@ -136,12 +140,11 @@ flowchart LR
 - 전사 결과는 `postprocess()`로 세그먼트와 전체 텍스트의 반복/노이즈/오인식 용어를 정리한다. 프로필의 `corrections: {}`는 범용 녹음에서 기존 강의 용어 교정을 끈다.
 - `quality_gate.evaluate()`가 반복도와, 길이를 알 수 있는 오디오의 전사 밀도·시간 커버리지를 계산해 메타데이터에 포함한다.
 - active semester에서 과목 route가 확정된 최종 산출물은 `02_transcripts/<semester>/<course_dir>/{base}.txt`, `{base}.json`으로 저장되고, 품질 메타데이터가 있으면 같은 폴더에 `{base}.quality.json` scorecard sidecar도 함께 저장된다. 과목 미확정·비강의 결과와 기존 평면 artifact는 `02_transcripts` 루트 호환 경계를 유지한다. Scorecard는 transcript 본문과 segment 배열을 제외한 metadata-only artifact이며 profile `key/version/config_sha256` snapshot을 포함할 수 있다.
-- 품질 `bad` 결과는 산출물을 보존하되 정상 성공으로 알리지 않고 DB 상태를 `NEEDS_REVIEW`로 기록하며 별도 review 알림을 보낸다.
+- 품질 `bad` 중 본문 누락·명확한 앞부분 절단만 `NEEDS_REVIEW`로 차단한다. 반복·밀도 등 휴리스틱 경고는 산출물을 `DONE`으로 보존하고 후속 작업을 계속 진행한다. 검토 알림은 후속 처리가 끝난 뒤 Telegram으로 보낸다. 후속 처리가 꺼져 있으면 STT `DONE`이 종료점이다.
 - STT 실행 실패는 기본 2회까지 retryable 상태(`전사 재시도 대기 n/2`)로 DB에 남기고, 다음 scan에서 즉시 재시도한다.
 - retry 한도 초과 후 terminal failure가 되면 오디오는 `99_errors`로 이동하고 DB 상태는 `ERROR`로 기록된다.
 - DB `engine_params`에는 `transcription_failures`, `transcription_max_retries`, `last_error_message`를 secret-redacted 형태로 남긴다.
-- 알림 계층은 `notification.provider` 설정과 `.env` secret을 기준으로 Telegram 또는 Discord provider를 선택한다.
-- `notification.dual_send_providers`를 사용하면 전환 기간 동안 다중 채널 shadow 전송을 할 수 있다.
+- 알림 계층은 `notification.provider` 설정과 `.env` secret을 기준으로 Telegram 또는 끄기를 선택한다. 과거 Discord 설정값은 호환 입력으로 받아 전송을 끈다.
 
 ## 메인 파이프라인 핵심 모듈
 - `src/lecture_stt/stt/main.py`: 설정 로드, 파이프라인 오케스트레이션, 상태 전이, 복구
@@ -159,7 +162,7 @@ flowchart LR
 - `src/lecture_stt/stt/postprocess.py`: 반복/점 노이즈 제거, 용어 교정
 - `src/lecture_stt/stt/profiles.py`: 프로필 스키마 검증, 활성 프로필 병합, 버전/hash snapshot
 - `src/lecture_stt/stt/quality_gate.py`: 품질 보고서와 metadata-only quality scorecard 생성
-- `src/lecture_stt/stt/notifier.py`: Telegram/Discord notifier, 중복 방지 마커, provider 팩토리
+- `src/lecture_stt/stt/notifier.py`: Telegram notifier, 중복 방지 마커, provider 팩토리
 - `src/lecture_stt/shared/utils.py`: macOS/Linux의 원자적 no-clobber rename으로 대상 파일을 덮어쓰지 않는 이동, atomic write, hash, pause flag 등 공용 함수. 장치가 다른 경로는 원본을 보존하고 이동을 거부한다.
 - 메인 워커는 `state/stt.lock` 파일 락으로 단일 인스턴스를 보장하고, claim 전에 원본이 사라진 경우는 다른 워커 선점 또는 외부 rename 가능성으로 보고 경고 후 skip한다.
 - `--plan-single-job RELATIVE_PATH`는 watch root 직속 regular single-link
@@ -422,7 +425,8 @@ flowchart LR
 - `src/lecture_stt/shared/db.py`가 SQLite 스키마와 접근 로직을 담당한다.
 - `jobs` 테이블은 STT 메인 파이프라인 상태를 저장한다.
 - 주요 상태는 `PENDING`, `PROCESSING`, `DONE`, `NEEDS_REVIEW`, `ERROR`다.
-- `NEEDS_REVIEW`는 전사 산출물은 유효하지만 자동 후속 처리 전에 사용자가 품질을 확인해야 하는 상태다. 시스템 실패인 `ERROR`와 구분한다.
+- `NEEDS_REVIEW`는 본문 누락·명확한 절단 등 자동 후속 처리를 막아야 하는 상태다. 그 외 품질 경고는 `DONE`에서 후속 처리하고 종료 후 별도 확인 대상으로 남긴다. 시스템 실패인 `ERROR`와 구분한다.
+- `quality_review_decisions`는 완료 후 확인 결과(`no_issue` 또는 `needs_correction`)를 job별로 저장한다. `needs_correction`은 확인 목록에 남고, 수동 처리 뒤 `no_issue`로 마무리할 수 있다. 확인 결과는 원본·교정·요약 산출물을 변경하지 않는다.
 - 진행률, ETA, dedupe 정보, 에러 메시지, 처리 시간까지 함께 저장한다.
 - 시작 시 `recover_processing_jobs()`가 중단된 `PROCESSING` 작업을 복구한다.
 - 복구 시 transcript metadata에 품질 보고서가 있는데 scorecard sidecar만 없는 저장 직후 crash window라면 metadata-only scorecard를 결정적으로 재생성한 뒤 검증한다. Sidecar가 malformed이거나 재생성할 수 없으면 산출물을 삭제하지 않고 `NEEDS_REVIEW`로 격리한다.
@@ -431,24 +435,26 @@ flowchart LR
 - 현재 주 제어 UI는 `src/lecture_stt/ui/web_panel.py`다.
 - 웹 제어 백엔드 상태/워커 제어 로직은 `src/lecture_stt/ui/web_panel_state.py`로 분리되어 있다.
 - 내장 HTTP 서버가 워커 시작, 일시정지, 재개, 중지, 로그 tail, DB 상태 조회를 제공한다.
-- 웹 제어 계층은 `config.yaml`의 `notification` 섹션도 수정할 수 있으며, 패널에서 텔레그램/디스코드/둘 다/끄기 선택을 저장한다.
+- 웹 제어 계층은 `config.yaml`의 `notification` 섹션도 수정할 수 있으며, 패널에서는 텔레그램/끄기만 선택한다.
 - React 빌드 산출물이 있으면 내장 HTTP 서버가 `/`에서 메인 웹 패널과 정적 자산을 서빙한다.
 - React 소스는 `frontend/web-panel/`에 있으며, Vite + React + TypeScript 기반으로 유지한다. 현재 client는 typed decoder, TanStack Query, Vitest와 Python static serving 경계가 이미 분리되어 있어 언어/프레임워크 재작성으로 확인된 리소스 이득이 없다. Controller/worker 경계와 idle I/O를 먼저 개선한다.
 - 프론트 데이터 계층은 `src/lib/panelApi.ts`, `src/lib/panelEvents.ts`, `src/lib/decodePanelState.ts`, `src/lib/logParser.ts`, `src/hooks/usePanelState.ts`, `src/hooks/usePanelLogs.ts`로 나뉜다.
 - 패널 UI는 `src/components/panel/`과 `src/components/ui/`의 로컬 재사용 컴포넌트로 나누고, `App.tsx`는 화면 조합만 담당한다.
-- 웹 패널의 시각 시스템은 루트 `DESIGN.md`와 `frontend/web-panel/tokens.css`를 정본으로 사용한다. 모든 화면은 같은 Pretendard/telemetry-mono 역할, cool cobalt light/dark palette, 4px spacing scale, focus/motion token을 공유하며 화면별 CSS에서 별도 palette나 font를 만들지 않는다.
+- 웹 패널의 시각 시스템은 루트 `DESIGN.md`와 `frontend/web-panel/tokens.css`, 현재 화면의 중립색 재정의 `frontend/web-panel/src/panel-redesign.css`를 따른다. 상태색은 실제 의미가 있을 때만 작은 표식에 사용하고 표·카드의 내부 정렬은 공통 열/간격을 사용한다.
 - 운영 shell은 장식적 번호 index가 아니라 hash route와 실제 대기 건수를 표시하는 command rail, 현재 화면·런타임·갱신·연결 상태를 묶은 상단 runtime strip, 화면별 workbench로 구성한다. 이 구조는 기존 API/DTO, TanStack Query, SSE/polling, guarded mutation 계약과 독립인 표시 계층이다.
 - panel state 조회와 action 이후 refetch/invalidation은 TanStack Query가 담당한다.
+- 설정 화면의 알림 스위치는 Telegram 연결 가능 여부를 보여 주며, 변경 시 `/api/notification`으로 `config.yaml`을 갱신한다. 자격정보가 없으면 실제 전송이 불가능한 상태로 표시한다.
 - 운영자는 패널에서 알림 채널을 직접 선택한다. 설정 저장 후 워커는 다음 작업을 선점할 때 바뀐 채널을 읽으며 현재 전사를 계속한다.
 - Python 워커 제어는 같은 사용자, 실행 경로, 설정 및 프로세스 신원을 확인한다. 이력 정리는 대상 완료 행의 건수와 지문을 확인한 뒤 적용하며 오류 복구 행과 활동 로그를 보존한다.
 - 실시간 갱신은 `GET /api/events` SSE를 우선 사용하며, 서버는 `state`, `log_chunk`, `log_reset` 이벤트를 스트리밍한다.
 - 클라이언트는 SSE가 연결되어 있는 동안 polling을 멈추고, 스트림이 실패하거나 브라우저가 `EventSource`를 지원하지 않으면 기존 `/api/state`, `/api/logs` polling으로 fallback 한다.
 - `/api/events`의 bare 요청은 기존처럼 state+logs를 함께 제공한다. 화면별 절전 경계에서는 `?streams=state`를 사용하며, 이 연결은 서버에서 `_log_stream_delta()`를 호출하지 않는다. `streams`는 `state`, `logs` 또는 둘의 쉼표 조합만 허용하고 빈 값·중복·알 수 없는 값은 400으로 거부한다.
-- React 패널은 hash 기반 `홈`, `처리 현황`, `녹음 보관함`, `검토 큐`, `시간표`, `설정` 화면 경계를 가진다. `처리 현황`에서만 Activity 로그 훅과 combined SSE를 활성화하고, 다른 화면은 state-only SSE를 사용한다. 처리 화면으로 전환할 때는 화면 상태에서 combined endpoint를 동기적으로 계산한 뒤 state/log 훅이 같은 singleton에 합류해 state-only와 combined `EventSource`가 중복 생성되지 않게 한다. Storage v2 패널은 해당 화면에서만 mount하며 analytics, recording library, archive review, timetable, title review와 unified feed query를 SSE snapshot에 합치지 않는다.
-- 검토 큐의 ‘누락 강의 복구’는 `jobs.sqlite3`의 `jobs`와 `transcript_postprocess_jobs`를 읽는다. `/api/postprocess/recovery`에서 미분류 작업과 운영자 확정 이력을 페이지 단위로 조회하고, 상세 화면은 활성 학기와 일치하는 복구 대상에 과목 후보를 표시한다. 단건 재등록 요청은 기존 CLI의 원전사 지문·학기·동시성 검사를 사용한다. 읽기 전용 응답에는 확정용 과목 목록과 지문을 제공하지 않는다. 생성과 최종 전달은 기존 후처리 워커가 담당한다.
-- command rail은 60rem 이상에서 workbench 왼쪽에 sticky하게 유지하고 그 아래에서는 상단 grid로 풀린다. 40rem 미만에서는 설명을 접은 2열 route grid로 바뀌며, clickable label은 한 줄을 유지한다. 문서 root는 `overflow-x: clip`을 사용하고 긴 storage path와 표 overflow는 각 evidence surface 안에 가둔다.
-- 화면이 바뀌어도 패널 state query와 기존 worker action 계약은 유지한다. 녹음 보관함은 legacy 운영 job count·folder 경계가 아니라 별도 Storage v2 list/detail API를 on-demand로 읽는다. List의 additive `capabilities.transcript_preview`는 구 응답·기본 비활성에서 false로 닫히고 explicit opt-in일 때만 true가 되어 미리보기 affordance를 노출한다. 전사 본문은 목록·상세에 포함하지 않고, 완료된 current job의 latest raw transcript에만 `미리보기 열기`로 요청한다. 추정 데이터나 웹 업로드 UI는 만들지 않는다.
-- 최근 작업과 로그는 분리 카드 대신 하나의 Activity 패널로 묶어, 최근 작업 행 선택과 해당 작업 중심의 한국어 운영 로그 확인을 한 흐름으로 제공한다.
+- React 패널의 주요 흐름은 `#home` 작업 현황 → `#job/<id>` 완료 본문·단계 상세, `#review` 완료 후 품질 확인, `#processing` 로그, `#settings` 운영 설정이다. 녹음 보관함과 시간표는 보조 화면으로 유지한다. 로그 화면에서만 Activity 로그 훅과 combined SSE를 활성화하고 다른 화면은 state-only SSE를 사용한다. Storage v2의 보관·시간표·통합 검토 query는 각 화면에서만 읽으며 SSE snapshot에 합치지 않는다.
+- 주 내비게이션은 넓은 화면에서 왼쪽 rail, 800px 이하에서 상단 가로 목록으로 바뀐다. 긴 작업 표와 로그 표는 각 카드 안에서만 가로 스크롤하고 문서 자체의 가로 넘침은 막는다.
+- 확인 화면의 ‘누락 강의 복구’는 `jobs.sqlite3`의 `jobs`와 `transcript_postprocess_jobs`를 읽는다. `/api/postprocess/recovery`에서 미분류 작업과 운영자 확정 이력을 페이지 단위로 조회하고, 상세 화면은 활성 학기와 일치하는 복구 대상에 과목 후보를 표시한다. 단건 재등록 요청은 기존 CLI의 원전사 지문·학기·동시성 검사를 사용한다. 읽기 전용 응답에는 확정용 과목 목록과 지문을 제공하지 않는다. 생성과 최종 전달은 기존 후처리 워커가 담당한다.
+- `/api/state.jobs_v2`는 최근 작업의 오디오·전사·교정·요약 상태와 품질 경고 metadata를 함께 준다. 완료 작업 본문은 목록에 넣지 않고 opt-in `GET /api/jobs/<id>/transcript-preview`에서만 읽는다. 본문 API는 `DONE` job의 설정된 transcript root 안 TXT만 no-follow, single-link, 크기·안정성·UTF-8 검사 후 반환한다. 기존 Storage v2 보관함은 별도 list/detail/preview API를 on-demand로 사용한다. 웹 업로드는 제공하지 않는다.
+- `/api/state.quality_review_open_count`는 최근 목록 밖을 포함한 열려 있는 완료 후 품질 확인 건수다. `GET /api/jobs/quality-reviews`는 완료·후속 처리 종료 후 미결정 또는 `needs_correction` 항목과 전사가 중단된 `NEEDS_REVIEW` 작업을 페이지로 조회한다. 중단된 작업은 사유와 로그로 연결하고 결과 결정 API를 적용하지 않는다. `POST /api/jobs/<id>/quality-review`는 완료 작업의 `문제 없음` 또는 `교정 필요` 결정을 저장한다. 같은 결정은 멱등이고 `needs_correction`에서 `no_issue`로만 마무리할 수 있다. 본문/품질 확인 API는 기존 Host/Origin 경계를 따른다.
+- 로그 화면은 작업·단계·수준·메시지 검색으로 운영 기록을 좁혀 보며, raw 로그는 별도 접기 영역에 유지한다.
 - 현재 패널은 `NEEDS_REVIEW`를 `확인 필요`로 집계·표시하며 `ERROR`와 분리한다. 구형 schema v2 payload에 해당 count가 없으면 0으로 해석한다.
 - Activity 패널의 로그 영역은 raw log를 그대로 유지하되, `logParser.ts`가 반복 패턴을 파싱해 과목/날짜/요일/교시를 포함한 한국어 운영 로그 뷰와 오류 전용 뷰를 함께 제공한다.
 - pause/resume는 별도 IPC 대신 `state/paused` 플래그 파일로 제어한다.
@@ -483,7 +489,7 @@ flowchart LR
 - 품질 점수는 latest non-archived `quality_scorecard` artifact만 읽는다. Storage key와 상대경로를 검증하고 records root dirfd 아래 각 path component를 `O_NOFOLLOW`로 열어 regular single-link 파일인지 확인한 뒤 최대 256KiB(호출 상한 1MiB)를 stable metadata 상태에서 읽는다. 실제 bytes/SHA-256을 DB artifact metadata와 대조하고 exact integer schema version을 포함한 scorecard 계약을 검증하며, 깊은 JSON·변조·malformed·비현실적으로 큰 duration은 해당 row의 `quality_invalid`로 격리한다. Optional audio/processing duration은 부분합과 함께 각각의 known/jobs 표본 수를 노출한다. Scorecard의 transcript/correction/summary 본문, summary 문구, artifact 경로, digest, error message와 engine parameter는 API에 반환하지 않는다.
 - Analytics DB 연결은 SQLite `mode=ro`로 table/schema write를 금지하면서 WAL-visible current row를 읽는다. Main DB와 WAL의 bytes·size·mtime·ctime은 읽기 전후 불변이어야 한다. SQLite가 read lock을 조정하며 `-shm` bytes/mtime/ctime을 바꿀 수 있으므로 이 sidecar는 identity·mode·link count·size 불변만 보장하며, filesystem byte-for-byte immutable snapshot 계약으로 표현하지 않는다.
 - 점수가 없는 artifact와 malformed/unsafe scorecard는 각각 `quality_missing`, `quality_invalid`로 분리하고 평균 점수 분모에서 숨기지 않는다. 분류는 `recording_contexts.is_selected=1`만 확정 분류로 계산하며, suggested classification은 합치지 않고 `미분류` bucket과 coverage로 남긴다.
-- React 홈은 Grafana식 기간·분포·추이 요약과 Falcon식 attention triage를 결합한 관제 화면으로 구성한다. 전사량·완료율·검토/오류·평균 품질 KPI, 처리량 추이, 품질 histogram, 상태/확정 분류 분포, 데이터 coverage/freshness, 최근 확인 항목을 표시한다. Attention 행은 같은 `storage_key`의 recording library detail로 명시적으로 연결하고, detail이 목록 첫 페이지 밖에 있어도 별도 read-only query로 유지한다. 새 chart/runtime 의존성이나 웹 업로드 UI는 추가하지 않고 기존 React+TypeScript, TanStack Query, semantic table/CSS bar 경계를 유지한다.
+- `/api/storage-v2/analytics/transcriptions`는 기존 읽기 전용 집계 API로 남는다. 현재 첫 화면은 기간 차트 대신 실제 작업과 단계별 상태, 확인 요청·오류 수를 우선 보여 준다. 로그 화면은 작업·단계·수준 필터와 원문 로그를 함께 제공한다.
 
 ## 학기 manifest와 전사 자동 후처리
 - 현재 generator는 저장된 ChatGPT 로그인 세션의 `codex exec`만 사용하며 별도 LLM API 키나 직접 HTTP API 경로가 없다. 다만 교정·요약 입력인 전사 내용은 Codex 서비스로 전송된다.
@@ -566,7 +572,7 @@ flowchart LR
 - 제목 plan 응답과 snapshot에는 제안 제목·NFC storage key·revision·상태·confidence만 남고 transcript 원문/발췌, artifact path, content digest, artifact/job/recording numeric id는 나오지 않는다. Apply plan digest에는 반환하지 않는 artifact identity/path/hash/bytes뿐 아니라 recorded timestamp, current title, selected context, active classification metadata를 포함해 결과 제목이 우연히 같아도 inference 입력 변경을 stale plan으로 거부한다. Apply는 독립 enable, allow-write, expected count, exact digest를 요구하고 read-only preflight 뒤 `BEGIN IMMEDIATE` 안에서 plan을 다시 만들며 commit 직전 파일/DB를 한 번 더 읽는다. Confirmation도 records root를 필수로 받고 현재 metadata와 transcript로 원래 제목 제안을 다시 계산해 proposal과 대조한다. 이 재계산 digest와 linked review/artifact/classification evidence는 lifecycle 전이 뒤에도 재구성 가능하게 구성해 read-only/exclusive/pre-commit 및 confirmed 멱등 replay에서 모두 검증한다. 생성·confirm·reject는 proposal/review만 바꾸고 canonical title/context/manifest는 바꾸지 않는다.
 - `recording_classification_materializations`는 confirmation과 별개의 canonical-write journal이다. 이전/새 title·context row, confirmation/materialization plan digest, old/new manifest digest, 닫힌 metadata-only plan JSON과 `prepared`/`applied` 상태를 기록한다. Proposal touch trigger는 recursive trigger에서도 재귀하지 않으며 materialization은 plan의 target을 현재 proposal에서 다시 계산해 같은 시각의 stale mutation도 쓰기 전에 차단한다. 후속 materialization으로 대체된 applied journal의 재실행은 successor chain 전체와 최신 manifest를 검증한 뒤 `skipped`로 끝난다. Storage v2 read-only 연결도 main DB의 symlink·hardlink·비정규 파일과 unsafe sidecar를 거부하고 SQLite가 연 inode를 재확인한다.
 - `recording_title_materializations`는 confirmed content-title에 대한 별도 canonical-write journal이다. 이전 title row는 비-current 이력으로 그대로 두고 새 `system` title row만 current로 전환하며, closed private plan에는 confirmation digest, proposal/review identity와 resolved 시각, transcript artifact locator/hash/bytes/revision, old/new manifest digest를 보존한다. Replay는 이 증거와 현재 recorded time/context/classification으로 inference를 다시 계산한다. Public plan은 제목·storage key·count·digest만 내보낸다. `prepared`는 old/new manifest 중 하나만 허용하고 `applied`는 새 manifest와 새 current title만 허용한다. 일반 confirmed replay는 materialization 뒤 current-title drift로 거부되지만 journal 기반 materialized replay는 원래 current-title evidence를 재구성한 뒤 실제 target title/manifest를 별도로 검증해 `skipped`로 끝난다.
-- 현재 React web panel은 runtime SSE `PanelState` 계약과 Storage v2 on-demand query를 분리한다. 기존 `/api/state`·`/api/events` 흐름은 그대로 유지하고, analytics, recording library, archive evidence review, 시간표·분류와 content-title 검토는 각각의 별도 API를 직접 조회한다. Timetable/title review UI는 suggested proposal 상세, guarded reject, confirmation plan/apply를 연결하고 archive evidence UI도 bounded case/revision metadata와 guarded status/promotion 흐름을 연결한다. 검토 index만 server-canonical unified feed를 한 번 조회하며 exact deep link 뒤의 상세와 mutation은 기존 source workbench를 다시 사용한다. Transcript preview는 별도 query로만 읽고 녹음 선택 변경·닫기·unmount에서 요청과 캐시를 제거하며, Clipboard API가 제한되는 Tailscale HTTP 접속에서는 브라우저의 legacy copy fallback을 사용한다.
+- 현재 React web panel은 runtime SSE `PanelState` 계약과 보관함·시간표·검토의 on-demand query를 분리한다. 기존 `/api/state`·`/api/events` 흐름을 유지하고, 작업 완료 본문과 전체 품질 확인 목록은 별도 API로 읽는다. 기존 Storage v2 timetable/title/archive workbench와 guarded mutation은 보조 검토 영역에서 유지한다. Storage v2 녹음 미리보기는 별도 query로만 읽고 선택 변경·닫기·unmount에서 요청과 캐시를 제거하며, Clipboard API가 제한되는 Tailscale HTTP 접속에서는 브라우저의 legacy copy fallback을 사용한다.
 - 실제 원본이 이미 정리된 과거 recording은 `source_state=missing`과 metadata marker로 파생 이력을 보존한다. Plan과 manifest는 transcript/content 계열 key를 어느 깊이에서도 허용하지 않는다. CLI apply는 write/count/plan SHA-256/missing-source 확인 플래그를 요구하며 현재 운영 데이터에는 실행하지 않았다.
 - `verify_library()`는 exclusive records-root lock과 단일 SQLite read transaction 안에서 canonical schema/checksum, `quick_check`, foreign key, manifest↔recording/title/context/all-active-jobs/selected-engine/artifact/review/import-map을 비교한다. Materialization journal의 closed plan/digest/proposal/revision chain/selection 상태와 latest manifest digest도 교차 검증하며 `prepared`는 복구가 필요한 비정상 완료 상태로 보고한다. Recording-level source와 ingest hash/size/MIME, job artifact ownership과 `jobs/<job_key>/` namespace도 직접 확인한다. 파일은 record-root dirfd 기준 `openat` + `O_NOFOLLOW`로 열어 같은 descriptor에서 inode/link/size/hash를 확인하며, root identity 교체와 DB에 없는 file/directory/symlink/special entry, orphan record, stale staging, 예상하지 않은 lock을 오류로 보고한다. 재귀 검사는 깊이·entry 상한을 둔다. `read_library_snapshot()`은 verifier/CLI용 요약 projection으로 유지하고, 웹 패널의 `library.py`는 metadata-only list/detail과 별도 gated transcript preview를 제공한다. Preview는 DB가 records root 안에 있으면 거부하고 shared root lock과 SQLite read snapshot을 함께 유지한 채 canonical `jobs/<job_key>/transcript.txt`와 `text/plain` MIME essence를 요구한다. 모든 path component를 `O_NOFOLLOW`로 열어 single-link regular file, stable stat, configured size 상한, DB bytes/SHA-256, strict UTF-8과 NUL 부재를 확인하며 historical recovery의 charset/provenance MIME parameter는 허용한다. 응답에는 artifact path/hash와 내부 numeric id를 포함하지 않는다.
 - manifest 기반 단일 작업 Python worker 계약과 작업을 소유하지 않는 Go

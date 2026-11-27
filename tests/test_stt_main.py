@@ -159,6 +159,9 @@ class SttConfigValidationTests(unittest.TestCase):
 
 
 class _FakeNotifier:
+    def is_enabled(self) -> bool:
+        return True
+
     def notify_detected(self, payload: dict) -> None:
         pass
 
@@ -1138,6 +1141,48 @@ class SttPipelineBehaviorTests(unittest.TestCase):
         self.assertEqual(len(notifier.errors), 0)
         self.assertEqual(len(notifier.transcript_generated), 0)
 
+    def test_soft_bad_quality_finishes_and_reviews_after_completion(self) -> None:
+        source_path = self.watch_dir / "soft-review.m4a"
+        source_path.write_bytes(b"fake-audio")
+        notifier = _RecordingNotifier()
+        self.pipeline.notifier = notifier  # type: ignore[assignment]
+
+        with mock.patch.object(stt_main, "quality_evaluate", return_value=_BadQualityReport()):
+            self.pipeline.process_job(source_path)
+
+        row = self.pipeline.conn.execute(
+            "SELECT id, status, current_step, engine_params, canonical_base FROM jobs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual(row["status"], stt_main.STATUS_DONE)
+        self.assertEqual(row["current_step"], "전체 완료")
+        self.assertEqual(len(notifier.successes), 1)
+        self.assertFalse(notifier.successes[0]["quality_health"])
+        self.assertFalse(notifier.successes[0]["quality_summary"])
+        self.assertEqual(len(notifier.reviews), 1)
+        self.assertTrue(notifier.reviews[0]["completed"])
+
+        self.pipeline.conn.execute(
+            "INSERT INTO transcript_postprocess_jobs (source_job_id, logical_stem, activation_cutoff, "
+            "route_method, source_txt_path, source_txt_sha256, source_json_path, source_json_sha256, "
+            "generator_backend, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (int(row["id"]), "soft-review", "2026-01-01", "test", "a.txt", "x", "a.json", "x", "fake", "now", "now"),
+        )
+        notifier.reviews.clear()
+        self.pipeline._notify_completed_quality_if_downstream_disabled(
+            job_id=int(row["id"]), source_path=source_path,
+            canonical_base=str(row["canonical_base"]), metadata=json.loads(row["engine_params"]),
+        )
+        self.assertEqual(notifier.reviews, [])
+        self.pipeline.conn.execute(
+            "UPDATE transcript_postprocess_jobs SET status = 'DELIVERED' WHERE source_job_id = ?",
+            (int(row["id"]),),
+        )
+        self.pipeline._notify_completed_quality_if_downstream_disabled(
+            job_id=int(row["id"]), source_path=source_path,
+            canonical_base=str(row["canonical_base"]), metadata=json.loads(row["engine_params"]),
+        )
+        self.assertEqual(len(notifier.reviews), 1)
+
     def test_validate_output_requires_quality_scorecard_sidecar(self) -> None:
         txt_path = self.transcript_dir / "missing-sidecar.txt"
         json_path = self.transcript_dir / "missing-sidecar.json"
@@ -1363,7 +1408,20 @@ class SttPipelineBehaviorTests(unittest.TestCase):
             },
         )
 
-    def test_deduped_bad_historical_quality_remains_needs_review(self) -> None:
+    def test_replay_keeps_operator_hold_on_nonblocking_bad_quality(self) -> None:
+        with mock.patch.object(stt_main, "quality_evaluate", return_value=_BadQualityReport()):
+            result = self.pipeline.process_job(self._write_stable_source("held-advisory.m4a", b"held audio"))
+        source_id = result["job_id"]
+        self.assertEqual(result["status"], "completed")
+        stt_main.db.set_status(self.pipeline.conn, source_id, stt_main.STATUS_NEEDS_REVIEW)
+        with mock.patch.object(self.pipeline.worker, "transcribe_file") as transcribe:
+            copy = self.pipeline.process_job(self._write_stable_source("held-advisory-copy.m4a", b"held audio"))
+        transcribe.assert_not_called()
+        self.assertEqual(copy["status"], "needs_review")
+        row = stt_main.db.get_job(self.pipeline.conn, copy["job_id"])
+        self.assertEqual(json.loads(row["engine_params"])["review_hold_source_job_id"], source_id)
+
+    def test_deduped_soft_bad_historical_quality_completes_with_review(self) -> None:
         original_path = self.watch_dir / "bad-history-original.m4a"
         original_path.write_bytes(b"bad-history-audio")
         self.pipeline.process_job(original_path)
@@ -1382,8 +1440,8 @@ class SttPipelineBehaviorTests(unittest.TestCase):
         self.pipeline.conn.execute(
             "UPDATE jobs SET status = ?, current_step = ?, error_message = ? WHERE id = ?",
             (
-                stt_main.STATUS_NEEDS_REVIEW,
-                "품질 검토 필요",
+                stt_main.STATUS_DONE,
+                "전체 완료",
                 "과거 품질 검토 대상",
                 int(original_row["id"]),
             ),
@@ -1406,12 +1464,13 @@ class SttPipelineBehaviorTests(unittest.TestCase):
             "SELECT status, current_step, error_message FROM jobs "
             "WHERE canonical_base = 'bad-history-copy'"
         ).fetchone()
-        self.assertEqual(row["status"], stt_main.STATUS_NEEDS_REVIEW)
-        self.assertEqual(row["current_step"], "품질 검토 필요")
-        self.assertIn("과거 품질", row["error_message"])
+        self.assertEqual(row["status"], stt_main.STATUS_DONE)
+        self.assertEqual(row["current_step"], "전체 완료")
+        self.assertIsNone(row["error_message"])
         self.assertEqual(len(notifier.reviews), 1)
-        self.assertEqual(notifier.successes, [])
-        self.assertEqual(notifier.transcript_generated, [])
+        self.assertTrue(notifier.reviews[0]["completed"])
+        self.assertEqual(len(notifier.successes), 1)
+        self.assertEqual(len(notifier.transcript_generated), 1)
 
     def test_process_job_skips_missing_source_when_competing_job_exists(self) -> None:
         source_path = self.watch_dir / "race.m4a"
@@ -1501,8 +1560,8 @@ class SttPipelineBehaviorTests(unittest.TestCase):
         # Seed recent results in the isolated fixture. The child processes must
         # reuse the existing reviewed result without running a real speech model.
         original = self._write_stable_source("original.m4a", b"reviewed audio")
-        with mock.patch.object(stt_main, "quality_evaluate", return_value=_BadQualityReport()):
-            self.pipeline.process_job(original)
+        with mock.patch.object(stt_main.STTWorker, "_wav_duration_sec", return_value=2755.0, create=True):
+            self.assertEqual(self.pipeline.process_job(original)["status"], "needs_review")
         _, bad_id, missing = self._plan_retry_after_transient_failure("missing.m4a")
         missing.unlink()
         staged = self.pipeline.staging_dir / "copy.m4a"
@@ -2124,6 +2183,48 @@ class SttPipelineBehaviorTests(unittest.TestCase):
         self.assertEqual(recovered["progress_pct"], 100)
         self.assertIn("전사량", recovered["error_message"])
 
+    def test_startup_recovery_persists_soft_quality_for_completed_review(self) -> None:
+        canonical_audio = self.audio_dir / "soft-recovery.m4a"
+        canonical_audio.write_bytes(b"claimed-audio")
+        txt_path = self.transcript_dir / "soft-recovery.txt"
+        json_path = self.transcript_dir / "soft-recovery.json"
+        metadata = self._quality_metadata("soft-recovery", txt_path, json_path)
+        metadata["quality"].update({
+            "health": "bad", "quality_score": 35,
+            "summary": "반복 비율이 높음", "nonempty_segments": 1, "nonspace_chars": 12,
+        })
+        txt_path.write_text("반복되는 전사 본문", encoding="utf-8")
+        json_path.write_text(
+            json.dumps({"segments": [{"text": "반복되는 전사 본문"}], "metadata": metadata}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        stt_main.write_quality_scorecard(json_path, metadata)
+        self.pipeline.conn.execute(
+            "INSERT INTO jobs (status, created_at, updated_at, started_at, orig_inbox_path, orig_name, "
+            "canonical_base, canonical_audio_path, transcript_txt_path, transcript_json_path, engine_params) "
+            "VALUES (?, datetime('now'), datetime('now'), datetime('now'), ?, ?, ?, ?, ?, ?, ?)",
+            (
+                stt_main.STATUS_PROCESSING, str(self.watch_dir / "soft-recovery.m4a"),
+                "soft-recovery.m4a", "soft-recovery", str(canonical_audio), str(txt_path),
+                str(json_path), json.dumps({"transcription_failures": 1}),
+            ),
+        )
+        self.pipeline.conn.commit()
+        notifier = _RecordingNotifier()
+        self.pipeline.notifier = notifier  # type: ignore[assignment]
+
+        self.pipeline.startup_recovery()
+
+        recovered = self.pipeline.conn.execute(
+            "SELECT status, engine_params FROM jobs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        params = json.loads(recovered["engine_params"])
+        self.assertEqual(recovered["status"], stt_main.STATUS_DONE)
+        self.assertEqual(params["quality"], metadata["quality"])
+        self.assertEqual(params["transcription_failures"], 1)
+        self.assertEqual(len(notifier.reviews), 1)
+        self.assertTrue(notifier.reviews[0]["completed"])
+
     def test_startup_recovery_rebuilds_missing_quality_scorecard_before_done(self) -> None:
         canonical_audio = self.audio_dir / "missing-recovery-sidecar.m4a"
         canonical_audio.write_bytes(b"claimed-audio")
@@ -2313,7 +2414,7 @@ class SttPipelineBehaviorTests(unittest.TestCase):
         self.assertEqual(row_metadata["transcription_failures_before_success"], 1)
         self.assertNotIn("terminal_error_recovery", row_metadata)
 
-    def test_retry_bad_quality_preserves_terminal_recovery_audit(self) -> None:
+    def test_retry_soft_bad_quality_completes_and_preserves_terminal_recovery_audit(self) -> None:
         source_path = self.watch_dir / "retry-bad-quality.m4a"
         source_path.write_bytes(b"fake-audio")
         worker = _FailingWorker(self.tmp_dir, failures_before_success=1)
@@ -2350,7 +2451,7 @@ class SttPipelineBehaviorTests(unittest.TestCase):
             "SELECT status, engine_params, transcript_json_path FROM jobs ORDER BY id DESC LIMIT 1"
         ).fetchone()
         self.assertIsNotNone(row)
-        self.assertEqual(row["status"], stt_main.STATUS_NEEDS_REVIEW)
+        self.assertEqual(row["status"], stt_main.STATUS_DONE)
         row_metadata = json.loads(row["engine_params"])
         self.assertEqual(
             row_metadata["terminal_error_recovery"]["plan_sha256"],

@@ -23,6 +23,7 @@ from lecture_stt.shared import db
 from lecture_stt.shared.paths import (
     env_file, iter_transcript_files, package_env, resolve_config_path, runtime_env, venv_python,
 )
+from lecture_stt.stt.quality_gate import requires_blocking_review
 from lecture_stt.storage_v2.analytics import (
     disabled_transcription_analytics,
     read_transcription_analytics,
@@ -66,7 +67,9 @@ import psutil
 import yaml
 
 
-NOTIFICATION_SELECTIONS = ("telegram", "discord", "both", "disabled")
+NOTIFICATION_SELECTIONS = ("telegram", "disabled")
+_QUALITY_REVIEW_DECISIONS = frozenset({"no_issue", "needs_correction"})
+_POSTPROCESS_TERMINAL_STATUSES = frozenset({"DELIVERED", "SKIPPED", "UNROUTED"})
 DEFAULT_CONTROLLER_LABEL = "com.geonha.lecture-stt-controller"
 CONTROLLER_LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 CONTROLLER_PID_SCHEMA = "lecture-stt/controller-pid@2"
@@ -97,6 +100,26 @@ class _DarwinProcBsdInfo(ctypes.Structure):
         ("pbi_start_tvsec", ctypes.c_uint64),
         ("pbi_start_tvusec", ctypes.c_uint64),
     ]
+
+
+class JobPreviewNotFoundError(LookupError):
+    pass
+
+
+class JobPreviewDisabledError(RuntimeError):
+    pass
+
+
+class JobPreviewConflictError(RuntimeError):
+    pass
+
+
+class QualityReviewNotFoundError(LookupError):
+    pass
+
+
+class QualityReviewConflictError(RuntimeError):
+    pass
 
 
 def _prometheus_escape_label(value: str) -> str:
@@ -261,7 +284,6 @@ class ControlState:
             "send_success": True,
             "send_review": True,
             "send_failure": True,
-            "dual_send_providers": [],
         }
 
     def _notification_config(self) -> dict[str, Any]:
@@ -275,19 +297,7 @@ class ControlState:
         runtime_env = self._runtime_env()
         return {
             "telegram": bool(runtime_env.get("TELEGRAM_BOT_TOKEN") and runtime_env.get("TELEGRAM_CHAT_ID")),
-            "discord": bool(runtime_env.get("DISCORD_WEBHOOK_URL")),
         }
-
-    @staticmethod
-    def _normalize_dual_send(value: Any) -> list[str]:
-        if value is None:
-            return []
-        if isinstance(value, str):
-            items = [item.strip().lower() for item in value.split(",")]
-            return [item for item in items if item]
-        if isinstance(value, list):
-            return [str(item).strip().lower() for item in value if str(item).strip()]
-        return []
 
     def _notification_selection(self, availability: dict[str, bool]) -> str:
         notification_cfg = self._notification_config()
@@ -295,29 +305,20 @@ class ControlState:
             return "disabled"
 
         provider = str(notification_cfg.get("provider", "auto") or "auto").strip().lower()
-        dual_send = set(self._normalize_dual_send(notification_cfg.get("dual_send_providers")))
 
         if provider == "noop":
             return "disabled"
-        if {"telegram", "discord"}.issubset(dual_send | {provider}):
-            return "both"
         if provider == "telegram":
             return "telegram"
-        if provider == "discord":
-            return "discord"
         if provider == "auto":
             if availability["telegram"]:
                 return "telegram"
-            if availability["discord"]:
-                return "discord"
         return "disabled"
 
     @staticmethod
     def _notification_label(selection: str) -> str:
         labels = {
-            "telegram": "텔레그램만",
-            "discord": "디스코드만",
-            "both": "둘 다",
+            "telegram": "텔레그램",
             "disabled": "끄기",
         }
         return labels.get(selection, "끄기")
@@ -327,21 +328,9 @@ class ControlState:
         return [
             {
                 "id": "telegram",
-                "label": "텔레그램만",
+                "label": "텔레그램",
                 "description": "TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID가 필요합니다.",
                 "available": availability["telegram"],
-            },
-            {
-                "id": "discord",
-                "label": "디스코드만",
-                "description": "DISCORD_WEBHOOK_URL이 필요합니다.",
-                "available": availability["discord"],
-            },
-            {
-                "id": "both",
-                "label": "둘 다",
-                "description": "텔레그램과 디스코드 secret이 모두 필요합니다.",
-                "available": availability["telegram"] and availability["discord"],
             },
             {
                 "id": "disabled",
@@ -372,25 +361,18 @@ class ControlState:
         availability = self._notification_availability()
         if normalized == "telegram" and not availability["telegram"]:
             raise RuntimeError("텔레그램 secret이 없어 선택할 수 없습니다.")
-        if normalized == "discord" and not availability["discord"]:
-            raise RuntimeError("디스코드 webhook이 없어 선택할 수 없습니다.")
-        if normalized == "both" and not (availability["telegram"] and availability["discord"]):
-            raise RuntimeError("둘 다를 선택하려면 텔레그램과 디스코드 설정이 모두 필요합니다.")
 
         config_data = self._load_config()
         notification_cfg = self._notification_defaults()
         current_notification = config_data.get("notification")
         if isinstance(current_notification, dict):
             notification_cfg.update(current_notification)
+        notification_cfg.pop("dual_send_providers", None)
 
         if normalized == "telegram":
-            notification_cfg.update({"provider": "telegram", "enabled": True, "dual_send_providers": []})
-        elif normalized == "discord":
-            notification_cfg.update({"provider": "discord", "enabled": True, "dual_send_providers": []})
-        elif normalized == "both":
-            notification_cfg.update({"provider": "telegram", "enabled": True, "dual_send_providers": ["discord"]})
+            notification_cfg.update({"provider": "telegram", "enabled": True})
         else:
-            notification_cfg.update({"provider": "noop", "enabled": False, "dual_send_providers": []})
+            notification_cfg.update({"provider": "noop", "enabled": False})
 
         config_data["notification"] = notification_cfg
         directory_synced = self._save_config(config_data)
@@ -2530,25 +2512,22 @@ class ControlState:
             for table in ("deliveries", "transcript_deliveries", "transcript_postprocess_jobs")
             if table in tables
         )
-        # The worker can be enabled by edits outside this long-lived panel. Check
-        # the same boolean contract at plan and apply under the DB transaction.
-        from lecture_stt.stt.main import _parse_bool
-
-        try:
-            config = self._load_config()
-            if not config:
-                raise ValueError("설정 파일이 비어 있습니다.")
-            if self._configured_db_path(config) != self.db_path:
-                raise ValueError("작업 DB 경로가 변경되었습니다.")
-            delivery = config.get("transcript_delivery", {})
-            if not isinstance(delivery, dict):
-                raise ValueError("후처리 설정이 올바르지 않습니다.")
-            delivery_enabled = _parse_bool("transcript_delivery.enabled", delivery.get("enabled", False))
-        except (OSError, ValueError, yaml.YAMLError) as exc:
-            raise ValueError("현재 작업 DB와 후처리 설정을 확인할 수 없어 정리를 중단했습니다.") from exc
+        # Re-read policy on both the preview and the guarded write.
+        delivery_enabled = self._current_postprocess_enabled()
         if delivery_enabled:
             protected.append("SELECT id FROM jobs WHERE status = 'DONE'")
-        if "deduped_from_job_id" in {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}:
+        job_columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
+        if "engine_params" in job_columns and not delivery_enabled:
+            conn.create_function("needs_quality_decision", 1, self._needs_quality_decision, deterministic=True)
+            undecided = (
+                "AND NOT EXISTS (SELECT 1 FROM quality_review_decisions q "
+                "WHERE q.job_id = jobs.id AND q.decision = 'no_issue')"
+                if "quality_review_decisions" in tables else ""
+            )
+            protected.append(
+                "SELECT id FROM jobs WHERE status='DONE' AND needs_quality_decision(engine_params) " + undecided
+            )
+        if "deduped_from_job_id" in job_columns:
             protected.append(
                 "SELECT jobs.deduped_from_job_id FROM jobs JOIN protected ON jobs.id = protected.id "
                 "WHERE jobs.deduped_from_job_id IS NOT NULL"
@@ -2575,6 +2554,7 @@ class ControlState:
     def clear_history(self, digest: str) -> tuple[int, str]:
         try:
             with sqlite3.connect(self.db_path, timeout=3) as conn:
+                conn.execute("PRAGMA foreign_keys = ON")
                 conn.execute("BEGIN IMMEDIATE")
                 query = self._clearable_history_query(conn)
                 plan = self._history_plan(conn, query)
@@ -2718,6 +2698,407 @@ class ControlState:
             "eta_label": ControlState._format_eta(eta_value),
         }
 
+    @staticmethod
+    def _quality_from_engine_params(raw: Any) -> dict[str, Any]:
+        try:
+            metadata = json.loads(raw) if isinstance(raw, str) else {}
+        except (TypeError, ValueError):
+            return {}
+        quality = metadata.get("quality") if isinstance(metadata, dict) else None
+        return quality if isinstance(quality, dict) else {}
+
+    @classmethod
+    def _needs_quality_decision(cls, engine_params: Any) -> bool:
+        quality = cls._quality_from_engine_params(engine_params)
+        return str(quality.get("health") or "").lower() == "bad" and not requires_blocking_review(quality)
+
+    @staticmethod
+    def _delivery_enabled(config: dict) -> bool:
+        from lecture_stt.stt.main import _parse_bool
+
+        delivery = config.get("transcript_delivery", {})
+        if not isinstance(delivery, dict):
+            raise ValueError("후처리 설정이 올바르지 않습니다.")
+        return _parse_bool("transcript_delivery.enabled", delivery.get("enabled", False))
+
+    def _postprocess_enabled(self) -> bool:
+        return self._delivery_enabled(self.config_data)
+
+    def _current_postprocess_enabled(self) -> bool:
+        try:
+            config = self._load_config()
+            if not config or self._configured_db_path(config) != self.db_path:
+                raise ValueError("설정된 작업 DB를 확인할 수 없습니다.")
+            return self._delivery_enabled(config)
+        except (OSError, ValueError, yaml.YAMLError) as exc:
+            raise ValueError("현재 작업 DB와 후처리 설정을 확인할 수 없습니다.") from exc
+
+    def _recent_job_pipeline_rows(self, job_ids: list[int]) -> dict[int, sqlite3.Row]:
+        if not job_ids or not getattr(self, "db_path", None):
+            return {}
+        placeholders = ",".join("?" for _ in job_ids)
+        try:
+            with sqlite3.connect(self.db_path, timeout=3.0) as conn:
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA busy_timeout = 3000")
+                has_decisions = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                    "AND name = 'quality_review_decisions'"
+                ).fetchone() is not None
+                decision_columns = (
+                    "q.decision, q.decided_at"
+                    if has_decisions else "NULL AS decision, NULL AS decided_at"
+                )
+                decision_join = (
+                    "LEFT JOIN quality_review_decisions AS q ON q.job_id = j.id"
+                    if has_decisions else ""
+                )
+                rows = conn.execute(
+                    "SELECT j.id, j.engine_params, p.status AS postprocess_status, "
+                    "p.correction_status, p.summary_status, " + decision_columns + " "
+                    "FROM jobs AS j LEFT JOIN transcript_postprocess_jobs AS p "
+                    "ON p.source_job_id = j.id " + decision_join + " "
+                    f"WHERE j.id IN ({placeholders})",
+                    job_ids,
+                ).fetchall()
+            return {int(row["id"]): row for row in rows}
+        except sqlite3.Error as exc:
+            self.notice = f"작업 단계 조회 실패: {exc}"
+            return {}
+
+    @staticmethod
+    def _file_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int, int, int]:
+        return (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_mode,
+            metadata.st_nlink,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+            metadata.st_ctime_ns,
+        )
+
+    def transcript_preview(self, job_id: int) -> dict[str, object]:
+        storage_config = self.config_data.get("storage_v2")
+        library_config = storage_config.get("library") if isinstance(storage_config, dict) else None
+        if not isinstance(library_config, dict) or library_config.get("transcript_preview_enabled") is not True:
+            raise JobPreviewDisabledError("전사 본문 조회가 비활성화되어 있습니다.")
+        max_bytes = library_config.get(
+            "transcript_preview_max_bytes", DEFAULT_TRANSCRIPT_PREVIEW_MAX_BYTES
+        )
+        if (
+            isinstance(max_bytes, bool)
+            or not isinstance(max_bytes, int)
+            or not 1 <= max_bytes <= MAX_TRANSCRIPT_PREVIEW_MAX_BYTES
+        ):
+            raise ValueError("transcript_preview_max_bytes 설정이 유효하지 않습니다.")
+        with sqlite3.connect(self.db_path, timeout=3.0) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT status, transcript_txt_path FROM jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+        if row is None or row["status"] != "DONE" or not row["transcript_txt_path"]:
+            raise JobPreviewNotFoundError("완료된 전사 본문을 찾을 수 없습니다.")
+        root = self.transcript_folder
+        if root is None or root.is_symlink():
+            raise JobPreviewConflictError("전사 저장소를 안전하게 읽을 수 없습니다.")
+        target = Path(str(row["transcript_txt_path"]))
+        if not root.is_absolute() or not target.is_absolute() or target.suffix.lower() != ".txt":
+            raise JobPreviewConflictError("전사 파일 경로가 유효하지 않습니다.")
+        try:
+            relative = target.relative_to(root)
+        except ValueError as exc:
+            raise JobPreviewConflictError("전사 파일이 지정된 저장소 밖에 있습니다.") from exc
+        if not relative.parts or any(part in {".", ".."} for part in relative.parts):
+            raise JobPreviewConflictError("전사 파일 경로가 유효하지 않습니다.")
+        if not hasattr(os, "O_NOFOLLOW"):
+            raise JobPreviewConflictError("안전한 전사 파일 읽기를 지원하지 않습니다.")
+
+        directory_flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_DIRECTORY", 0)
+        file_flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
+        descriptors: list[int] = []
+        try:
+            root_fd = os.open(root, directory_flags)
+            descriptors.append(root_fd)
+            parent_fd = root_fd
+            for component in relative.parts[:-1]:
+                parent_fd = os.open(component, directory_flags, dir_fd=parent_fd)
+                descriptors.append(parent_fd)
+            name = relative.parts[-1]
+            file_fd = os.open(name, file_flags, dir_fd=parent_fd)
+            descriptors.append(file_fd)
+            before = os.fstat(file_fd)
+            entry_before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_nlink != 1
+                or before.st_size > max_bytes
+                or self._file_identity(before) != self._file_identity(entry_before)
+            ):
+                raise JobPreviewConflictError("전사 파일을 안전하게 읽을 수 없습니다.")
+            data = os.read(file_fd, max_bytes + 1)
+            after = os.fstat(file_fd)
+            entry_after = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if (
+                len(data) > max_bytes
+                or self._file_identity(before) != self._file_identity(after)
+                or self._file_identity(before) != self._file_identity(entry_after)
+                or len(data) != before.st_size
+            ):
+                raise JobPreviewConflictError("전사 파일이 읽는 동안 변경되었습니다.")
+            try:
+                text = data.decode("utf-8", errors="strict")
+            except UnicodeDecodeError as exc:
+                raise JobPreviewConflictError("전사 파일 인코딩이 유효하지 않습니다.") from exc
+            if "\x00" in text:
+                raise JobPreviewConflictError("전사 파일에 유효하지 않은 문자가 있습니다.")
+            return {"job_id": job_id, "text": text, "truncated": False}
+        except FileNotFoundError as exc:
+            raise JobPreviewNotFoundError("전사 파일을 찾을 수 없습니다.") from exc
+        except OSError as exc:
+            raise JobPreviewConflictError("전사 파일을 안전하게 읽을 수 없습니다.") from exc
+        finally:
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
+
+    def record_quality_review_decision(self, job_id: int, decision: str) -> dict[str, object]:
+        if decision not in _QUALITY_REVIEW_DECISIONS:
+            raise ValueError("decision must be no_issue or needs_correction")
+        with sqlite3.connect(self.db_path, timeout=3.0) as conn:
+            conn.row_factory = sqlite3.Row
+            db.init_quality_review_decisions_table(conn)
+            conn.commit()
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                postprocess_enabled = self._current_postprocess_enabled()
+            except ValueError as exc:
+                raise QualityReviewConflictError("설정이 변경되어 확인 결과를 기록할 수 없습니다.") from exc
+            existing = conn.execute(
+                "SELECT decision, decided_at FROM quality_review_decisions WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if existing is not None:
+                if existing["decision"] == decision:
+                    return {
+                        "job_id": job_id,
+                        "decision": decision,
+                        "decided_at": existing["decided_at"],
+                        "required": decision == "needs_correction",
+                    }
+                if existing["decision"] != "needs_correction" or decision != "no_issue":
+                    raise QualityReviewConflictError("이미 다른 확인 결과가 저장되어 있습니다.")
+                if conn.execute("SELECT 1 FROM jobs WHERE id = ?", (job_id,)).fetchone() is None:
+                    raise QualityReviewNotFoundError("작업을 찾을 수 없습니다.")
+                decided_at = datetime.now().astimezone().isoformat(timespec="seconds")
+                conn.execute(
+                    "UPDATE quality_review_decisions SET decision = ?, decided_at = ? "
+                    "WHERE job_id = ?",
+                    (decision, decided_at, job_id),
+                )
+                conn.commit()
+                self._set_poll_boost()
+                return {
+                    "job_id": job_id,
+                    "decision": decision,
+                    "decided_at": decided_at,
+                    "required": False,
+                }
+            row = conn.execute(
+                "SELECT j.status, j.engine_params, p.status AS postprocess_status "
+                "FROM jobs AS j LEFT JOIN transcript_postprocess_jobs AS p "
+                "ON p.source_job_id = j.id WHERE j.id = ?",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                raise QualityReviewNotFoundError("작업을 찾을 수 없습니다.")
+            quality = self._quality_from_engine_params(row["engine_params"])
+            postprocess_status = str(row["postprocess_status"] or "").upper()
+            terminal = postprocess_status in _POSTPROCESS_TERMINAL_STATUSES or (
+                not postprocess_enabled and not postprocess_status
+            )
+            if (
+                row["status"] != "DONE"
+                or str(quality.get("health") or "").lower() != "bad"
+                or requires_blocking_review(quality)
+                or not terminal
+            ):
+                raise QualityReviewConflictError("완료 후 확인 가능한 품질 경고가 아닙니다.")
+            decided_at = datetime.now().astimezone().isoformat(timespec="seconds")
+            conn.execute(
+                "INSERT INTO quality_review_decisions (job_id, decision, decided_at) "
+                "VALUES (?, ?, ?)",
+                (job_id, decision, decided_at),
+            )
+        self._set_poll_boost()
+        return {
+            "job_id": job_id,
+            "decision": decision,
+            "decided_at": decided_at,
+            "required": decision == "needs_correction",
+        }
+
+    def _job_stage_state(
+        self,
+        job: dict[str, object],
+        pipeline: sqlite3.Row | None,
+    ) -> tuple[dict[str, str], dict[str, object], str | None]:
+        status = str(job["status"]).upper()
+        step = str(job["step"])
+        if status == "PENDING":
+            audio, transcript = "pending", "pending"
+        elif status == "PROCESSING":
+            audio_ready = step.startswith(("전사", "후처리", "품질", "전체 완료"))
+            audio = "done" if audio_ready else "processing"
+            transcript = "pending" if audio == "processing" else "processing"
+        elif status == "DONE":
+            audio, transcript = "done", "done"
+        elif status == "NEEDS_REVIEW":
+            audio, transcript = "done", "blocked"
+        elif status == "ERROR":
+            transcript_started = any(token in step for token in ("전사", "후처리", "품질", "산출물", "최종", "알림"))
+            audio = "done" if transcript_started else "error"
+            transcript = "blocked" if audio == "error" else "error"
+        else:
+            audio, transcript = "pending", "blocked"
+
+        postprocess_enabled = self._postprocess_enabled()
+        postprocess_status = str(pipeline["postprocess_status"] or "").upper() if pipeline else ""
+        if not postprocess_enabled and not postprocess_status:
+            correction, summary = "skipped", "skipped"
+        elif status != "DONE":
+            correction, summary = "blocked", "blocked"
+        elif postprocess_status == "SKIPPED":
+            correction, summary = "skipped", "skipped"
+        elif postprocess_status == "UNROUTED":
+            correction, summary = "blocked", "blocked"
+        elif pipeline is None or not postprocess_status:
+            correction, summary = "pending", "blocked"
+        else:
+            stage_map = {
+                "PENDING": "pending",
+                "READY": "done",
+                "DELIVERED": "done",
+                "BLOCKED": "blocked",
+                "NEEDS_REVIEW": "blocked",
+                "CONFLICT": "blocked",
+                "ERROR": "error",
+                "SKIPPED": "skipped",
+            }
+            correction = stage_map.get(str(pipeline["correction_status"] or "").upper(), "blocked")
+            summary = stage_map.get(str(pipeline["summary_status"] or "").upper(), "blocked")
+
+        quality = self._quality_from_engine_params(pipeline["engine_params"]) if pipeline else {}
+        health = str(quality.get("health") or "").lower()
+        decision = str(pipeline["decision"] or "") if pipeline else ""
+        terminal = postprocess_status in _POSTPROCESS_TERMINAL_STATUSES or (
+            not postprocess_enabled and not postprocess_status
+        )
+        review: dict[str, object] = {
+            "required": (
+                status == "DONE" and health == "bad" and terminal
+                and not requires_blocking_review(quality) and decision != "no_issue"
+            ),
+            "blocking": status == "NEEDS_REVIEW",
+            "health": health or None,
+            "summary": str(quality.get("summary") or "")[:240] or None,
+            "decision": decision or None,
+            "decided_at": (str(pipeline["decided_at"] or "") or None) if pipeline else None,
+        }
+        return {
+            "audio": audio,
+            "transcript": transcript,
+            "correction": correction,
+            "summary": summary,
+        }, review, postprocess_status or None
+
+    def _open_quality_review_jobs(self, *, strict: bool = False) -> list[dict[str, object]]:
+        if not getattr(self, "db_path", None):
+            return []
+        postprocess_enabled = self._postprocess_enabled()
+        try:
+            with sqlite3.connect(self.db_path, timeout=3.0) as conn:
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA busy_timeout = 3000")
+                has_decisions = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                    "AND name = 'quality_review_decisions'"
+                ).fetchone() is not None
+                decision_columns = (
+                    "q.decision, q.decided_at"
+                    if has_decisions else "NULL AS decision, NULL AS decided_at"
+                )
+                decision_join = (
+                    "LEFT JOIN quality_review_decisions AS q ON q.job_id = j.id"
+                    if has_decisions else ""
+                )
+                decision_filter = (
+                    "AND (q.job_id IS NULL OR q.decision = 'needs_correction') "
+                    if has_decisions else ""
+                )
+                terminal_filter = (
+                    "AND p.status IN ('DELIVERED', 'SKIPPED', 'UNROUTED') "
+                    if postprocess_enabled else ""
+                )
+                rows = conn.execute(
+                    "SELECT j.id, j.status, j.orig_name, j.updated_at, "
+                    "j.current_step, j.progress_pct, j.error_message, j.engine_params, "
+                    "p.status AS postprocess_status, p.correction_status, p.summary_status, "
+                    + decision_columns + " FROM jobs AS j "
+                    "LEFT JOIN transcript_postprocess_jobs AS p ON p.source_job_id = j.id "
+                    + decision_join + " WHERE j.status = 'DONE' "
+                    + decision_filter + terminal_filter
+                    + "AND CASE WHEN json_valid(j.engine_params) "
+                    "THEN json_extract(j.engine_params, '$.quality.health') END = 'bad' "
+                    "ORDER BY j.id DESC"
+                ).fetchall()
+        except sqlite3.Error as exc:
+            if strict:
+                raise
+            self.notice = f"확인 요청 조회 실패: {exc}"
+            return []
+        items: list[dict[str, object]] = []
+        for row in rows:
+            job = self._serialize_job_row((
+                row["id"], row["status"], row["orig_name"], row["updated_at"],
+                row["current_step"], row["progress_pct"], row["error_message"],
+            ))
+            stages, review, postprocess_status = self._job_stage_state(job, row)
+            if review["required"]:
+                job.update(stages=stages, quality_review=review, postprocess_status=postprocess_status)
+                items.append(job)
+        return items
+
+    def quality_review_jobs(self, *, limit: int = 50, offset: int = 0) -> dict[str, object]:
+        if limit < 1 or limit > 100 or offset < 0:
+            raise ValueError("limit must be 1..100 and offset must be non-negative")
+        items = self._open_quality_review_jobs(strict=True)
+        if getattr(self, "db_path", None):
+            with sqlite3.connect(self.db_path, timeout=3.0) as conn:
+                conn.row_factory = sqlite3.Row
+                hard_rows = conn.execute(
+                    "SELECT id, status, orig_name, updated_at, current_step, progress_pct, "
+                    "error_message, engine_params, NULL AS postprocess_status, "
+                    "NULL AS correction_status, NULL AS summary_status, "
+                    "NULL AS decision, NULL AS decided_at "
+                    "FROM jobs WHERE status = 'NEEDS_REVIEW' ORDER BY id DESC"
+                ).fetchall()
+            for row in hard_rows:
+                job = self._serialize_job_row((
+                    row["id"], row["status"], row["orig_name"], row["updated_at"],
+                    row["current_step"], row["progress_pct"], row["error_message"],
+                ))
+                stages, review, postprocess_status = self._job_stage_state(job, row)
+                job.update(stages=stages, quality_review=review, postprocess_status=postprocess_status)
+                items.append(job)
+        items.sort(key=lambda job: int(job["id"]), reverse=True)
+        return {
+            "total": len(items),
+            "limit": limit,
+            "offset": offset,
+            "items": items[offset:offset + limit],
+        }
+
     def snapshot(self, include_log: bool = False) -> dict:
         with self.lock:
             managed_running = self._is_managed_running()
@@ -2779,6 +3160,16 @@ class ControlState:
             jobs = self._recent_jobs()
             processing = self._processing_jobs()
             jobs_v2 = [self._serialize_job_row(row) for row in jobs]
+            pipeline_rows = self._recent_job_pipeline_rows([int(job["id"]) for job in jobs_v2])
+            for job in jobs_v2:
+                stages, review, postprocess_status = self._job_stage_state(
+                    job, pipeline_rows.get(int(job["id"]))
+                )
+                job.update(
+                    stages=stages,
+                    quality_review=review,
+                    postprocess_status=postprocess_status,
+                )
             processing_v2 = [self._serialize_processing_row(row) for row in processing]
             current_processing = processing_v2[0] if processing_v2 else None
             if current_processing is not None:
@@ -2844,6 +3235,7 @@ class ControlState:
                     },
                 },
                 "jobs_v2": jobs_v2,
+                "quality_review_open_count": len(self._open_quality_review_jobs()),
                 "processing_v2": processing_v2,
                 "summary": {
                     "current_job": current_processing,

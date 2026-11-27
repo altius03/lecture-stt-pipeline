@@ -1559,6 +1559,8 @@ def open_delivery_db(
     if not readonly:
         conn = shared_db.connect_db(str(db_path))
         shared_db.init_transcript_postprocess_jobs_table(conn)
+        shared_db.init_quality_review_decisions_table(conn)
+        conn.commit()
         return conn
 
     if not db_path.is_absolute():

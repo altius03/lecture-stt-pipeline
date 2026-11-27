@@ -1,380 +1,67 @@
-import { useEffect, useMemo, useState, type KeyboardEvent, type RefObject } from "react"
+import { useEffect, useMemo, useState, type RefObject } from "react"
 
-import { ActionBar } from "../ui/ActionBar"
-import { SectionCard } from "../ui/SectionCard"
 import type { PanelLogState } from "../../hooks/usePanelLogs"
 import { parseLectureFileInfo, parsePanelLogText, type ParsedLogEntry } from "../../lib/logParser"
-import type { PanelAction, PanelJob } from "../../types"
+import type { PanelJob } from "../../types"
 
 interface ActivityPanelProps {
-  canControl?: boolean
   jobs: PanelJob[]
+  selectedJobId?: number | null
   logs: PanelLogState
   error: string | null
   logRef: RefObject<HTMLPreElement>
   autoFollow: boolean
   hasUnread: boolean
-  pendingAction: PanelAction | null
   onLogScroll: () => void
   onToggleAutoFollow: (nextValue: boolean) => void
   onJumpToLatest: () => void
-  onAction: (action: "clear_history" | "exit") => void
 }
 
-function formatLog(text: string): string {
-  return text.trim() ? text : "로그가 아직 없습니다."
+type LevelFilter = "all" | "INFO" | "WARNING" | "ERROR"
+type StageFilter = "all" | "audio" | "transcript" | "correction" | "summary" | "system"
+
+function entryStage(entry: ParsedLogEntry): StageFilter {
+  const message = `${entry.message} ${entry.summary}`.toLocaleLowerCase()
+  if (/오디오|audio|stabili|moved to stable/.test(message)) return "audio"
+  if (/전사|transcri|quality/.test(message)) return "transcript"
+  if (/요약|summary|markdown/.test(message)) return "summary"
+  if (/교정|correct|postprocess|후처리/.test(message)) return "correction"
+  return "system"
 }
 
-function statusClassName(status: string): string {
-  if (status === "DONE") {
-    return "status-pill status-positive"
-  }
-  if (status === "ERROR") {
-    return "status-pill status-negative"
-  }
-  if (status === "NEEDS_REVIEW") {
-    return "status-pill status-active"
-  }
-  if (status === "PROCESSING") {
-    return "status-pill status-active"
-  }
-  return "status-pill status-neutral"
+const STAGE_LABEL: Record<StageFilter, string> = {
+  all: "전체 단계", audio: "오디오", transcript: "전사", correction: "교정", summary: "요약", system: "시스템",
 }
 
-function statusLabel(status: string): string {
-  if (status === "PENDING") {
-    return "대기"
-  }
-  if (status === "PROCESSING") {
-    return "처리중"
-  }
-  if (status === "DONE") {
-    return "완료"
-  }
-  if (status === "ERROR") {
-    return "오류"
-  }
-  if (status === "NEEDS_REVIEW") {
-    return "확인 필요"
-  }
-  return status
-}
+export function ActivityPanel({ jobs, selectedJobId, logs, error, logRef, autoFollow, hasUnread, onLogScroll, onToggleAutoFollow, onJumpToLatest }: ActivityPanelProps) {
+  const [query, setQuery] = useState("")
+  const [jobFilter, setJobFilter] = useState<string>(selectedJobId ? String(selectedJobId) : "all")
+  const [levelFilter, setLevelFilter] = useState<LevelFilter>("all")
+  const [stageFilter, setStageFilter] = useState<StageFilter>("all")
+  const [selectedIndex, setSelectedIndex] = useState<number | null>(null)
+  const [showRaw, setShowRaw] = useState(false)
+  useEffect(() => { setJobFilter(selectedJobId ? String(selectedJobId) : "all") }, [selectedJobId])
 
-function entryLevelClassName(entry: ParsedLogEntry): string {
-  if (entry.level === "ERROR") {
-    return "status-pill status-negative"
-  }
-  if (entry.level === "WARNING") {
-    return "status-pill status-active"
-  }
-  return "status-pill status-neutral"
-}
-
-function selectedJobDisplay(job: PanelJob | null): { title: string; meta: string } {
-  if (!job) {
-    return {
-      title: "작업을 선택하면 관련 운영 로그를 볼 수 있습니다.",
-      meta: "최근 작업 표에서 행을 선택하세요.",
+  const parsed = useMemo(() => parsePanelLogText(logs.text, jobs), [logs.text, jobs])
+  const selectedStem = useMemo(() => {
+    const selectedJob = jobs.find((job) => String(job.id) === jobFilter)
+    if (!selectedJob) return null
+    const stem = parseLectureFileInfo(selectedJob.file_name)?.normalizedStem
+    if (!stem || jobs.some((job) => job.id !== selectedJob.id && parseLectureFileInfo(job.file_name)?.normalizedStem === stem)) {
+      return null
     }
-  }
-
-  const fileInfo = parseLectureFileInfo(job.file_name)
-  return {
-    title: fileInfo?.displayTitle ?? job.file_name,
-    meta: fileInfo?.displayMeta ?? `작업 #${job.id} · ${job.updated_at}`,
-  }
-}
-
-function isEntryForJob(entry: ParsedLogEntry, job: PanelJob | null): boolean {
-  if (!job) {
-    return false
-  }
-
-  if (entry.jobId !== null) {
-    return entry.jobId === String(job.id)
-  }
-
-  const selectedFileInfo = parseLectureFileInfo(job.file_name)
-  if (!selectedFileInfo || !entry.fileInfo) {
-    return false
-  }
-
-  return entry.fileInfo.normalizedStem === selectedFileInfo.normalizedStem
-}
-
-function entryTargetLabel(entry: ParsedLogEntry): string {
-  if (entry.fileInfo) {
-    return entry.fileInfo.displayTitle
-  }
-  if (entry.jobId) {
-    return `작업 #${entry.jobId}`
-  }
-  return "시스템"
-}
-
-function entryMetaLabel(entry: ParsedLogEntry): string {
-  if (entry.fileInfo) {
-    return entry.fileInfo.displayMeta
-  }
-  if (entry.canonicalBase) {
-    return `base · ${entry.canonicalBase}`
-  }
-  return "공통 이벤트"
-}
-
-function pickDefaultJobId(jobs: PanelJob[]): number | null {
-  const processingJob = jobs.find((job) => job.status === "PROCESSING")
-  const reviewJob = jobs.find((job) => job.status === "NEEDS_REVIEW")
-  return processingJob?.id ?? reviewJob?.id ?? jobs[0]?.id ?? null
-}
-
-function formatUpdatedAt(value: string): string {
-  const date = new Date(value)
-  if (Number.isNaN(date.getTime())) {
-    return value
-  }
-
-  const month = String(date.getMonth() + 1).padStart(2, "0")
-  const day = String(date.getDate()).padStart(2, "0")
-  const hour = String(date.getHours()).padStart(2, "0")
-  const minute = String(date.getMinutes()).padStart(2, "0")
-  return `${month}-${day} ${hour}:${minute}`
-}
-
-function shortErrorMessage(message: string): string {
-  if (!message) {
-    return "-"
-  }
-  if (message.includes("Source file disappeared before move")) {
-    return "원본 파일 사라짐"
-  }
-  if (message.length > 34) {
-    return `${message.slice(0, 34)}...`
-  }
-  return message
-}
-
-export function ActivityPanel({
-  canControl,
-  jobs,
-  logs,
-  error,
-  logRef,
-  autoFollow,
-  hasUnread,
-  pendingAction,
-  onLogScroll,
-  onToggleAutoFollow,
-  onJumpToLatest,
-  onAction,
-}: ActivityPanelProps) {
-  const [viewMode, setViewMode] = useState<"selected" | "errors" | "raw">("selected")
-  const [selectedJobId, setSelectedJobId] = useState<number | null>(() => pickDefaultJobId(jobs))
-
-  useEffect(() => {
-    const nextSelectedJobExists = jobs.some((job) => job.id === selectedJobId)
-    if (nextSelectedJobExists) {
-      return
+    return stem
+  }, [jobs, jobFilter])
+  const visible = useMemo(() => parsed.filter((entry) => {
+    if (jobFilter !== "all") {
+      if (entry.jobId !== null && entry.jobId !== jobFilter) return false
+      if (entry.jobId === null && (!selectedStem || entry.fileInfo?.normalizedStem !== selectedStem)) return false
     }
-    setSelectedJobId(pickDefaultJobId(jobs))
-  }, [jobs, selectedJobId])
+    if (levelFilter !== "all" && entry.level !== levelFilter) return false
+    if (stageFilter !== "all" && entryStage(entry) !== stageFilter) return false
+    return !query || `${entry.raw} ${entry.summary} ${entry.detail ?? ""}`.toLocaleLowerCase().includes(query.toLocaleLowerCase())
+  }).reverse().slice(0, 200), [parsed, jobFilter, selectedStem, levelFilter, stageFilter, query])
+  const selected = selectedIndex !== null ? visible[selectedIndex] ?? null : null
 
-  const selectedJob = jobs.find((job) => job.id === selectedJobId) ?? null
-  const selectedDisplay = selectedJobDisplay(selectedJob)
-  const parsedEntries = useMemo(() => parsePanelLogText(logs.text, jobs), [jobs, logs.text])
-  const parsedOperationalEntries = useMemo(
-    () => parsedEntries.filter((entry) => entry.kind !== "unclassified" || entry.level !== "UNKNOWN"),
-    [parsedEntries],
-  )
-  const selectedEntries = useMemo(
-    () => parsedOperationalEntries.filter((entry) => isEntryForJob(entry, selectedJob)),
-    [parsedOperationalEntries, selectedJob],
-  )
-  const errorEntries = useMemo(
-    () => parsedOperationalEntries.filter((entry) => entry.level === "ERROR" || entry.level === "WARNING"),
-    [parsedOperationalEntries],
-  )
-  const visibleEntries = useMemo(() => {
-    const sourceEntries = viewMode === "errors" ? errorEntries : selectedEntries
-    return [...sourceEntries].slice(-5).reverse()
-  }, [errorEntries, selectedEntries, viewMode])
-
-  function handleRowKeyDown(event: KeyboardEvent<HTMLTableRowElement>, jobId: number) {
-    if (event.key === "Enter" || event.key === " ") {
-      event.preventDefault()
-      setSelectedJobId(jobId)
-    }
-  }
-
-  return (
-    <SectionCard label="History" title="최근 작업" className="activity-card">
-      <div className="table-wrap activity-table">
-        <table>
-          <colgroup>
-            <col className="jobs-col-id" />
-            <col className="jobs-col-status" />
-            <col className="jobs-col-file" />
-            <col className="jobs-col-updated" />
-            <col className="jobs-col-progress" />
-            <col className="jobs-col-step" />
-            <col className="jobs-col-error" />
-          </colgroup>
-          <thead>
-            <tr>
-              <th>ID</th>
-              <th>상태</th>
-              <th>파일</th>
-              <th>업데이트</th>
-              <th>진행률</th>
-              <th>단계</th>
-              <th>오류</th>
-            </tr>
-          </thead>
-          <tbody>
-            {jobs.length === 0 ? (
-              <tr>
-                <td colSpan={7}>작업 없음</td>
-              </tr>
-            ) : (
-              jobs.map((job) => {
-                const isSelected = selectedJobId === job.id
-                return (
-                  <tr
-                    key={job.id}
-                    className={isSelected ? "jobs-row is-selected" : "jobs-row"}
-                    tabIndex={0}
-                    onClick={() => {
-                      setSelectedJobId(job.id)
-                    }}
-                    onKeyDown={(event) => {
-                      handleRowKeyDown(event, job.id)
-                    }}
-                  >
-                    <td className="mono-cell">{job.id}</td>
-                    <td className="status-cell"><span className={statusClassName(job.status)}>{statusLabel(job.status)}</span></td>
-                    <td className="file-cell" title={job.file_name}>{job.file_name}</td>
-                    <td className="muted-cell" title={job.updated_at}>{formatUpdatedAt(job.updated_at)}</td>
-                    <td className="mono-cell progress-cell">{job.progress_pct}%</td>
-                    <td className="step-cell">{job.step || "-"}</td>
-                    <td className="error-cell" title={job.error_message || "-"}>{shortErrorMessage(job.error_message)}</td>
-                  </tr>
-                )
-              })
-            )}
-          </tbody>
-        </table>
-      </div>
-
-      <details className="log-details">
-        <summary>선택 작업 로그</summary>
-        <div className="activity-detail">
-          <div className="activity-selection-card">
-            <span>선택 작업</span>
-            <strong>{selectedDisplay.title}</strong>
-            <p>{selectedDisplay.meta}</p>
-          </div>
-
-          <div className="activity-toolbar">
-            <div className="log-view-switch" role="tablist" aria-label="작업 로그 보기">
-              <button
-                className={`button-secondary log-view-tab${viewMode === "selected" ? " is-active" : ""}`}
-                type="button"
-                onClick={() => {
-                  setViewMode("selected")
-                }}
-              >
-                선택 작업 로그
-              </button>
-              <button
-                className={`button-secondary log-view-tab${viewMode === "errors" ? " is-active" : ""}`}
-                type="button"
-                onClick={() => {
-                  setViewMode("errors")
-                }}
-              >
-                전체 오류
-              </button>
-              <button
-                className={`button-secondary log-view-tab${viewMode === "raw" ? " is-active" : ""}`}
-                type="button"
-                onClick={() => {
-                  setViewMode("raw")
-                }}
-              >
-                원본 로그
-              </button>
-            </div>
-
-            {viewMode === "raw" ? (
-              <div className="log-toolbar-actions">
-                <label className="log-follow-toggle">
-                  <input
-                    checked={autoFollow}
-                    type="checkbox"
-                    onChange={(event) => {
-                      onToggleAutoFollow(event.target.checked)
-                    }}
-                  />
-                  자동 따라가기
-                </label>
-                {hasUnread ? (
-                  <button className="button-secondary log-jump-button" type="button" onClick={onJumpToLatest}>
-                    최신으로 이동
-                  </button>
-                ) : null}
-              </div>
-            ) : null}
-          </div>
-
-          {logs.droppedLineCount > 0 ? (
-            <p className="log-meta">오래된 로그 {logs.droppedLineCount}줄을 숨겼습니다.</p>
-          ) : null}
-          {error ? <p className="log-meta">{error}</p> : null}
-
-          {viewMode === "raw" ? (
-            <pre ref={logRef} onScroll={onLogScroll}>{formatLog(logs.text)}</pre>
-          ) : visibleEntries.length === 0 ? (
-            <div className="parsed-log-empty">
-              {viewMode === "selected"
-                ? "선택한 작업과 연결된 운영 이벤트가 아직 없습니다."
-                : "아직 경고나 오류가 없습니다."}
-            </div>
-          ) : (
-            <div className="parsed-log-list">
-              {visibleEntries.map((entry, index) => (
-                <article className="parsed-log-entry" key={`${entry.raw}-${index}`}>
-                  <div className="parsed-log-header">
-                    <div>
-                      <strong className="parsed-log-target">{entryTargetLabel(entry)}</strong>
-                      <p className="parsed-log-meta">
-                        {(entry.timeLabel ?? "시간 미상") + " · " + entryMetaLabel(entry)}
-                      </p>
-                    </div>
-                    <span className={entryLevelClassName(entry)}>{entry.level === "UNKNOWN" ? "기타" : entry.level}</span>
-                  </div>
-                  <p className="parsed-log-summary">{entry.summary}</p>
-                  {entry.detail ? <p className="parsed-log-detail">{entry.detail}</p> : null}
-                </article>
-              ))}
-            </div>
-          )}
-        </div>
-      </details>
-
-      <ActionBar
-        canControl={canControl}
-        compact
-        actions={[
-          { action: "clear_history", label: "완료 이력 정리", tone: "secondary" },
-          { action: "exit", label: "패널 종료", tone: "danger" },
-        ]}
-        pendingAction={pendingAction}
-        onAction={(action) => {
-          if (action === "clear_history" || action === "exit") {
-            onAction(action)
-          }
-        }}
-      />
-    </SectionCard>
-  )
+  return <section className="log-explorer" aria-label="작업 로그 탐색"><div className="data-surface log-context"><div><strong>{jobFilter === "all" ? "전체 작업" : jobs.find((job) => String(job.id) === jobFilter)?.file_name ?? `작업 #${jobFilter}`}</strong><p>{visible.length}개 로그 표시 · 최신 기록부터</p></div><span className="live-state"><span className="runtime-dot is-running" aria-hidden="true" />실시간</span></div><div className="data-surface log-toolbar"><label className="search-field"><span className="sr-only">로그 메시지 검색</span><input type="search" placeholder="로그 메시지 검색" value={query} onChange={(event) => setQuery(event.target.value)} /></label><label><span className="sr-only">작업 필터</span><select value={jobFilter} onChange={(event) => setJobFilter(event.target.value)}><option value="all">전체 작업</option>{jobs.map((job) => <option key={job.id} value={job.id}>#{job.id} {job.file_name}</option>)}</select></label><label><span className="sr-only">단계 필터</span><select value={stageFilter} onChange={(event) => setStageFilter(event.target.value as StageFilter)}>{(Object.keys(STAGE_LABEL) as StageFilter[]).map((stage) => <option key={stage} value={stage}>{STAGE_LABEL[stage]}</option>)}</select></label><label><span className="sr-only">수준 필터</span><select value={levelFilter} onChange={(event) => setLevelFilter(event.target.value as LevelFilter)}><option value="all">전체 수준</option><option value="INFO">INFO</option><option value="WARNING">WARN</option><option value="ERROR">ERROR</option></select></label><button className="button-secondary" type="button" onClick={() => { setQuery(""); setJobFilter(selectedJobId ? String(selectedJobId) : "all"); setLevelFilter("all"); setStageFilter("all"); setSelectedIndex(null) }}>초기화</button></div>{error ? <p role="alert" className="form-error">{error}</p> : null}<div className="data-surface log-table-scroll"><table className="log-table"><thead><tr><th scope="col">시각</th><th scope="col">수준</th><th scope="col">단계</th><th scope="col">메시지</th></tr></thead><tbody>{visible.length === 0 ? <tr><td colSpan={4} className="empty-table">일치하는 로그가 없습니다.</td></tr> : visible.map((entry, index) => <tr key={`${entry.raw}-${index}`} className={selectedIndex === index ? "is-selected" : ""}><td><button type="button" className="log-row-button" onClick={() => setSelectedIndex(index)}>{entry.timeLabel ?? "—"}</button></td><td><span className={`log-level is-${entry.level.toLowerCase()}`}><i aria-hidden="true" />{entry.level === "WARNING" ? "WARN" : entry.level}</span></td><td>{STAGE_LABEL[entryStage(entry)]}</td><td><button type="button" className="log-row-button" onClick={() => setSelectedIndex(index)}>{entry.summary}</button></td></tr>)}</tbody></table>{selected ? <div className="log-detail"><strong>선택한 로그 상세</strong><dl><dt>시각</dt><dd>{selected.timestamp ?? "—"}</dd><dt>작업</dt><dd>{selected.jobId ? `#${selected.jobId}` : "시스템"}</dd><dt>수준</dt><dd>{selected.level}</dd></dl><p>{selected.detail ?? selected.message}</p></div> : null}</div><details className="raw-log-details" open={showRaw} onToggle={(event) => setShowRaw(event.currentTarget.open)}><summary>원본 로그</summary><div className="raw-log-controls"><label><input type="checkbox" checked={autoFollow} onChange={(event) => onToggleAutoFollow(event.target.checked)} />자동 따라가기</label>{hasUnread ? <button type="button" className="button-secondary" onClick={onJumpToLatest}>최신으로 이동</button> : null}{logs.droppedLineCount > 0 ? <span>오래된 로그 {logs.droppedLineCount}줄 숨김</span> : null}</div><pre ref={logRef} onScroll={onLogScroll}>{logs.text || "로그가 아직 없습니다."}</pre></details></section>
 }

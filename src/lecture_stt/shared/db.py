@@ -199,11 +199,21 @@ def init_db(db_path: str) -> sqlite3.Connection:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_sha256 ON jobs (sha256)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs (created_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_updated_at ON jobs (updated_at)")
+    init_quality_review_decisions_table(conn)
     init_deliveries_table(conn)
     init_transcript_deliveries_table(conn)
     init_transcript_postprocess_jobs_table(conn)
     conn.commit()
     return conn
+
+
+def init_quality_review_decisions_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS quality_review_decisions ("
+        "job_id INTEGER PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE, "
+        "decision TEXT NOT NULL CHECK (decision IN ('no_issue', 'needs_correction')), "
+        "decided_at TEXT NOT NULL)"
+    )
 
 
 def _existing_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
@@ -1074,11 +1084,19 @@ def _completed_transcript_quality(
     quality = metadata.get("quality")
     if not isinstance(quality, dict):
         return None, None, scorecard_error, {}
-    health = quality.get("health")
     summary = quality.get("summary")
-    normalized_health = health.strip().lower() if isinstance(health, str) else None
     normalized_summary = summary.strip() if isinstance(summary, str) and summary.strip() else None
-    return normalized_health, normalized_summary, scorecard_error, {}
+    try:
+        prior = json.loads(row["engine_params"] or "{}")
+    except (TypeError, ValueError):
+        prior = {}
+    # Recover the metadata snapshot written with the pair. The completed-job
+    # review queue reads this exact quality evidence from the jobs ledger.
+    if not isinstance(prior, dict):
+        prior = {}
+    fields = {"engine_params": json.dumps({**prior, **metadata}, ensure_ascii=False)}
+    health = "bad" if quality_gate.requires_blocking_review(quality) else None
+    return health, normalized_summary, scorecard_error, fields
 
 
 def recover_processing_jobs(
@@ -1152,6 +1170,7 @@ def recover_processing_jobs(
                 ended_at=utils.now_iso(),
                 error_message=None,
                 error_trace=None,
+                **fields,
             )
             counts["done"] += 1
             continue

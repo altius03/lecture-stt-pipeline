@@ -85,18 +85,6 @@ function createPanelState(): PanelState {
           available: true,
         },
         {
-          id: "discord",
-          label: "디스코드만",
-          description: "DISCORD_WEBHOOK_URL이 필요합니다.",
-          available: true,
-        },
-        {
-          id: "both",
-          label: "둘 다",
-          description: "텔레그램과 디스코드 secret이 모두 필요합니다.",
-          available: true,
-        },
-        {
           id: "disabled",
           label: "끄기",
           description: "알림 전송을 중단합니다.",
@@ -362,11 +350,11 @@ describe("usePanelState", () => {
     })
 
     await act(async () => {
-      await result.current.saveNotificationSelection("both")
+      await result.current.saveNotificationSelection("disabled")
     })
 
     await waitFor(() => {
-      expect(postNotificationSelectionMock).toHaveBeenCalledWith("/api/runtime/notification", "both", { applyNow: false })
+      expect(postNotificationSelectionMock).toHaveBeenCalledWith("/api/runtime/notification", "disabled", { applyNow: false })
       expect(result.current.pendingNotificationSelection).toBeNull()
     })
   })
@@ -376,7 +364,7 @@ describe("usePanelState", () => {
     postNotificationSelectionMock.mockRejectedValue(new Error("저장 실패"))
     const { result } = renderHook(() => usePanelState(), { wrapper: createMutationWrapper() })
     await waitFor(() => expect(result.current.state).not.toBeNull())
-    await act(async () => { await result.current.saveNotificationSelection("discord").catch(() => {}) })
+    await act(async () => { await result.current.saveNotificationSelection("telegram").catch(() => {}) })
     await waitFor(() => expect(result.current.error).toBe("저장 실패"))
   })
 })

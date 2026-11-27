@@ -9,7 +9,7 @@ import {
   decodeRecoveryDetail, decodeRecoveryList, decodeRequeueResult,
   type RecoveryView, type RequeueRequest,
 } from "./decodePostprocessRecovery"
-import { decodeLogPayload, decodePanelActionResponse, decodePanelState } from "./decodePanelState"
+import { decodeLogPayload, decodePanelActionResponse, decodePanelJob, decodePanelState } from "./decodePanelState"
 import {
   decodeRecordingDetail,
   decodeRecordingLibraryList,
@@ -47,10 +47,13 @@ import type {
   ClassificationProposalListPayload,
   ClassificationStatusResult,
   LogPayload,
+  JobTranscriptPreview,
+  QualityReviewDecision,
   NotificationSelection,
   PanelActionResponse,
   PanelEndpoints,
   PanelState,
+  PanelJob,
   RecordingDetailPayload,
   RecordingLibraryListPayload,
   TimetableEntriesPayload,
@@ -258,6 +261,43 @@ export async function fetchPanelState(endpoint: string = FALLBACK_PANEL_ENDPOINT
   return decodePanelState(payload)
 }
 
+export async function fetchJobTranscriptPreview(jobId: number, signal?: AbortSignal): Promise<JobTranscriptPreview> {
+  const id = normalizePositiveInteger(jobId, "Job id")
+  const response = await fetch(`/api/jobs/${id}/transcript-preview`, { cache: "no-store", signal })
+  const payload = await readJson(response)
+  if (!response.ok) throw createApiError(response, payload, `본문을 불러오지 못했습니다: ${response.status}`)
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) throw new Error("본문 응답 형식이 올바르지 않습니다.")
+  const preview = payload as Record<string, unknown>
+  if (preview.job_id !== id || typeof preview.text !== "string" || preview.truncated !== false) {
+    throw new Error("본문 응답 형식이 올바르지 않습니다.")
+  }
+  return { job_id: id, text: preview.text, truncated: false }
+}
+
+export async function postJobQualityReview(jobId: number, decision: QualityReviewDecision): Promise<void> {
+  const id = normalizePositiveInteger(jobId, "Job id")
+  if (decision !== "no_issue" && decision !== "needs_correction") throw new Error("올바르지 않은 확인 결과입니다.")
+  const response = await fetch(`/api/jobs/${id}/quality-review`, {
+    method: "POST",
+    headers: FORM_HEADERS,
+    body: new URLSearchParams({ decision }),
+  })
+  const payload = await readJson(response)
+  if (!response.ok) throw createApiError(response, payload, `확인 결과를 저장하지 못했습니다: ${response.status}`)
+}
+
+export async function fetchQualityReviews(limit = 50, offset = 0, signal?: AbortSignal): Promise<{ items: PanelJob[]; total: number }> {
+  const normalizedLimit = normalizePositiveInteger(limit, "Quality review limit")
+  const normalizedOffset = normalizeNonNegativeInteger(offset, "Quality review offset")
+  const response = await fetch(`/api/jobs/quality-reviews?limit=${normalizedLimit}&offset=${normalizedOffset}`, { cache: "no-store", signal })
+  const payload = await readJson(response)
+  if (!response.ok) throw createApiError(response, payload, `확인 목록을 불러오지 못했습니다: ${response.status}`)
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) throw new Error("확인 목록 응답 형식이 올바르지 않습니다.")
+  const record = payload as Record<string, unknown>
+  if (!Array.isArray(record.items) || typeof record.total !== "number" || !Number.isInteger(record.total) || record.total < 0) throw new Error("확인 목록 응답 형식이 올바르지 않습니다.")
+  return { items: record.items.map(decodePanelJob), total: record.total }
+}
+
 export async function fetchRecordingLibraryList(
   params?: { limit?: number; offset?: number },
   signal?: AbortSignal,
@@ -442,6 +482,9 @@ export async function postNotificationSelection(
   selection: NotificationSelection,
   options?: { applyNow?: boolean },
 ): Promise<PanelActionResponse> {
+  if (selection !== "telegram" && selection !== "disabled") {
+    throw new Error("지원하지 않는 알림 채널입니다.")
+  }
   const body = new URLSearchParams({
     selection,
     ...(options?.applyNow ? { apply_now: "1" } : {}),

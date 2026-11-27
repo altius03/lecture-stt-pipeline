@@ -219,7 +219,7 @@ bash scripts/distribute_status.sh list --only-problems
 
 ### 잘못 분류됐거나 입력 한도를 넘긴 강의 복구
 
-과목을 바로잡을 때는 패널의 **검토 큐 → 누락 강의 복구 → 과목 확인 대기**에서 녹음명, 작업 ID, 녹음 시각과 분류 사유를 확인한다. 시각은 작업이 기록한 `recorded_at`을 한국시간으로 표시한다. 워커가 오디오 수정 시각에서 얻은 보조 정보이므로 시간만으로 과목을 확정하기 어려울 수 있다. 값이 없는 예전 작업은 ‘녹음 시각 미상’으로 표시한다.
+과목을 바로잡을 때는 패널의 **확인 → 누락 강의 복구 → 과목 확인 대기**에서 녹음명, 작업 ID, 녹음 시각과 분류 사유를 확인한다. 시각은 작업이 기록한 `recorded_at`을 한국시간으로 표시한다. 워커가 오디오 수정 시각에서 얻은 보조 정보이므로 시간만으로 과목을 확정하기 어려울 수 있다. 값이 없는 예전 작업은 ‘녹음 시각 미상’으로 표시한다.
 
 `SKIPPED` 또는 `UNROUTED` 작업을 선택하고 활성 학기의 과목을 직접 고른 뒤 **과목 확정 및 재등록**을 누른다. 확인 창에서 취소하면 해당 작업은 그대로 남는다. 등록 후 **확정 이력**에서 교정·요약·전달 상태를 확인한다. `PENDING`은 후처리 워커를 기다리는 상태이고, 최종 과목 폴더까지 전달되면 ‘전달 완료’가 표시된다. 패널을 다시 열어도 확정 이력에서 작업을 찾을 수 있다.
 
@@ -239,6 +239,20 @@ bash scripts/distribute_status.sh requeue ID --course-code CODE \
 개인용 loopback 접속에서는 기존 제어를 사용할 수 있다. `WEB_PANEL_ALLOWED_HOSTS`에 공유 도메인을 넣거나, 운영자 토큰을 설정하거나, 외부 인터페이스에 바인딩하면 공유 모드가 된다. 공유 모드에서 익명 사용자는 조회만 할 수 있다. 전사 본문 미리보기는 별도 설정이며, 켜면 조회 권한을 가진 사용자에게 본문이 보인다.
 
 공유할 때는 프록시가 Host를 다시 쓰더라도 서버가 공유 모드를 식별하도록 허용 호스트 또는 운영자 토큰을 명시한다. 공유 환경에서 운영자 제어가 필요하면 패널은 loopback에 바인딩하고 인증 프록시에서 TLS와 운영자 접근 권한을 적용한다. 프록시는 외부 요청의 `Authorization`과 `X-Lecture-STT-Operator`를 제거하고, 검증한 운영자의 조회·SSE·변경 요청에만 서버가 설정한 `WEB_PANEL_CONTROL_TOKEN`과 일치하는 Bearer 헤더를 주입한다. 운영자 식별자 헤더는 선택 사항이다. 토큰은 서버와 프록시에만 설정한다. 공유 모드의 로컬 브라우저도 같은 운영자 경로를 사용한다. 토큰 설정 변경은 패널 재시작 뒤 반영된다. 서버의 변경 요청 로그에는 주체·경로·결과가 기록된다.
+
+### SSH 운영자 접속
+
+공유 프록시가 운영자 인증 헤더를 주입할 수 없는 환경에서는 SSH 계정 소유자가 별도 Unix 소켓으로 접속할 수 있다. 운영 서버에 `WEB_PANEL_CONTROL_TOKEN`을 설정하고 같은 값을 소유자 전용(0600) 토큰 파일에 둔다. 소켓 부모 디렉터리는 운영자 소유 0700이어야 한다. `controller/cmd/lecture-stt-operator-proxy`를 대상 OS용으로 빌드해 운영자 전용 디렉터리의 `panel-proxy`로 설치한다.
+
+운영자 Mac에서 아래의 `ACCOUNT_HOME`을 서버 계정의 절대 홈 경로로 바꾸고 평소 사용하는 SSH 별칭으로 접속한다. 이 세션을 열어 둔 동안 같은 Mac에서 `http://127.0.0.1:18765/#review`를 연다.
+
+```bash
+ssh -T -o ExitOnForwardFailure=yes \
+  -L 127.0.0.1:18765:ACCOUNT_HOME/.lecture-stt-operator/panel.sock macmini \
+  'exec "$HOME/.lecture-stt-operator/panel-proxy" --socket "$HOME/.lecture-stt-operator/panel.sock" --token-file "$HOME/.lecture-stt-operator/token" --exit-on-stdin-close'
+```
+
+운영자 전용으로 쓰는 Mac에서만 터널을 열고 작업 후 Ctrl+C로 닫는다. 프록시는 고정된 loopback 패널로 전달하고 인증정보를 서버에서만 읽는다. 공유 패널의 익명 접속은 계속 읽기 전용이다.
 
 ## 5. Log policy
 

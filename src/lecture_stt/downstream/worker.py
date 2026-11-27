@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import argparse
 from contextlib import nullcontext
+import json
 import logging
 import os
 import sqlite3
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -23,12 +24,17 @@ from lecture_stt.downstream.lib import (
 )
 from lecture_stt.downstream.semester import load_active_semester
 from lecture_stt.downstream.transcript_delivery import (
+    TRANSCRIPT_DELIVERY_DELIVERED,
+    TRANSCRIPT_DELIVERY_SKIPPED,
+    TRANSCRIPT_DELIVERY_UNROUTED,
     TranscriptPostprocessSettings,
     TranscriptDeliveryDistributor,
     load_postprocess_settings,
     open_delivery_db,
     reconcile_completed_jobs,
 )
+from lecture_stt.stt.notifier import BaseNotifier, NoopNotifier, build_notifier
+from lecture_stt.stt.quality_gate import requires_blocking_review
 from lecture_stt.shared.log_retention import DEFAULT_DOWNSTREAM_BACKUP_COUNT, DEFAULT_LOG_MAX_BYTES
 from lecture_stt.shared.paths import (
     default_db_path,
@@ -61,6 +67,9 @@ class TranscriptWorkerConfig:
     lock_path: Path
     active_semester_path: Path
     postprocess_settings: TranscriptPostprocessSettings | None = None
+    notification_config: dict[str, Any] = field(default_factory=dict)
+    notification_env: dict[str, str] = field(default_factory=dict)
+    notification_config_path: Path | None = None
 
 
 class SingleInstanceLock:
@@ -240,6 +249,11 @@ def load_transcript_worker_config(
         log_jsonl_backup_count=parse_non_negative_int("log_jsonl_backup_count"),
         lock_path=resolve_delivery_path("lock_path"),
         postprocess_settings=postprocess_settings,
+        notification_config={"notification": merged.get("notification") or {}},
+        notification_env=env,
+        notification_config_path=(
+            Path(config_path) if Path(config_path).is_absolute() else repo_root() / config_path
+        ),
     )
 
 
@@ -453,6 +467,75 @@ def _safe_delivery_results(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return safe
 
 
+def _notify_terminal_quality_reviews(conn: sqlite3.Connection, notifier: BaseNotifier) -> None:
+    if not notifier.is_enabled():
+        return
+    # Include unresolved terminal jobs so a failed notification can be retried.
+    rows = conn.execute(
+        "SELECT j.id, j.orig_name, j.canonical_base, j.engine_params, p.status "
+        "FROM transcript_postprocess_jobs p JOIN jobs j ON j.id = p.source_job_id "
+        "LEFT JOIN quality_review_decisions d ON d.job_id = j.id "
+        "WHERE j.status = 'DONE' AND d.job_id IS NULL AND p.status IN (?, ?, ?) AND "
+        "CASE WHEN json_valid(j.engine_params) THEN json_extract(j.engine_params, '$.quality.health') END = 'bad'",
+        (TRANSCRIPT_DELIVERY_DELIVERED, TRANSCRIPT_DELIVERY_UNROUTED, TRANSCRIPT_DELIVERY_SKIPPED),
+    ).fetchall()
+    for row in rows:
+        try:
+            metadata = json.loads(row["engine_params"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        quality = metadata.get("quality") if isinstance(metadata, dict) else None
+        if not isinstance(quality, dict) or quality.get("health") != "bad":
+            continue
+        if requires_blocking_review(quality):
+            continue
+        notifier.notify_review({
+            "job_id": int(row["id"]),
+            "orig_name": str(row["orig_name"]),
+            "canonical_base": str(row["canonical_base"]),
+            "review_step": (
+                "교정·요약 완료"
+                if row["status"] == TRANSCRIPT_DELIVERY_DELIVERED
+                else "후속 처리 없이 종료"
+            ),
+            "review_message": str(quality.get("summary") or "품질 경고"),
+            "completed": True,
+        })
+
+
+def _refresh_notification_notifier(
+    config: TranscriptWorkerConfig,
+    previous: tuple[dict[str, Any], dict[str, str]] | None,
+    notifier: BaseNotifier,
+) -> tuple[tuple[dict[str, Any], dict[str, str]] | None, BaseNotifier]:
+    try:
+        if config.notification_config_path is None:
+            notification_config = config.notification_config
+            env = config.notification_env
+        else:
+            with config.notification_config_path.open("r", encoding="utf-8") as handle:
+                loaded = yaml.safe_load(handle)
+            if not isinstance(loaded, dict):
+                raise ValueError("notification config must be a mapping")
+            notification = loaded.get("notification") or {}
+            if not isinstance(notification, dict):
+                raise ValueError("notification section must be a mapping")
+            notification_config = {"notification": notification}
+            env = runtime_env(dotenv_path=env_file())
+        credentials = {
+            key: str(env.get(key) or "")
+            for key in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "TELEGRAM_MESSAGE_THREAD_ID")
+        }
+        current = (notification_config, credentials)
+        if current != previous:
+            notifier = build_notifier(notification_config, env=credentials, state_dir=config.db_path.parent)
+        return current, notifier
+    except (OSError, ValueError, yaml.YAMLError):
+        if notifier.is_enabled():
+            logger.warning("Notification config unavailable; review alert sending paused")
+        return None, NoopNotifier()
+
+
 def run_transcript_worker(
     config: TranscriptWorkerConfig,
     *,
@@ -479,6 +562,8 @@ def run_transcript_worker(
             config.postprocess_settings,
             dry_run=dry_run,
         )
+        notifier: BaseNotifier = NoopNotifier()
+        notification_state: tuple[dict[str, Any], dict[str, str]] | None = None
         try:
             while True:
                 reconciliation = reconcile_completed_jobs(
@@ -488,6 +573,11 @@ def run_transcript_worker(
                     dry_run=dry_run,
                 )
                 delivery = distributor.process_pending(limit=config.batch_size)
+                if not dry_run:
+                    notification_state, notifier = _refresh_notification_notifier(
+                        config, notification_state, notifier
+                    )
+                    _notify_terminal_quality_reviews(conn, notifier)
                 event = {
                     "event": "transcript_postprocess_scan",
                     "dry_run": dry_run,

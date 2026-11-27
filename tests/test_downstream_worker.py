@@ -117,6 +117,85 @@ class DownstreamWorkerReportingTests(unittest.TestCase):
         self.assertIn("downstream scan stats initial", logger.info.call_args.args[0])
 
 
+class CompletedQualityReviewTests(unittest.TestCase):
+    def test_runtime_notification_change_disables_existing_worker_notifier(self) -> None:
+        with tempfile.TemporaryDirectory(dir=CANONICAL_TEMP_ROOT) as tmp:
+            root = Path(tmp)
+            config_path = root / "config.yaml"
+            config_path.write_text("notification:\n  provider: telegram\n", encoding="utf-8")
+            config = downstream_worker.TranscriptWorkerConfig(
+                enabled=True, db_path=root / "jobs.sqlite3", scan_interval_sec=1,
+                batch_size=1, log_jsonl_path=root / "worker.jsonl", log_jsonl_max_bytes=0,
+                log_jsonl_backup_count=0, lock_path=root / "worker.lock",
+                active_semester_path=root / "active.json", notification_config_path=config_path,
+            )
+            credentials = {"TELEGRAM_BOT_TOKEN": "token", "TELEGRAM_CHAT_ID": "123"}
+            with (
+                mock.patch.object(downstream_worker, "runtime_env", return_value=credentials),
+                mock.patch("lecture_stt.stt.notifier.requests.get") as get_mock,
+            ):
+                get_mock.return_value.status_code = 200
+                get_mock.return_value.content = b'{"ok":true}'
+                get_mock.return_value.json.return_value = {"ok": True}
+                state, notifier = downstream_worker._refresh_notification_notifier(
+                    config, None, downstream_worker.NoopNotifier()
+                )
+                self.assertTrue(notifier.is_enabled())
+                same_state, same_notifier = downstream_worker._refresh_notification_notifier(
+                    config, state, notifier
+                )
+                self.assertIs(same_notifier, notifier)
+                self.assertEqual(same_state, state)
+                self.assertEqual(get_mock.call_count, 1)
+
+                config_path.write_text("notification:\n  provider: noop\n", encoding="utf-8")
+                state, notifier = downstream_worker._refresh_notification_notifier(
+                    config, state, notifier
+                )
+                self.assertFalse(notifier.is_enabled())
+
+                config_path.write_text("notification: [invalid]\n", encoding="utf-8")
+                state, notifier = downstream_worker._refresh_notification_notifier(
+                    config, state, notifier
+                )
+                self.assertIsNone(state)
+                self.assertFalse(notifier.is_enabled())
+
+    def test_review_notice_waits_for_terminal_postprocess_and_skips_decided_jobs(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(
+            "CREATE TABLE jobs (id INTEGER PRIMARY KEY, status TEXT, orig_name TEXT, "
+            "canonical_base TEXT, engine_params TEXT);"
+            "CREATE TABLE transcript_postprocess_jobs (source_job_id INTEGER, status TEXT);"
+            "CREATE TABLE quality_review_decisions (job_id INTEGER);"
+        )
+        bad = json.dumps({"quality": {"health": "bad", "summary": "반복 비율이 높음", "nonspace_chars": 20, "nonempty_segments": 2}})
+        good = json.dumps({"quality": {"health": "good"}})
+        for job_id, status, quality in (
+            (1, "DELIVERED", bad),
+            (2, "PENDING", bad),
+            (3, "UNROUTED", bad),
+            (4, "SKIPPED", bad),
+            (5, "DELIVERED", good),
+            (6, "DELIVERED", bad),
+        ):
+            conn.execute("INSERT INTO jobs VALUES (?, 'DONE', ?, ?, ?)", (job_id, f"{job_id}.wav", str(job_id), quality))
+            conn.execute("INSERT INTO transcript_postprocess_jobs VALUES (?, ?)", (job_id, status))
+        conn.execute("INSERT INTO quality_review_decisions VALUES (6)")
+
+        notifier = mock.Mock()
+        notifier.is_enabled.return_value = True
+        downstream_worker._notify_terminal_quality_reviews(conn, notifier)
+
+        self.assertEqual(
+            [call.args[0]["job_id"] for call in notifier.notify_review.call_args_list],
+            [1, 3, 4],
+        )
+        self.assertEqual(notifier.notify_review.call_args_list[0].args[0]["review_step"], "교정·요약 완료")
+        conn.close()
+
+
 class DownstreamWorkerConfigTests(unittest.TestCase):
     def _write_config(self, root: Path, *, override_line: str) -> Path:
         config_path = root / "config.yaml"

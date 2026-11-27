@@ -125,6 +125,7 @@ describe("decodePanelState", () => {
     expect(state.runtime_state.status).toBe("running")
     expect(state.actions.endpoints.logs).toBe("/api/custom-logs")
     expect(state.notification.selection).toBe("telegram")
+    expect(state.notification.options.map((option) => option.id)).toEqual(["telegram", "disabled"])
     expect(state.summary.current_job?.eta_sec).toBe(120)
     expect(state.counts.NEEDS_REVIEW).toBe(1)
     expect(state.jobs_v2[0]?.status).toBe("PROCESSING")
@@ -164,7 +165,29 @@ describe("decodePanelState", () => {
     expect(state.actions.endpoints.notification).toBe("/api/notification")
     expect(state.notification.selected_label).toBe("미지원 백엔드")
     expect(state.notification.options[0]?.available).toBe(false)
-    expect(state.notification.options[3]?.available).toBe(true)
+    expect(state.notification.options[1]?.available).toBe(true)
+  })
+
+  it("accepts nullable quality summary on a pending job", () => {
+    const payload = createStatePayload()
+    payload.jobs_v2[0] = {
+      ...payload.jobs_v2[0],
+      status: "PENDING",
+      stages: { audio: "pending", transcript: "pending", correction: "blocked", summary: "blocked" },
+      quality_review: { required: false, decision: null, decided_at: null, summary: null },
+    } as typeof payload.jobs_v2[number]
+
+    const state = decodePanelState(payload)
+    expect(state.jobs_v2[0]?.quality_review?.summary).toBeNull()
+    expect(state.jobs_v2[0]?.stages?.audio).toBe("pending")
+  })
+
+  it("maps legacy channel selection to disabled", () => {
+    const payload = createStatePayload()
+    payload.notification.selection = "discord"
+    const state = decodePanelState(payload)
+    expect(state.notification.selection).toBe("disabled")
+    expect(state.notification.options.map((option) => option.id)).toEqual(["telegram", "disabled"])
   })
 
   it("defaults NEEDS_REVIEW count to zero for older schema_version 2 payloads", () => {
