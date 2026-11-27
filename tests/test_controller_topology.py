@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -13,112 +12,24 @@ from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = REPO_ROOT / "src"
-if str(SRC_ROOT) not in sys.path:
-    sys.path.insert(0, str(SRC_ROOT))
+for import_root in (REPO_ROOT, SRC_ROOT):
+    if str(import_root) not in sys.path:
+        sys.path.insert(0, str(import_root))
 
 from lecture_stt.stt import controller_topology  # noqa: E402
-
-
-_PATH_VALUE = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin"
-_EXISTING_LABELS = (
-    "com.geonha.lecture-stt",
-    "com.geonha.lecture-stt-cleanup",
-    "com.geonha.lecture-stt-distribute",
-    "com.geonha.lecture-stt-webpanel",
+from tests.fixtures.controller_repo import (
+    LAUNCHD_PATH,
+    existing_plist,
+    plist_xml,
+    write_launchd_repo,
 )
-
-
-def _plist_xml(mapping: dict[str, object]) -> bytes:
-    import plistlib
-
-    return plistlib.dumps(mapping, sort_keys=False)
-
-
-def _existing_plist(label: str, *, stdout_name: str, stderr_name: str) -> dict[str, object]:
-    return {
-        "EnvironmentVariables": {"PATH": _PATH_VALUE},
-        "Label": label,
-        "ProgramArguments": ["/bin/bash", f"__REPO_ROOT__/scripts/{label}.sh"],
-        "StandardErrorPath": f"__HOME__/Library/Logs/lecture_stt/{stderr_name}",
-        "StandardOutPath": f"__HOME__/Library/Logs/lecture_stt/{stdout_name}",
-        "WorkingDirectory": "__REPO_ROOT__",
-    }
-
-
-def _write_repo_fixture(root: Path) -> None:
-    (root / "launchd").mkdir(parents=True, exist_ok=True)
-    (root / "controller/launchd").mkdir(parents=True, exist_ok=True)
-    (root / "scripts").mkdir(parents=True, exist_ok=True)
-
-    fixtures = {
-        "com.geonha.lecture-stt": _existing_plist(
-            "com.geonha.lecture-stt",
-            stdout_name="launchd.out.log",
-            stderr_name="launchd.err.log",
-        ),
-        "com.geonha.lecture-stt-cleanup": _existing_plist(
-            "com.geonha.lecture-stt-cleanup",
-            stdout_name="cleanup.out.log",
-            stderr_name="cleanup.err.log",
-        ),
-        "com.geonha.lecture-stt-distribute": _existing_plist(
-            "com.geonha.lecture-stt-distribute",
-            stdout_name="downstream.out.log",
-            stderr_name="downstream.err.log",
-        ),
-        "com.geonha.lecture-stt-webpanel": _existing_plist(
-            "com.geonha.lecture-stt-webpanel",
-            stdout_name="webpanel.out.log",
-            stderr_name="webpanel.err.log",
-        ),
-    }
-    for label, payload in fixtures.items():
-        _replace_path(root / "launchd" / f"{label}.plist", _plist_xml(payload))
-
-    _replace_path(
-        root / "controller/launchd/com.geonha.lecture-stt-controller-shadow.plist.template",
-        (REPO_ROOT / "controller/launchd/com.geonha.lecture-stt-controller-shadow.plist.template").read_bytes()
-    )
-    _replace_text(
-        root / "scripts/setup_launchd.sh",
-        textwrap.dedent(
-            """\
-            #!/usr/bin/env bash
-            set -euo pipefail
-            REPO=/tmp/repo
-            PLISTS=(
-              "com.geonha.lecture-stt"
-              "com.geonha.lecture-stt-cleanup"
-              "com.geonha.lecture-stt-distribute"
-              "com.geonha.lecture-stt-webpanel"
-            )
-            for label in "${PLISTS[@]}"; do
-              src="$REPO/launchd/${label}.plist"
-              render_plist "$src" "$dst"
-            done
-            """
-        ),
-    )
-
-
-def _replace_path(path: Path, payload: bytes) -> None:
-    if path.exists() or path.is_symlink():
-        if path.is_dir() and not path.is_symlink():
-            shutil.rmtree(path)
-        else:
-            path.unlink()
-    path.write_bytes(payload)
-
-
-def _replace_text(path: Path, payload: str) -> None:
-    _replace_path(path, payload.encode("utf-8"))
 
 
 class ControllerTopologyTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.temp_dir.name)
-        _write_repo_fixture(self.root)
+        write_launchd_repo(self.root)
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
@@ -166,7 +77,7 @@ class ControllerTopologyTests(unittest.TestCase):
 
     def test_candidate_placeholder_or_program_drift_fails_closed(self) -> None:
         candidate = self.root / "controller/launchd/com.geonha.lecture-stt-controller-shadow.plist.template"
-        payload = _plist_xml(
+        payload = plist_xml(
             {
                 **controller_topology._CANDIDATE_TEMPLATE,
                 "ProgramArguments": [
@@ -189,7 +100,7 @@ class ControllerTopologyTests(unittest.TestCase):
     def test_candidate_unknown_key_and_duplicate_plist_key_fail_closed(self) -> None:
         candidate = self.root / "controller/launchd/com.geonha.lecture-stt-controller-shadow.plist.template"
         candidate.write_bytes(
-            _plist_xml(
+            plist_xml(
                 {
                     **controller_topology._CANDIDATE_TEMPLATE,
                     "KeepAlive": True,
@@ -227,14 +138,14 @@ class ControllerTopologyTests(unittest.TestCase):
         with self.assertRaisesRegex(controller_topology.ControllerTopologyError, "must not reference"):
             controller_topology.run_topology_preflight(self.root)
 
-        _write_repo_fixture(self.root)
+        write_launchd_repo(self.root)
         worker = self.root / "launchd/com.geonha.lecture-stt.plist"
-        payload = _existing_plist(
+        payload = existing_plist(
             "com.geonha.lecture-stt",
             stdout_name="controller-shadow.evidence-result.jsonl",
             stderr_name="launchd.err.log",
         )
-        worker.write_bytes(_plist_xml(payload))
+        worker.write_bytes(plist_xml(payload))
         with self.assertRaisesRegex(controller_topology.ControllerTopologyError, "log paths must be unique"):
             controller_topology.run_topology_preflight(self.root)
 
@@ -245,7 +156,7 @@ class ControllerTopologyTests(unittest.TestCase):
             **controller_topology._CANDIDATE_TEMPLATE,
             "StartInterval": 3601,
         }
-        candidate.write_bytes(_plist_xml(too_slow))
+        candidate.write_bytes(plist_xml(too_slow))
         with self.assertRaisesRegex(
             controller_topology.ControllerTopologyError,
             "StartInterval is not bounded",
@@ -256,7 +167,7 @@ class ControllerTopologyTests(unittest.TestCase):
             **controller_topology._CANDIDATE_TEMPLATE,
             "StandardOutPath": controller_topology._CANDIDATE_TEMPLATE["StandardErrorPath"],
         }
-        candidate.write_bytes(_plist_xml(same_logs))
+        candidate.write_bytes(plist_xml(same_logs))
         with self.assertRaisesRegex(
             controller_topology.ControllerTopologyError,
             "stdout and stderr paths must differ",
@@ -267,7 +178,7 @@ class ControllerTopologyTests(unittest.TestCase):
             **controller_topology._CANDIDATE_TEMPLATE,
             "StandardOutPath": "__HOME__/Library/Logs/lecture_stt/launchd.out.log",
         }
-        candidate.write_bytes(_plist_xml(colliding_logs))
+        candidate.write_bytes(plist_xml(colliding_logs))
         with self.assertRaisesRegex(
             controller_topology.ControllerTopologyError,
             "stdout path contract drifted",
@@ -280,7 +191,7 @@ class ControllerTopologyTests(unittest.TestCase):
             **controller_topology._CANDIDATE_TEMPLATE,
             "WorkingDirectory": "__REPO_ROOT__",
         }
-        candidate.write_bytes(_plist_xml(drift))
+        candidate.write_bytes(plist_xml(drift))
 
         with self.assertRaisesRegex(
             controller_topology.ControllerTopologyError,
@@ -291,12 +202,12 @@ class ControllerTopologyTests(unittest.TestCase):
         bad_pythonpath = {
             **controller_topology._CANDIDATE_TEMPLATE,
             "EnvironmentVariables": {
-                "PATH": _PATH_VALUE,
+                "PATH": LAUNCHD_PATH,
                 "PYTHONDONTWRITEBYTECODE": "1",
                 "PYTHONPATH": "__REPO_ROOT__/other",
             },
         }
-        candidate.write_bytes(_plist_xml(bad_pythonpath))
+        candidate.write_bytes(plist_xml(bad_pythonpath))
         with self.assertRaisesRegex(
             controller_topology.ControllerTopologyError,
             "PYTHONPATH contract drifted",
@@ -306,12 +217,12 @@ class ControllerTopologyTests(unittest.TestCase):
         bad_bytecode = {
             **controller_topology._CANDIDATE_TEMPLATE,
             "EnvironmentVariables": {
-                "PATH": _PATH_VALUE,
+                "PATH": LAUNCHD_PATH,
                 "PYTHONDONTWRITEBYTECODE": "0",
                 "PYTHONPATH": "__BUNDLED_RUNTIME_ROOT__",
             },
         }
-        candidate.write_bytes(_plist_xml(bad_bytecode))
+        candidate.write_bytes(plist_xml(bad_bytecode))
         with self.assertRaisesRegex(
             controller_topology.ControllerTopologyError,
             "PYTHONDONTWRITEBYTECODE contract drifted",
@@ -333,14 +244,14 @@ class ControllerTopologyTests(unittest.TestCase):
         with self.assertRaisesRegex(controller_topology.ControllerTopologyError, "single-link"):
             controller_topology.run_topology_preflight(self.root)
 
-        _write_repo_fixture(self.root)
+        write_launchd_repo(self.root)
         candidate = self.root / "controller/launchd/com.geonha.lecture-stt-controller-shadow.plist.template"
         candidate.unlink()
         candidate.mkdir()
         with self.assertRaisesRegex(controller_topology.ControllerTopologyError, "not safely openable|regular file"):
             controller_topology.run_topology_preflight(self.root)
 
-        _write_repo_fixture(self.root)
+        write_launchd_repo(self.root)
         script = self.root / "scripts/setup_launchd.sh"
         script.write_bytes(b"x" * (controller_topology.MAX_REPO_FILE_BYTES + 1))
         with self.assertRaisesRegex(controller_topology.ControllerTopologyError, "size is out of bounds"):
@@ -360,13 +271,13 @@ class ControllerTopologyTests(unittest.TestCase):
     def test_existing_template_bytes_change_topology_digest(self) -> None:
         before = controller_topology.run_topology_preflight(self.root)
         worker = self.root / "launchd/com.geonha.lecture-stt.plist"
-        payload = _existing_plist(
+        payload = existing_plist(
             "com.geonha.lecture-stt",
             stdout_name="launchd.out.log",
             stderr_name="launchd.err.log",
         )
         payload["ThrottleInterval"] = 11
-        worker.write_bytes(_plist_xml(payload))
+        worker.write_bytes(plist_xml(payload))
 
         after = controller_topology.run_topology_preflight(self.root)
         self.assertNotEqual(before["topology_sha256"], after["topology_sha256"])

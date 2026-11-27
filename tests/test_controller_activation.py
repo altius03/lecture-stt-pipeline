@@ -6,180 +6,36 @@ import hashlib
 import os
 from pathlib import Path
 import re
-import shutil
 import stat
 import subprocess
 import sys
 import tempfile
-import textwrap
 import unittest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = REPO_ROOT / "src"
-if str(SRC_ROOT) not in sys.path:
-    sys.path.insert(0, str(SRC_ROOT))
+for import_root in (REPO_ROOT, SRC_ROOT):
+    if str(import_root) not in sys.path:
+        sys.path.insert(0, str(import_root))
 
 from lecture_stt.stt import controller_activation
 from lecture_stt.stt import controller_bundle
+from tests.fixtures.controller_files import remove_tree, set_runtime_tree_mode, write_file
+from tests.fixtures.controller_repo import BundleFixture
 
-
-_PATH_VALUE = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin"
 _RECORD_RE = re.compile(r"^(?P<sequence>\d+)\.((install)|(uninstall)|(rollback))\.json$")
-
-
-def _plist_xml(mapping: dict[str, object]) -> bytes:
-    import plistlib
-
-    return plistlib.dumps(mapping, sort_keys=False)
-
-
-def _existing_plist(label: str, *, stdout_name: str, stderr_name: str) -> dict[str, object]:
-    return {
-        "EnvironmentVariables": {"PATH": _PATH_VALUE},
-        "Label": label,
-        "ProgramArguments": ["/bin/bash", f"__REPO_ROOT__/scripts/{label}.sh"],
-        "StandardErrorPath": f"__HOME__/Library/Logs/lecture_stt/{stderr_name}",
-        "StandardOutPath": f"__HOME__/Library/Logs/lecture_stt/{stdout_name}",
-        "WorkingDirectory": "__REPO_ROOT__",
-    }
-
-
-def _replace_path(path: Path, payload: bytes) -> None:
-    if path.exists() or path.is_symlink():
-        if path.is_dir() and not path.is_symlink():
-            shutil.rmtree(path)
-        else:
-            path.unlink()
-    path.write_bytes(payload)
-
-
-def _replace_text(path: Path, payload: str) -> None:
-    _replace_path(path, payload.encode("utf-8"))
-
-
-def _remove_tree(path: Path) -> None:
-    if not path.exists() and not path.is_symlink():
-        return
-    for current in sorted(path.rglob("*"), reverse=True):
-        try:
-            current.chmod(0o700 if current.is_dir() else 0o600)
-        except OSError:
-            pass
-    try:
-        path.chmod(0o700)
-    except OSError:
-        pass
-    shutil.rmtree(path)
-
-
-def _write_repo_fixture(root: Path) -> None:
-    (root / "launchd").mkdir(parents=True, exist_ok=True)
-    (root / "controller/launchd").mkdir(parents=True, exist_ok=True)
-    (root / "scripts").mkdir(parents=True, exist_ok=True)
-    (root / "src/lecture_stt/stt").mkdir(parents=True, exist_ok=True)
-    _replace_path(
-        root / "src/lecture_stt/__init__.py",
-        (REPO_ROOT / "src/lecture_stt/__init__.py").read_bytes(),
-    )
-    _replace_path(
-        root / "src/lecture_stt/stt/__init__.py",
-        (REPO_ROOT / "src/lecture_stt/stt/__init__.py").read_bytes(),
-    )
-
-    for label, stdout_name, stderr_name in [
-        ("com.geonha.lecture-stt", "launchd.out.log", "launchd.err.log"),
-        ("com.geonha.lecture-stt-cleanup", "cleanup.out.log", "cleanup.err.log"),
-        ("com.geonha.lecture-stt-distribute", "downstream.out.log", "downstream.err.log"),
-        ("com.geonha.lecture-stt-webpanel", "webpanel.out.log", "webpanel.err.log"),
-    ]:
-        _replace_path(root / "launchd" / f"{label}.plist", _plist_xml(_existing_plist(label, stdout_name=stdout_name, stderr_name=stderr_name)))
-
-    _replace_path(
-        root / "controller/launchd/com.geonha.lecture-stt-controller-shadow.plist.template",
-        (REPO_ROOT / "controller/launchd/com.geonha.lecture-stt-controller-shadow.plist.template").read_bytes(),
-    )
-    _replace_text(
-        root / "scripts/setup_launchd.sh",
-        textwrap.dedent(
-            """\
-            #!/usr/bin/env bash
-            set -euo pipefail
-            REPO=/tmp/repo
-            PLISTS=(
-              "com.geonha.lecture-stt"
-              "com.geonha.lecture-stt-cleanup"
-              "com.geonha.lecture-stt-distribute"
-              "com.geonha.lecture-stt-webpanel"
-            )
-            for label in "${PLISTS[@]}"; do
-              src="$REPO/launchd/${label}.plist"
-              render_plist "$src" "$dst"
-            done
-            """
-        ),
-    )
-    _replace_path(
-        root / "src/lecture_stt/stt/controller_evidence.py",
-        (REPO_ROOT / "src/lecture_stt/stt/controller_evidence.py").read_bytes(),
-    )
-    _replace_path(
-        root / "src/lecture_stt/stt/controller_readiness.py",
-        (REPO_ROOT / "src/lecture_stt/stt/controller_readiness.py").read_bytes(),
-    )
-
-
-def _write_file(path: Path, payload: bytes | str = b"", *, executable: bool = False) -> None:
-    mode = 0o700 if executable else 0o600
-    binary = payload.encode("utf-8") if isinstance(payload, str) else payload
-    path.write_bytes(binary)
-    path.chmod(mode)
 
 
 class ControllerActivationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.temp_dir.name)
-        _write_repo_fixture(self.root)
-
-        self.repo_root = self.root
-        self.output_root = self.root / "bundle-output"
-        self.output_root.mkdir()
-        self.home = self.root / "home"
-        self.home.mkdir()
-        self.evidence_root = self.root / "evidence"
-        self.evidence_root.mkdir()
-        self.evidence_root.chmod(0o700)
-
-        self.source_binary = self.root / "source-controller"
-        _write_file(self.source_binary, b"#!/bin/bash\necho source\n", executable=True)
-
-        self.python_binary = self.root / "python-bin"
-        _write_file(self.python_binary, "#!/bin/bash\necho python\n", executable=True)
-
-        self.config = self.root / "config.yaml"
-        _write_file(self.config, "watch_root: {}\n".format(self.root))
-
-        self.kill_switch = self.root / "controller.disabled"
-        self.kill_switch.unlink(missing_ok=True)
-
+        self.bundle = BundleFixture(self.root)
         self.activation_root = self.root / "activation"
         self.activation_root.mkdir(mode=0o700)
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
-
-    @staticmethod
-    def _bundle_kwargs(context: "ControllerActivationTests") -> dict[str, str]:
-        return {
-            "repo_root": str(context.repo_root),
-            "output_root": str(context.output_root),
-            "source_binary": str(context.source_binary),
-            "python_binary": str(context.python_binary),
-            "config": str(context.config),
-            "kill_switch": str(context.kill_switch),
-            "home": str(context.home),
-            "evidence_root": str(context.evidence_root),
-        }
 
     @staticmethod
     def _canonical_sha(plan: dict[str, object]) -> str:
@@ -195,15 +51,11 @@ class ControllerActivationTests(unittest.TestCase):
         return hashlib.sha256(canonical).hexdigest()
 
     def _prepare_bundle(self) -> tuple[dict[str, object], Path]:
-        bundle_dir = self.output_root / controller_bundle.BUNDLE_DIRECTORY_NAME
-        if bundle_dir.exists() or bundle_dir.is_symlink():
-            if bundle_dir.is_dir() and not bundle_dir.is_symlink():
-                _remove_tree(bundle_dir)
-            else:
-                bundle_dir.unlink()
-        plan = controller_bundle.plan_controller_bundle(**self._bundle_kwargs(self))
+        bundle_dir = self.bundle.output_root / controller_bundle.BUNDLE_DIRECTORY_NAME
+        remove_tree(bundle_dir)
+        plan = controller_bundle.plan_controller_bundle(**self.bundle.plan_kwargs())
         result = controller_bundle.prepare_controller_bundle(
-            **self._bundle_kwargs(self),
+            **self.bundle.plan_kwargs(),
             enable_prepare=True,
             allow_write=True,
             expected_count=1,
@@ -295,11 +147,6 @@ class ControllerActivationTests(unittest.TestCase):
             "lecture_stt/stt/controller_evidence.py",
             "lecture_stt/stt/controller_readiness.py",
         ]
-
-    @staticmethod
-    def _set_runtime_tree_mode(runtime_root: Path, mode: int) -> None:
-        for candidate in (runtime_root, runtime_root / "lecture_stt", runtime_root / "lecture_stt/stt"):
-            candidate.chmod(mode)
 
     def test_plan_install_is_deterministic_with_exact_sha(self) -> None:
         bundle_plan, bundle_dir = self._prepare_bundle()
@@ -498,7 +345,7 @@ class ControllerActivationTests(unittest.TestCase):
         ):
             with self.subTest(scenario=scenario):
                 if self.activation_root.exists():
-                    _remove_tree(self.activation_root)
+                    remove_tree(self.activation_root)
                 self.activation_root.mkdir(mode=0o700)
                 _, bundle_dir = self._prepare_bundle()
                 install_plan = self._plan_install(bundle_dir)
@@ -512,40 +359,40 @@ class ControllerActivationTests(unittest.TestCase):
                 runtime = version / controller_bundle.RUNTIME_DIRECTORY_NAME
                 target = runtime / "lecture_stt/__init__.py"
                 if scenario == "unknown":
-                    self._set_runtime_tree_mode(runtime, 0o700)
-                    _write_file(runtime / "unexpected_runtime_file.py", "x = 1\n")
-                    self._set_runtime_tree_mode(runtime, 0o500)
+                    set_runtime_tree_mode(runtime, 0o700)
+                    write_file(runtime / "unexpected_runtime_file.py", "x = 1\n")
+                    set_runtime_tree_mode(runtime, 0o500)
                 elif scenario == "unknown_directory":
-                    self._set_runtime_tree_mode(runtime, 0o700)
+                    set_runtime_tree_mode(runtime, 0o700)
                     unexpected = runtime / "unexpected"
                     unexpected.mkdir()
                     unexpected.chmod(0o500)
-                    self._set_runtime_tree_mode(runtime, 0o500)
+                    set_runtime_tree_mode(runtime, 0o500)
                 elif scenario == "mode":
-                    self._set_runtime_tree_mode(runtime, 0o700)
+                    set_runtime_tree_mode(runtime, 0o700)
                     target.chmod(0o600)
-                    self._set_runtime_tree_mode(runtime, 0o500)
+                    set_runtime_tree_mode(runtime, 0o500)
                 elif scenario == "hardlink":
-                    self._set_runtime_tree_mode(runtime, 0o700)
+                    set_runtime_tree_mode(runtime, 0o700)
                     hardlink_source = self.root / "activation-runtime-hardlink-source"
                     if hardlink_source.exists():
                         hardlink_source.unlink()
                     os.link(target, hardlink_source)
                     target.unlink()
                     os.link(hardlink_source, target)
-                    self._set_runtime_tree_mode(runtime, 0o500)
+                    set_runtime_tree_mode(runtime, 0o500)
                     # Keep the extra hardlink to preserve nlink > 1 for drift check.
                 elif scenario == "symlink":
-                    self._set_runtime_tree_mode(runtime, 0o700)
+                    set_runtime_tree_mode(runtime, 0o700)
                     target.unlink()
                     target.symlink_to(
                         str(self.root / "src/lecture_stt/stt/controller_evidence.py")
                     )
-                    self._set_runtime_tree_mode(runtime, 0o500)
+                    set_runtime_tree_mode(runtime, 0o500)
                 else:
-                    self._set_runtime_tree_mode(runtime, 0o700)
+                    set_runtime_tree_mode(runtime, 0o700)
                     target.unlink()
-                    self._set_runtime_tree_mode(runtime, 0o500)
+                    set_runtime_tree_mode(runtime, 0o500)
 
                 with self.assertRaises(controller_activation.ControllerActivationRecoveryRequiredError):
                     controller_activation.plan_install(
@@ -564,10 +411,10 @@ class ControllerActivationTests(unittest.TestCase):
         version = self._version_dir(str(install_plan["source_version"]["plan_sha256"]))
         runtime_target = version / controller_bundle.RUNTIME_DIRECTORY_NAME / "lecture_stt/__init__.py"
         runtime_root = version / controller_bundle.RUNTIME_DIRECTORY_NAME
-        self._set_runtime_tree_mode(runtime_root, 0o700)
+        set_runtime_tree_mode(runtime_root, 0o700)
         runtime_target.unlink()
-        _write_file(runtime_target, "tampered = True\n")
-        self._set_runtime_tree_mode(runtime_root, 0o500)
+        write_file(runtime_target, "tampered = True\n")
+        set_runtime_tree_mode(runtime_root, 0o500)
         with self.assertRaises(controller_activation.ControllerActivationRecoveryRequiredError):
             self._plan_install(bundle_dir=bundle_dir)
 
@@ -612,13 +459,13 @@ class ControllerActivationTests(unittest.TestCase):
         os.chmod(version / controller_bundle.PLIST_FILENAME, 0o400)
 
         external = self.root / "external-target"
-        _write_file(external, b"external")
+        write_file(external, b"external")
         os.unlink(version / controller_bundle.PLIST_FILENAME)
         (version / controller_bundle.PLIST_FILENAME).symlink_to(external)
         with self.assertRaises(controller_activation.ControllerActivationRecoveryRequiredError):
             controller_activation.plan_uninstall(activation_root=str(self.activation_root))
         (version / controller_bundle.PLIST_FILENAME).unlink()
-        _write_file(version / controller_bundle.PLIST_FILENAME, b"plist", )
+        write_file(version / controller_bundle.PLIST_FILENAME, b"plist", )
         os.chmod(version / controller_bundle.PLIST_FILENAME, 0o400)
 
         linked_copy = version / "plist-copy"
