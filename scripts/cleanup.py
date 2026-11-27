@@ -5,8 +5,11 @@ import argparse
 from contextlib import ExitStack, closing
 from datetime import datetime
 import fcntl
+import hashlib
+import os
 from pathlib import Path
 import sqlite3
+import stat
 import sys
 import unicodedata
 
@@ -20,7 +23,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from lecture_stt.shared.paths import default_tmp_dir, env_file, resolve_config_path
-from lecture_stt.shared.utils import compute_sha256
+from lecture_stt.shared.temporary_wav import TemporaryWav, WORKSPACE_PREFIX, is_private_workspace, witness_name
 
 
 def _load_config(config_path: str = str(REPO_ROOT / "config" / "config.yaml")) -> dict:
@@ -52,7 +55,7 @@ def _ensure_config_defaults(config: dict) -> dict:
 
 def _retired_wavs(
     conn: sqlite3.Connection, delivery_enabled: bool
-) -> dict[str, tuple[str, Path, str]]:
+) -> dict[str, tuple[Path, str]]:
     """Return inactive temp WAV names with their canonical source and digest."""
     tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     conditions = ["j.status = 'DONE'"]
@@ -83,32 +86,51 @@ def _retired_wavs(
         if name in seen:
             candidates.pop(name, None)
         elif retired and audio and digest:
-            candidates[name] = (f"{stem}.wav", Path(audio), digest)
+            candidates[name] = (stem, Path(audio), digest)
         seen.add(name)
-    return candidates
+    return {witness_name(source, stem): (source, digest) for stem, source, digest in candidates.values()}
 
 
-def _cleanup_tmp(tmp_dir: Path, audio_dir: Path, candidates: dict[str, tuple[str, Path, str]],
+def _verified_source(source: Path, audio_dir: Path, digest: str, wav: TemporaryWav) -> bool:
+    if source.parent.resolve() != audio_dir.resolve() or source.is_symlink() or not source.is_file():
+        return False
+    try:
+        fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as handle:
+            before = os.fstat(fd)
+            if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+                    or os.path.samestat(before, os.fstat(wav.handle.fileno()))):
+                return False
+            actual = hashlib.file_digest(handle, "sha256").hexdigest()
+            after = source.lstat()
+            return (actual == digest and os.path.samestat(before, after)
+                    and before.st_ctime_ns == after.st_ctime_ns and before.st_size == after.st_size)
+    except (FileNotFoundError, IsADirectoryError):
+        return False
+
+
+def _cleanup_tmp(tmp_dir: Path, audio_dir: Path, candidates: dict[str, tuple[Path, str]],
                  cutoff_ts: float, dry_run: bool) -> int:
     deleted = 0
-    for item in tmp_dir.glob("*.wav"):
-        name = unicodedata.normalize("NFC", item.name).casefold()
-        if name not in candidates or item.is_symlink() or not item.is_file():
+    for directory in tmp_dir.glob(WORKSPACE_PREFIX + "*"):
+        if not is_private_workspace(directory):
             continue
-        if item.stat().st_mtime >= cutoff_ts:
-            continue
-        expected_name, source, digest = candidates[name]
-        expected = tmp_dir / expected_name
-        if not expected.exists() or not item.samefile(expected):
-            continue
-        if (source.is_symlink() or not source.is_file() or source.parent.resolve() != audio_dir.resolve()
-                or source.samefile(item) or compute_sha256(source) != digest):
-            continue
-        if dry_run:
-            print(f"[dry-run] would remove: {item}")
-        else:
-            item.unlink()
-            deleted += 1
+        for witness in directory.glob("owner-*"):
+            if witness.name not in candidates or witness.is_symlink() or not witness.is_file():
+                continue
+            wav = TemporaryWav.reopen(directory, witness)
+            if wav is None:
+                continue
+            with wav.handle:
+                if os.fstat(wav.handle.fileno()).st_mtime >= cutoff_ts:
+                    continue
+                source, digest = candidates[witness.name]
+                if not _verified_source(source, audio_dir, digest, wav):
+                    continue
+                if dry_run:
+                    print(f"[dry-run] would remove: {wav.path}")
+                else:
+                    deleted += int(wav.remove())
     return deleted
 
 
@@ -148,9 +170,13 @@ def main() -> None:
     tmp_dir = resolve_config_path(str(paths_cfg["tmp_dir"]), base_dir=REPO_ROOT)
     db_path = resolve_config_path(str(paths_cfg["db_path"]), base_dir=REPO_ROOT)
     retain_days = int(cfg["cleanup"]["retain_days"])
-    for protected in (audio_dir, transcript_dir):
+    protected_dirs = [audio_dir, transcript_dir]
+    for key in ("watch_folder", "error_folder"):
+        if paths_cfg.get(key):
+            protected_dirs.append(resolve_config_path(str(paths_cfg[key]), base_dir=REPO_ROOT))
+    for protected in protected_dirs:
         if tmp_dir.resolve().is_relative_to(protected.resolve()) or protected.resolve().is_relative_to(tmp_dir.resolve()):
-            parser.error("tmp_dir must be separate from the audio and transcript roots")
+            parser.error("tmp_dir must be separate from input, audio, transcript and error roots")
     if retain_days < 0:
         parser.error("retention settings must be non-negative")
     print(f"dry_run={dry_run}")

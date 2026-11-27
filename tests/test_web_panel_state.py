@@ -2084,6 +2084,32 @@ class WebPanelControllerExecutionOwnerTests(unittest.TestCase):
             self.assertIn("이력 정리 실패", state.notice)
             self.assertEqual(log_path.read_text(encoding="utf-8"), "keep log")
 
+    def test_history_plan_and_apply_use_the_default_db_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "config/config.yaml"
+            config.parent.mkdir()
+            config.write_text("paths: {watch_folder: inbox}\n", encoding="utf-8")
+            (root / "state").mkdir()
+            state = web_panel_state.ControlState(root)
+            self.assertEqual(state.db_path, root / "state/jobs.sqlite3")
+            with sqlite3.connect(state.db_path) as conn:
+                conn.execute(
+                    "INSERT INTO jobs (status, created_at, updated_at, orig_inbox_path, orig_name,"
+                    " canonical_base, canonical_audio_path) VALUES "
+                    "('DONE','2026-01-01','2026-01-01','inbox/a.wav','a.wav','a','audio/a.wav')"
+                )
+            plan = state.history_plan()
+            self.assertEqual(plan["count"], 1)
+
+            for changed in ("paths: {db_path: state/other.sqlite3}", "paths: {db_path: null}", ""):
+                with self.subTest(changed=changed):
+                    config.write_text(changed, encoding="utf-8")
+                    self.assertEqual(state.clear_history(plan["digest"])[0], 500)
+            config.write_text("paths: {}\n", encoding="utf-8")
+            self.assertEqual(state.clear_history(plan["digest"])[0], 200)
+            self.assertEqual(state.history_plan()["count"], 0)
+
     def test_history_apply_rereads_current_delivery_policy_and_refuses_unreadable_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2131,6 +2157,12 @@ class WebPanelControllerExecutionOwnerTests(unittest.TestCase):
                 (course_dir / "same_stem.txt").write_text("transcript", encoding="utf-8")
                 (course_dir / "same_stem.json").write_text("{}", encoding="utf-8")
                 (course_dir / "same_stem.quality.json").write_text("{}", encoding="utf-8")
+
+            for name in (".recovered-job-3", ".quality-recovery-temp/pair"):
+                recovery = course_dir / name
+                recovery.mkdir(parents=True)
+                (recovery / "same_stem.txt").write_text("review copy")
+                (recovery / "same_stem.json").write_text("{}")
 
             self.assertEqual(
                 web_panel_state.ControlState._count_transcript_sets(transcript_dir),

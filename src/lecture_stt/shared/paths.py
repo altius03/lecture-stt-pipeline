@@ -4,12 +4,27 @@ import os
 from pathlib import Path
 import re
 import shutil
-from typing import Mapping
+from typing import Iterator, Mapping
 
 from dotenv import dotenv_values
 
 
 _ENV_VAR_PATTERN = re.compile(r"\$(?:\{[A-Za-z_][A-Za-z0-9_]*\}|[A-Za-z_][A-Za-z0-9_]*)")
+
+
+RECOVERY_PAIR_PREFIX = ".recovered-job-"
+RECOVERY_STAGING_PREFIX = ".quality-recovery-"
+
+
+def iter_transcript_files(root: Path) -> Iterator[Path]:
+    """List visible transcript sets once; recovery copies are addressed by job ID."""
+    for parent, directories, files in os.walk(root):
+        directories[:] = [
+            name for name in directories
+            if not name.startswith((RECOVERY_PAIR_PREFIX, RECOVERY_STAGING_PREFIX))
+        ]
+        for name in files:
+            yield Path(parent) / name
 
 
 def repo_root() -> Path:

@@ -82,6 +82,13 @@ def _copy_present(mapping: Mapping[str, Any], keys: tuple[str, ...]) -> dict[str
     return {key: mapping[key] for key in keys if key in mapping and mapping[key] is not None}
 
 
+def inherited_review_reason(metadata: Mapping[str, Any]) -> str | None:
+    source_id = metadata.get("review_hold_source_job_id")
+    if type(source_id) is int and source_id > 0:
+        return f"원본 작업 #{source_id}의 검토 보류를 계승했습니다."
+    return None
+
+
 def build_quality_scorecard(
     metadata: Mapping[str, Any],
     *,
@@ -154,6 +161,8 @@ def build_quality_scorecard(
         "model": model,
         "artifacts": artifacts,
     }
+    if inherited_review_reason(metadata):
+        scorecard["review_hold_source_job_id"] = metadata["review_hold_source_job_id"]
     profile = metadata.get("profile")
     if isinstance(profile, Mapping):
         profile_snapshot = _copy_present(
@@ -216,6 +225,9 @@ def validate_quality_scorecard(transcript_json_path: str | Path, metadata: Mappi
     ):
         if scorecard.get(key) != expected[key]:
             raise ValueError(f"Quality scorecard {key} does not match transcript metadata")
+
+    if scorecard.get("review_hold_source_job_id") != expected.get("review_hold_source_job_id"):
+        raise ValueError("Quality scorecard inherited review hold does not match transcript metadata")
 
     if "profile" in expected and scorecard.get("profile") != expected["profile"]:
         raise ValueError("Quality scorecard profile does not match transcript metadata")

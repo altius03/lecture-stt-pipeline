@@ -1659,6 +1659,184 @@ class SttPipelineBehaviorTests(unittest.TestCase):
         self.assertEqual(stt_main.db.get_job(self.pipeline.conn, first_id)["status"], stt_main.STATUS_DONE)
         self.assertEqual(stt_main.db.get_job(self.pipeline.conn, second_id)["status"], stt_main.STATUS_PENDING)
 
+    def test_legacy_review_hold_survives_replay_without_quality_metadata(self) -> None:
+        source = self._write_stable_source("legacy-hold.m4a", b"held")
+        job_id = self.pipeline.process_job(source)["job_id"]
+        path = self.transcript_dir / "legacy-hold.json"
+        payload = json.loads(path.read_bytes())
+        payload["metadata"].pop("quality")
+        path.write_text(json.dumps(payload))
+        self.pipeline.notifier = _RecordingNotifier()
+        stt_main.db.set_status(self.pipeline.conn, job_id, stt_main.STATUS_NEEDS_REVIEW,
+                               error_message="운영자 확인 필요")
+        with mock.patch.object(self.pipeline.worker, "transcribe_file") as transcribe:
+            outcome = self.pipeline.process_job(self._write_stable_source("copy.m4a", b"held"))
+        transcribe.assert_not_called()
+        self.assertEqual(outcome["status"], "needs_review")
+        copy = stt_main.db.get_job(self.pipeline.conn, outcome["job_id"])
+        self.assertEqual(copy["deduped_from_job_id"], job_id)
+        self.assertIn(f"원본 작업 #{job_id}", copy["error_message"])
+        self.assertNotIn("운영자 확인 필요", copy["error_message"])
+        copy_meta = json.loads(copy["engine_params"])
+        self.assertNotEqual(copy_meta["quality"]["health"], "bad")
+        self.assertEqual(copy_meta["review_hold_source_job_id"], job_id)
+        card = json.loads((self.transcript_dir / "copy.quality.json").read_bytes())
+        self.assertEqual(card["review_hold_source_job_id"], job_id)
+        self.assertNotIn("운영자 확인 필요", json.dumps(card, ensure_ascii=False))
+        self.assertEqual(len(self.pipeline.notifier.reviews), 1)
+        self.assertEqual(self.pipeline.notifier.successes, [])
+        stt_main.db.set_status(self.pipeline.conn, copy["id"], stt_main.STATUS_PROCESSING)
+        self.assertEqual(stt_main.db.recover_processing_jobs(self.pipeline.conn)["needs_review"], 1)
+
+    def _historical_empty_output(self, name: str):
+        job = self.pipeline.process_job(self._write_stable_source(name + ".m4a", name.encode()))
+        row = stt_main.db.get_job(self.pipeline.conn, job["job_id"])
+        txt, path = Path(row["transcript_txt_path"]), Path(row["transcript_json_path"])
+        txt.write_bytes(b"")
+        doc = json.loads(path.read_bytes())
+        doc["segments"] = [{"id": 17, "start": 1.0, "end": 2.0, "text": ""}]
+        doc["metadata"]["quality"].update(health="good", quality_score=88, summary="old")
+        doc["metadata"]["timings"]["extra"] = "historical"
+        path.write_text(json.dumps(doc))
+        stt_main.write_quality_scorecard(path, doc["metadata"])
+        stt_main.db.set_status(self.pipeline.conn, row["id"], stt_main.STATUS_PROCESSING)
+        return row["id"], txt, path, doc
+
+    def _assert_empty_review_artifacts(self, job_id, original):
+        row = stt_main.db.get_job(self.pipeline.conn, job_id)
+        self.assertEqual(row["status"], stt_main.STATUS_NEEDS_REVIEW)
+        path = Path(row["transcript_json_path"])
+        payload = json.loads(path.read_bytes())
+        meta = payload["metadata"]
+        self.assertEqual(payload["segments"], original["segments"])
+        self.assertEqual(meta["timings"], original["metadata"]["timings"])
+        self.assertEqual(meta["quality"]["health"], "bad")
+        self.assertEqual(meta["quality"]["quality_score"], 0)
+        self.assertEqual(meta["quality"], json.loads(row["engine_params"])["quality"])
+        stt_main.validate_quality_scorecard(path, meta)
+        self.assertEqual(Path(row["transcript_txt_path"]).read_bytes(), b"")
+        return path
+
+    def test_recovery_updates_silent_legacy_json_scorecard_and_engine_metadata(self):
+        job_id, _, path, original = self._historical_empty_output("empty-legacy")
+        self.assertEqual(stt_main.db.recover_processing_jobs(self.pipeline.conn)["needs_review"], 1)
+        self.assertEqual(self._assert_empty_review_artifacts(job_id, original), path)
+        saved = path.read_bytes()
+        stt_main.db.set_status(self.pipeline.conn, job_id, stt_main.STATUS_PROCESSING)
+        stt_main.db.recover_processing_jobs(self.pipeline.conn)
+        self.assertEqual(self._assert_empty_review_artifacts(job_id, original).read_bytes(), saved)
+
+    def test_legacy_null_segment_and_missing_metadata_cannot_become_healthy(self):
+        job_id, txt, path, original = self._historical_empty_output("empty-before-metadata")
+        original.pop("metadata")
+        original["segments"][0]["text"] = None
+        path.write_text(json.dumps(original))
+        path.with_suffix(".quality.json").unlink()
+        txt.write_text("legacy placeholder")
+        stt_main.db.recover_processing_jobs(self.pipeline.conn)
+        recovered = stt_main.db.get_job(self.pipeline.conn, job_id)
+        self.assertEqual(recovered["status"], stt_main.STATUS_NEEDS_REVIEW)
+        payload = json.loads(path.read_bytes())
+        self.assertEqual(payload["segments"], original["segments"])
+        self.assertEqual(payload["metadata"]["quality"]["health"], "bad")
+        self.assertEqual(payload["metadata"]["quality"]["nonempty_segments"], 0)
+        self.assertEqual(payload["metadata"]["quality"], json.loads(recovered["engine_params"])["quality"])
+        self.assertEqual(txt.read_text(), "legacy placeholder")
+        stt_main.validate_quality_scorecard(path, payload["metadata"])
+
+    def test_interrupted_empty_repair_resumes_after_sidecar_write(self):
+        job_id, _, path, original = self._historical_empty_output("partial-empty")
+        write = stt_main.utils.atomic_write
+
+        def stop_before_json(target, data, *args, **kwargs):
+            if target == path:
+                raise KeyboardInterrupt()
+            return write(target, data, *args, **kwargs)
+
+        with mock.patch.object(stt_main.utils, "atomic_write", side_effect=stop_before_json):
+            with self.assertRaises(KeyboardInterrupt):
+                stt_main.db.recover_processing_jobs(self.pipeline.conn)
+        self.assertEqual(stt_main.db.get_job(self.pipeline.conn, job_id)["status"], stt_main.STATUS_PROCESSING)
+        stt_main.db.recover_processing_jobs(self.pipeline.conn)
+        self.assertEqual(self._assert_empty_review_artifacts(job_id, original), path)
+
+    def test_temporary_io_failure_keeps_empty_repair_retryable(self):
+        job_id, _, path, original = self._historical_empty_output("retry-empty")
+        with mock.patch.object(stt_main.utils, "atomic_write", side_effect=OSError("temporary I/O")):
+            counts = stt_main.db.recover_processing_jobs(self.pipeline.conn)
+        waiting = stt_main.db.get_job(self.pipeline.conn, job_id)
+        self.assertEqual(counts["done"], 0)
+        self.assertEqual(waiting["status"], stt_main.STATUS_PROCESSING)
+        self.assertEqual(waiting["current_step"], "품질 산출물 복구 대기")
+        stt_main.db.recover_processing_jobs(self.pipeline.conn)
+        self.assertEqual(self._assert_empty_review_artifacts(job_id, original), path)
+
+    def test_polling_worker_retries_only_deferred_repair_while_accepting_new_audio(self):
+        job_id, _, path, original = self._historical_empty_output("poll-empty")
+        fresh = self._write_stable_source("independent.m4a", b"independent")
+        write = stt_main.utils.atomic_write
+        clock = 0.0
+        attempts = []
+
+        def simulated_write(target, data, *args, **kwargs):
+            if target == path:
+                attempts.append(clock)
+                if len(attempts) < 3:
+                    raise OSError("temporarily unavailable")
+            return write(target, data, *args, **kwargs)
+
+        def poll_sleep(seconds):
+            nonlocal clock
+            clock += seconds
+            if clock >= 120 or stt_main.db.get_job(self.pipeline.conn, job_id)["status"] == stt_main.STATUS_NEEDS_REVIEW:
+                raise KeyboardInterrupt()
+
+        with (
+            mock.patch.object(stt_main.time, "monotonic", side_effect=lambda: clock),
+            mock.patch.object(stt_main.time, "sleep", side_effect=poll_sleep),
+            mock.patch.object(stt_main.utils, "atomic_write", side_effect=simulated_write),
+            mock.patch.object(self.pipeline.watcher, "scan_stable_files", side_effect=lambda: [fresh] if fresh.exists() else []),
+            mock.patch.object(self.pipeline, "startup_recovery", wraps=self.pipeline.startup_recovery) as startup,
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            self.pipeline.run()
+        startup.assert_called_once()
+        self.assertEqual(len(attempts), 3)
+        self.assertGreaterEqual(attempts[2] - attempts[1], self.pipeline.polling_interval_sec)
+        self.assertEqual(self._assert_empty_review_artifacts(job_id, original), path)
+        self.assertEqual(self.pipeline.conn.execute("SELECT status FROM jobs WHERE orig_name=?", (fresh.name,)).fetchone()[0], stt_main.STATUS_DONE)
+
+    def test_recovery_keeps_pinned_empty_transcript_pair_at_original_paths(self):
+        job_id, txt, path, original = self._historical_empty_output("empty-pinned")
+        original_bytes = path.read_bytes()
+        scorecard = path.with_suffix(".quality.json")
+        scorecard_bytes = scorecard.read_bytes()
+        self.pipeline.conn.execute(
+            "INSERT INTO transcript_deliveries(source_job_id, logical_stem, source_txt_path, "
+            "source_txt_sha256, source_json_path, source_json_sha256, route_method, created_at, updated_at) "
+            "VALUES(?,?,?,?,?,?,?,datetime('now'),datetime('now'))",
+            (job_id, path.stem, str(txt), stt_main.utils.compute_sha256(txt), str(path),
+             stt_main.utils.compute_sha256(path), "filename_alias"),
+        )
+        self.pipeline.conn.commit()
+        # The complete pair can already exist while the DB still names the original.
+        with mock.patch.object(stt_main.db, "set_status", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                stt_main.db.recover_processing_jobs(self.pipeline.conn)
+        self.assertEqual(stt_main.db.get_job(self.pipeline.conn, job_id)["transcript_json_path"], str(path))
+        stt_main.db.recover_processing_jobs(self.pipeline.conn)
+        repaired = self._assert_empty_review_artifacts(job_id, original)
+        self.assertNotEqual(repaired, path)
+        self.assertEqual(repaired.name, path.name)
+        row = stt_main.db.get_job(self.pipeline.conn, job_id)
+        self.assertEqual(Path(row["transcript_txt_path"]).parent, repaired.parent)
+        self.assertEqual(path.read_bytes(), original_bytes)
+        self.assertEqual(scorecard.read_bytes(), scorecard_bytes)
+        stt_main.db.set_status(self.pipeline.conn, job_id, stt_main.STATUS_PROCESSING)
+        stt_main.db.recover_processing_jobs(self.pipeline.conn)
+        self.assertEqual(self._assert_empty_review_artifacts(job_id, original), repaired)
+
+
     def test_empty_transcript_requires_review_including_replay_and_recovery(self) -> None:
         source = self._write_stable_source("silent.m4a", b"silent")
         empty_output = ([], "", 0.1, 0.2, self.tmp_dir / "missing-duration.wav")

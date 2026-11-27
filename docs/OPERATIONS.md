@@ -227,7 +227,7 @@ bash scripts/distribute_status.sh requeue ID --course-code CODE \
   --source-txt-sha256 TXT_SHA256 --source-json-sha256 JSON_SHA256
 ```
 
-`INPUT_TOO_LARGE`면 `last_error`의 입력 길이와 한도를 확인한다. 해당 단계의 `max_correction_chars` 또는 `max_summary_chars`를 모델이 처리할 수 있는 범위로 조정하고 후처리 워커가 새 설정을 읽은 뒤 재등록한다. 원본 지문과 학기·과목 연결을 재검증하며 이미 완료한 교정 결과는 보존한다. 일시적인 파일 접근 실패는 재시도하며, 시도 한도를 모두 썼다면 원본을 복원한 뒤 재등록한다.
+`INPUT_TOO_LARGE`면 `last_error`의 입력 길이와 한도를 확인한다. 해당 단계의 `max_correction_chars` 또는 `max_summary_chars`를 모델이 처리할 수 있는 범위로 조정하고 후처리 워커가 새 설정을 읽은 뒤 재등록한다. TXT·JSON 지문과 학기·과목 경로를 읽는 동안 다른 작업은 DB에 계속 기록할 수 있다. 재등록 직전에 원전사 행과 큐 상태를 다시 대조하며 이미 완료한 교정 결과는 보존한다. 일시적인 파일 접근 실패는 재시도하며, 시도 한도를 모두 썼다면 원본을 복원한 뒤 재등록한다.
 
 ### 웹 패널을 공유할 때
 
@@ -278,7 +278,7 @@ Launchd stdout/stderr rotation dry-run:
 - legacy `/Users/geonha/lecture_stt`는 2026-05-20 cleanup에서 삭제하지 않고 `~/Library/Application Support/lecture_stt/cleanup_archives/cleanup-20260520T014307Z/legacy_root`로 이동 보존했다.
 - repo 안 empty runtime folders는 placeholder로 유지한다.
 - repo-local stale tmp/log/state-log payloads는 2026-05-20 cleanup에서 `~/Library/Application Support/lecture_stt/cleanup_archives/cleanup-20260520T014307Z`로 이동 보존했다. iCloud audio/transcript cleanup 후보도 영구삭제하지 않고 `lecture_recordings/90_cleanup_archive/cleanup-20260520T014307Z`로 이동 보존했다.
-- `cleanup.py --apply`는 STT 잠금과 DB를 확인한 뒤 기간이 지난 작업용 WAV만 정리한다. 완료 작업의 원음 해시가 일치해야 하며 대기·검토·미전달 작업과 원음·전사·품질 기록은 보존한다. 기존 `retain_min_transcripts` 설정은 더 이상 필요하지 않다.
+- `cleanup.py --apply`는 STT 잠금과 DB를 확인한 뒤 기간이 지난 작업용 WAV만 정리한다. 완료 작업의 원음 해시가 일치해야 하며 대기·검토·미전달 작업과 원음·전사·품질 기록은 보존한다. 워커가 만든 임시 디렉터리에서 WAV와 소유 확인용 하드링크가 일치할 때만 삭제한다. 예전 방식의 WAV, 교체된 파일, 파일시스템이 하드링크·잠금을 지원하지 않거나 중단으로 증거가 일부만 남은 사본은 디스크에 남는다. 기존 `retain_min_transcripts` 설정은 더 이상 필요하지 않다.
 
 관련 이력/rollback 문서:
 

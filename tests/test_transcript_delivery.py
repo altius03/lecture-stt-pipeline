@@ -1067,6 +1067,77 @@ class TranscriptPostprocessTests(unittest.TestCase):
         self.assertEqual([done[key] for key in ("correction_attempt_count", "summary_attempt_count",
                                                 "delivery_attempt_count")], [1, 1, 1])
 
+    def test_requeue_keeps_sqlite_writable_during_source_and_semester_io(self) -> None:
+        _, row = self._queue_job(canonical_base="미분류", profile_key="general")
+        self.conn.execute("CREATE TABLE progress(event TEXT)")
+        self.conn.commit()
+        with closing(sqlite3.connect(self.db_path, timeout=0)) as other:
+            def observing(operation, name):
+                def perform(*args, **kwargs):
+                    with other:
+                        other.execute("INSERT INTO progress VALUES (?)", (name,))
+                    return operation(*args, **kwargs)
+                return perform
+            with (
+                mock.patch.object(td, "_read_regular_file_bytes", observing(td._read_regular_file_bytes, "source")),
+                mock.patch.object(td, "load_active_semester", observing(td.load_active_semester, "semester")),
+                mock.patch.object(td, "_active_snapshot_sha256", observing(td._active_snapshot_sha256, "hash")),
+                mock.patch.object(td, "_build_queue_fields", observing(td._build_queue_fields, "destinations")),
+            ):
+                self.assertEqual(self._confirmed_requeue(row), "PENDING")
+        events = [record[0] for record in self.conn.execute("SELECT event FROM progress")]
+        self.assertCountEqual(events, ["source", "source", "semester", "hash", "destinations"])
+
+    def test_requeue_does_not_overwrite_changes_during_confirmation(self) -> None:
+        for change in ("source_row", "queue_pin", "source_file", "active_semester"):
+            with self.subTest(change=change):
+                job_id, row = self._queue_job(canonical_base=change, profile_key="general", source_suffix=change)
+                build = td._build_queue_fields
+                def concurrent_change(*args, **kwargs):
+                    fields = build(*args, **kwargs)
+                    if change == "active_semester":
+                        copy = self.active_path.with_suffix(".new")
+                        copy.write_bytes(self.active_path.read_bytes())
+                        copy.replace(self.active_path)
+                    elif change == "source_file":
+                        Path(row["source_txt_path"]).write_text("새 내용", encoding="utf-8")
+                    else:
+                        with closing(sqlite3.connect(self.db_path, timeout=0)) as other, other:
+                            if change == "source_row":
+                                other.execute("UPDATE jobs SET orig_name='updated.wav' WHERE id=?", (job_id,))
+                            else:
+                                other.execute("UPDATE transcript_postprocess_jobs SET destination_txt_path='reserved' "
+                                              "WHERE source_job_id=?", (job_id,))
+                    return fields
+                with mock.patch.object(td, "_build_queue_fields", side_effect=concurrent_change):
+                    with self.assertRaises(td.TranscriptDeliveryConflictError):
+                        self._confirmed_requeue(row)
+                saved = shared_db.get_transcript_postprocess_job(self.conn, job_id)
+                self.assertEqual(saved["status"], "SKIPPED")
+                if change == "queue_pin":
+                    self.assertEqual(saved["destination_txt_path"], "reserved")
+
+    def test_requeue_returns_already_delivered_when_concurrent_confirmation_wins(self) -> None:
+        job_id, row = self._queue_job(canonical_base="미분류", profile_key="general")
+        build = td._build_queue_fields
+        with closing(sqlite3.connect(self.db_path, timeout=0)) as other:
+            other.row_factory = sqlite3.Row
+            def complete_on_other_connection(*args, **kwargs):
+                fields = build(*args, **kwargs)
+                with mock.patch.object(td, "_build_queue_fields", build):
+                    self.assertEqual(td.requeue_confirmed_job(
+                        other, source_job_id=job_id, course_code="CS201",
+                        source_txt_sha256=row["source_txt_sha256"],
+                        source_json_sha256=row["source_json_sha256"], settings=self.settings,
+                    ), "PENDING")
+                    self.assertEqual(td.TranscriptDeliveryDistributor(other, self.settings).process_pending()["delivered"], 1)
+                return fields
+            with mock.patch.object(td, "_build_queue_fields", side_effect=complete_on_other_connection):
+                self.assertEqual(self._confirmed_requeue(row), "DELIVERED")
+        done = shared_db.get_transcript_postprocess_job(self.conn, job_id)
+        for stage in ("correction", "summary", "delivery"):
+            self.assertEqual(done[f"{stage}_attempt_count"], 1)
+
     def test_skipped_legacy_row_with_stage_intent_is_never_redirected(self) -> None:
         job_id, row = self._queue_job(canonical_base="장소 녹음", profile_key="general")
         shared_db.update_transcript_postprocess_job(self.conn, job_id, correction_stage_json_sha256="f" * 64)

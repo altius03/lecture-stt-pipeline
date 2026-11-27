@@ -128,7 +128,8 @@ flowchart LR
 - `PollingWatcher`가 inbox 폴더를 polling하면서 일정 시간 이상 변하지 않은 일반 파일만 안정 파일로 판단하고 심볼릭 링크는 제외한다.
 - 안정 파일은 먼저 로컬 `tmp/inbox_staging`으로 선점 이동한 뒤 `01_audio`로 옮겨, iCloud rename/sync 영향이 전사 중간 단계로 번지지 않게 한다.
 - 워커 시작 시 `tmp/inbox_staging`의 파일은 과거 완료 작업과 이름이 같아도 inbox로 되돌린다. 실제로 되돌린 staging 파일에 대응하는 job row만 지우고, DB가 가리키는 staging 파일이 없으면 행을 `NEEDS_REVIEW`로 남겨 고립된 canonical 오디오를 조사할 수 있게 한다. 중단된 `PROCESSING`을 먼저 복구한 뒤 미완성 일반 작업의 `01_audio`를 inbox로 되돌린다.
-- 같은 SHA-256의 `DONE` 또는 `NEEDS_REVIEW` 작업이 있으면 기존 결과를 복제해 dedupe 처리한다. 복제 전에 새 job을 `PROCESSING`으로 claim하고 복제 계보와 결과 metadata를 먼저 기록하므로 산출물 완성 직후 중단된 작업도 이력을 유지하며 복구한다. 복제 실패 후 일반 전사로 대체하면 계보와 원래 engine 설정을 즉시 복원한다. 원본 작업이 검토 상태라면 새 작업도 성공으로 승격하지 않고 `NEEDS_REVIEW`를 유지한다.
+- 같은 SHA-256의 `DONE` 또는 `NEEDS_REVIEW` 작업이 있으면 기존 결과를 복제해 dedupe 처리한다. 복제 전에 새 job을 `PROCESSING`으로 claim하고 복제 계보와 결과 metadata를 먼저 기록하므로 산출물 완성 직후 중단된 작업도 이력을 유지하며 복구한다. 복제 실패 후 일반 전사로 대체하면 계보와 원래 engine 설정을 즉시 복원한다. 검토 중인 원본을 재사용하면 복사본도 `NEEDS_REVIEW`를 유지한다. 품질 수치와 별도로 검토 보류의 출처인 작업 ID를 기록하므로 과거 원본에 품질 필드가 없어도 중단 복구 뒤 같은 판정이 유지된다.
+- 중단 작업의 무음 전사는 TXT와 발화 구간을 유지하면서 JSON·품질 기록·DB 판정을 맞춘다. 전달 원장에 이미 고정된 자료는 같은 이름의 별도 복구본으로 게시하고 작업 행이 그 쌍을 가리킨다. 패널에서 녹음 수를 셀 때와 수동 교정 폴더를 스캔할 때는 이 복구 디렉터리를 제외한다. 쓰기에 일시적으로 실패하면 상시 Python 워커가 최소 30초 간격으로 복구 대기 행 한 건을 다시 확인한다.
 - 입력 stem은 NFC로 정규화하고 Unicode 문자·숫자를 보존한다. macOS/iCloud의 NFD 한글 파일명도 더 이상 `audio`로 붕괴하지 않는다.
 - `profiles.active`가 있으면 선택한 프로필의 transcribe override, 후처리 교정표, 품질 임계값을 적용한다. 프로필 설정이 없는 기존 config는 처리 동작을 바꾸지 않는 `legacy/unversioned` 프로필로 기록한다.
 - 중복이 아니면 `STTWorker`가 ffmpeg로 WAV 전처리 후 faster-whisper 전사를 수행한다.
@@ -412,8 +413,8 @@ flowchart LR
   `operational_install_supported=false`, `python_polling_authority=true`를
   고정한다. 이 모듈에는 subprocess, LaunchAgents/launchctl, 운영 DB/root,
   worker 제어 경로가 없다.
-- 예약 정리는 기본 dry-run이다. 수동 적용 시 STT 워커와 같은 잠금, SQLite 쓰기 트랜잭션 안에서 기간이 지난 임시 WAV만 정리한다. 정본 오디오 SHA-256, 작업 완료와 후처리 상태, 이름의 유일성을 확인한다.
-- 원음, 원전사 TXT·JSON, 품질 기록과 staging은 보존한다. DB가 없거나 워커가 가동 중이면 정리를 적용할 수 없다.
+- 디코더는 작업마다 전용 임시 디렉터리를 만들고 열린 파일 디스크립터로 WAV를 쓴다. 작업 종료 시 자신이 생성한 파일만 제거한다. 예약 정리는 기본 dry-run이며 수동 적용 시 STT 워커와 같은 잠금을 잡는다. 기간이 지난 WAV와 소유 확인용 하드링크가 같은 파일인지, 해당 작업이 종료됐는지, 정본 오디오 SHA-256과 후처리 상태가 일치하는지 확인한다.
+- 원음, 원전사 TXT·JSON, 품질 기록과 staging은 보존한다. DB가 없거나 워커가 가동 중이면 정리를 적용할 수 없다. 임시 폴더와 감시·원음·전사·오류 폴더가 겹쳐도 정리를 거부한다.
 - 설치된 scheduled cleanup은 인자 없는 기본 dry-run으로만 실행된다. 보존 기간 경과만으로는 “미사용”을 증명하지 못하므로 운영 apply 근거로 사용하지 않는다. Legacy 파일을 정리하려면 Storage v2와 archive-evidence verifier issue 0, active/problem/postprocess row 0, 각 파일의 single-link regular metadata와 SHA-256 보존 사본을 함께 확인해야 한다.
 - 2026-08-09에는 위 별도 검증으로 Storage v2에 exact copy가 있고 운영 파일 참조가 없는 과거 audio 41개, summary 97개와 disposable metadata 5개, 합계 143개만 iCloud 휴지통으로 이동했다. `DONE`/`NEEDS_REVIEW` job의 legacy transcript TXT/JSON 경로는 같은 SHA 입력의 dedupe replay가 직접 읽으므로 Storage v2 사본이 있어도 활성 의존성이다. 이 경로가 Storage v2 read로 전환되기 전에는 transcript와 같은 stem의 quality sidecar를 cleanup하지 않는다. 같은 bytes여도 실패 원위치나 historical filename provenance가 다른 자료도 중복으로 취급하지 않는다. Active v1 디렉터리는 새 입력·전사·Codex staging을 위해 그대로 유지하며, 검증 사본이 없는 transcript/correction/prompt/recovery/manual-review 자료는 보존한다.
 

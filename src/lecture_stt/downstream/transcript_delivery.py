@@ -243,7 +243,7 @@ def _active_snapshot_sha256(path: Path) -> str:
     return utils.compute_sha256(path)
 
 
-def _load_legacy_job_source(conn: sqlite3.Connection, source_job_id: int) -> LegacyJobSource:
+def _done_job_row(conn: sqlite3.Connection, source_job_id: int) -> sqlite3.Row:
     row = conn.execute(
         """
         SELECT
@@ -267,10 +267,14 @@ def _load_legacy_job_source(conn: sqlite3.Connection, source_job_id: int) -> Leg
         raise TranscriptDeliveryError(f"Legacy job not found: {source_job_id}")
     if str(row["status"]) != "DONE":
         raise TranscriptDeliveryError(f"Legacy job is not DONE: {source_job_id}")
+    if not all(str(row[key] or "").strip() for key in ("transcript_txt_path", "transcript_json_path")):
+        raise TranscriptDeliveryError(f"Legacy job transcript paths are incomplete: {source_job_id}")
+    return row
+
+
+def _read_legacy_job_source(row: sqlite3.Row) -> LegacyJobSource:
     txt_path = Path(str(row["transcript_txt_path"] or "").strip())
     json_path = Path(str(row["transcript_json_path"] or "").strip())
-    if not txt_path or not json_path:
-        raise TranscriptDeliveryError(f"Legacy job transcript paths are incomplete: {source_job_id}")
     txt_bytes = _read_regular_file_bytes(txt_path, field="source_txt_path")
     json_bytes = _read_regular_file_bytes(json_path, field="source_json_path")
     engine_params = _safe_engine_params(row["engine_params"])
@@ -579,7 +583,7 @@ def enqueue_completed_job(
     shared_db.init_transcript_postprocess_jobs_table(conn)
     active = load_active_semester(settings.active_semester_path)
     active_sha256 = _active_snapshot_sha256(settings.active_semester_path)
-    source = _load_legacy_job_source(conn, source_job_id)
+    source = _read_legacy_job_source(_done_job_row(conn, source_job_id))
     completed_at = _parse_iso_datetime(source.completed_at)
     cutoff = _parse_iso_datetime(active.activated_at)
     if completed_at is None or cutoff is None:
@@ -630,6 +634,11 @@ def enqueue_completed_job(
     return str(existing["status"])
 
 
+def _file_identity(path: Path) -> tuple[int, int, int, int, int]:
+    info = path.lstat()
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+
+
 def requeue_confirmed_job(
     conn: sqlite3.Connection,
     *,
@@ -640,56 +649,59 @@ def requeue_confirmed_job(
     settings: TranscriptPostprocessSettings,
 ) -> str:
     """Requeue only the confirmed source and course, preserving completed stages."""
-    with conn:
-        conn.execute("BEGIN IMMEDIATE")
-        row = shared_db.get_transcript_postprocess_job(conn, source_job_id)
-        if row is None:
-            raise TranscriptDeliveryConflictError("후처리 작업을 찾을 수 없습니다.")
-        source = _load_legacy_job_source(conn, source_job_id)
-        for kind, path, digest, expected in (
-            ("txt", source.transcript_txt_path, source.source_txt_sha256, source_txt_sha256),
-            ("json", source.transcript_json_path, source.source_json_sha256, source_json_sha256),
+    row = shared_db.get_transcript_postprocess_job(conn, source_job_id)
+    if row is None:
+        raise TranscriptDeliveryConflictError("후처리 작업을 찾을 수 없습니다.")
+    job = _done_job_row(conn, source_job_id)
+    source_paths = [Path(str(job[f"transcript_{kind}_path"]).strip()) for kind in ("txt", "json")]
+    source_identities = [_file_identity(path) for path in source_paths]
+    source = _read_legacy_job_source(job)
+    for kind, path, digest, expected in (
+        ("txt", source.transcript_txt_path, source.source_txt_sha256, source_txt_sha256),
+        ("json", source.transcript_json_path, source.source_json_sha256, source_json_sha256),
+    ):
+        if (
+            str(path) != row[f"source_{kind}_path"]
+            or digest != row[f"source_{kind}_sha256"]
+            or digest != expected
         ):
-            if (
-                str(path) != row[f"source_{kind}_path"]
-                or digest != row[f"source_{kind}_sha256"]
-                or digest != expected
-            ):
-                raise TranscriptDeliveryConflictError("확인한 원전사 경로 또는 SHA-256이 달라졌습니다.")
-        status = str(row["status"])
-        if status in {TRANSCRIPT_DELIVERY_SKIPPED, TRANSCRIPT_DELIVERY_UNROUTED}:
-            # Conflicting legacy rows can carry paths or hashes from an earlier
-            # delivery. Never redirect or reset an existing artifact reservation.
-            if any(
-                row[name] is not None for name in row.keys()
-                if name.startswith(("correction_stage_", "summary_stage_", "destination_"))
-            ) or any(row[name] == STAGE_READY for name in ("correction_status", "summary_status")):
-                raise TranscriptDeliveryConflictError("기존 후처리 산출물 기록이 있어 과목을 변경할 수 없습니다.")
-            active = load_active_semester(settings.active_semester_path)
-            digest = _active_snapshot_sha256(settings.active_semester_path)
-            if digest != row["active_semester_sha256"]:
-                raise TranscriptDeliveryConflictError("등록 당시의 활성 학기 설정이 달라졌습니다.")
-            stem = row["logical_stem"]
-            if (
-                stem != source.canonical_base
-                or not stem
-                or Path(stem).name != stem
-                or stem in {".", ".."}
-            ):
-                raise TranscriptDeliveryConflictError("원전사 파일 이름이 등록 당시와 일치하지 않습니다.")
-            fields = _build_queue_fields(
-                active,
-                active_semester_path=settings.active_semester_path,
-                active_semester_sha256=digest,
-                source=source,
-                route=_confirmed_course_route(active, stem, course_code),
-                settings=settings,
-            )
-        else:
-            if course_code != row["course_code"]:
-                raise TranscriptDeliveryConflictError("확인한 과목과 등록된 과목이 다릅니다.")
-            if status in {TRANSCRIPT_DELIVERY_PENDING, TRANSCRIPT_DELIVERY_DELIVERED}:
-                return status
+            raise TranscriptDeliveryConflictError("확인한 원전사 경로 또는 SHA-256이 달라졌습니다.")
+    status = str(row["status"])
+    active_identity = None
+    fields = {}
+    if status in {TRANSCRIPT_DELIVERY_SKIPPED, TRANSCRIPT_DELIVERY_UNROUTED}:
+        # Conflicting legacy rows can carry paths or hashes from an earlier
+        # delivery. Never redirect or reset an existing artifact reservation.
+        if any(
+            row[name] is not None for name in row.keys()
+            if name.startswith(("correction_stage_", "summary_stage_", "destination_"))
+        ) or any(row[name] == STAGE_READY for name in ("correction_status", "summary_status")):
+            raise TranscriptDeliveryConflictError("기존 후처리 산출물 기록이 있어 과목을 변경할 수 없습니다.")
+        active_identity = _file_identity(settings.active_semester_path)
+        active = load_active_semester(settings.active_semester_path)
+        digest = _active_snapshot_sha256(settings.active_semester_path)
+        if digest != row["active_semester_sha256"]:
+            raise TranscriptDeliveryConflictError("등록 당시의 활성 학기 설정이 달라졌습니다.")
+        stem = row["logical_stem"]
+        if (
+            stem != source.canonical_base
+            or not stem
+            or Path(stem).name != stem
+            or stem in {".", ".."}
+        ):
+            raise TranscriptDeliveryConflictError("원전사 파일 이름이 등록 당시와 일치하지 않습니다.")
+        fields = _build_queue_fields(
+            active,
+            active_semester_path=settings.active_semester_path,
+            active_semester_sha256=digest,
+            source=source,
+            route=_confirmed_course_route(active, stem, course_code),
+            settings=settings,
+        )
+    else:
+        if course_code != row["course_code"]:
+            raise TranscriptDeliveryConflictError("확인한 과목과 등록된 과목이 다릅니다.")
+        if status not in {TRANSCRIPT_DELIVERY_PENDING, TRANSCRIPT_DELIVERY_DELIVERED}:
             if (status, row["last_error_code"]) not in {
                 (TRANSCRIPT_DELIVERY_NEEDS_REVIEW, "INPUT_TOO_LARGE"),
                 (TRANSCRIPT_DELIVERY_ERROR, "FILESYSTEM_ERROR"),
@@ -705,6 +717,37 @@ def requeue_confirmed_job(
                 "last_error_stage": None,
                 "last_error": None,
             }
+
+    if source_identities != [_file_identity(path) for path in source_paths]:
+        raise TranscriptDeliveryConflictError("확인하는 동안 원전사 파일이 바뀌었습니다.")
+
+    # The distributor rechecks the source hashes before generating any output.
+    # A DB writer is needed only to compare pins and perform the transition.
+    with conn:
+        conn.execute("BEGIN IMMEDIATE")
+        if _done_job_row(conn, source_job_id) != job:
+            raise TranscriptDeliveryConflictError("확인하는 동안 전사 작업 기록이 바뀌었습니다.")
+        current = shared_db.get_transcript_postprocess_job(conn, source_job_id)
+        if current is None:
+            raise TranscriptDeliveryConflictError("확인하는 동안 후처리 작업이 사라졌습니다.")
+        if current != row:
+            # A duplicate confirmation may already have advanced through delivery.
+            # Return that state only if this request verified the same immutable pins.
+            expected = dict(row)
+            expected.update(fields)
+            if (
+                current["status"] in {TRANSCRIPT_DELIVERY_PENDING, TRANSCRIPT_DELIVERY_DELIVERED}
+                and current["course_code"] == course_code
+                and _pinned_field_mismatch(current, expected, settings=settings) is None
+            ):
+                return str(current["status"])
+            raise TranscriptDeliveryConflictError("확인하는 동안 후처리 작업이 바뀌었습니다. 다시 조회하세요.")
+        if not fields:
+            return status
+        # Semester activation atomically replaces this local snapshot under the
+        # same DB lock. Compare its identity here without rereading its contents.
+        if active_identity is not None and _file_identity(settings.active_semester_path) != active_identity:
+            raise TranscriptDeliveryConflictError("확인하는 동안 활성 학기 설정이 바뀌었습니다.")
         shared_db.update_transcript_postprocess_job(conn, source_job_id, **fields)
     return TRANSCRIPT_DELIVERY_PENDING
 
@@ -777,7 +820,7 @@ def reconcile_completed_jobs(
             continue
         try:
             if dry_run:
-                source = _load_legacy_job_source(conn, source_job_id)
+                source = _read_legacy_job_source(_done_job_row(conn, source_job_id))
                 route = resolve_course_route(
                     active,
                     CourseRoutingSource(

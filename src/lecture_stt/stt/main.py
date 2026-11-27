@@ -59,6 +59,7 @@ from lecture_stt.stt.profiles import (
 )
 from lecture_stt.stt.quality_gate import (
     evaluate as quality_evaluate,
+    inherited_review_reason,
     validate_quality_scorecard,
     write_quality_scorecard,
 )
@@ -1272,14 +1273,14 @@ class STTPipeline:
                 return False
 
             segments = prior_payload.get("segments")
-            if not isinstance(segments, list):
+            if not isinstance(segments, list) or not all(isinstance(item, dict) for item in segments):
                 return False
 
             text = "\n".join(
                 [
-                    str(item.get("text", "")).strip()
+                    str(item.get("text") or "").strip()
                     for item in segments
-                    if str(item.get("text", "")).strip()
+                    if str(item.get("text") or "").strip()
                 ]
             )
 
@@ -1325,15 +1326,16 @@ class STTPipeline:
                 if isinstance(prior_metadata, dict)
                 else None
             )
-            if (duplicate["status"] == STATUS_NEEDS_REVIEW and isinstance(prior_quality, dict)
-                    and prior_quality.get("health") != "bad" and text.strip()):
-                # The original was held for a reason outside its quality score.
-                # Keep its evidence and produce a fresh independent result.
-                return False
-            if isinstance(prior_quality, dict) and text.strip():
+            if (text.strip() and isinstance(prior_quality, dict)
+                    and prior_quality.get("health") in ("good", "warn", "bad")
+                    and isinstance(prior_quality.get("quality_score"), int)
+                    and isinstance(prior_quality.get("summary"), str)):
                 metadata["quality"] = dict(prior_quality)
             else:
                 metadata["quality"] = quality_evaluate(segments, text).to_dict()
+            if duplicate["status"] == STATUS_NEEDS_REVIEW and metadata["quality"].get("health") != "bad":
+                # Reusing bytes does not resolve an existing operator or recovery hold.
+                metadata["review_hold_source_job_id"] = int(duplicate["id"])
 
             db.update_job(
                 self.conn,
@@ -1346,8 +1348,8 @@ class STTPipeline:
             self._validate_output_files(txt_path, json_path)
             self._update_progress(job_id, "전사문 생성(TXT/JSON)")
             replay_health = str(metadata["quality"].get("health", "")).strip().lower()
-            if replay_health == "bad":
-                self._handle_bad_quality(
+            if replay_health == "bad" or inherited_review_reason(metadata):
+                self._handle_quality_review(
                     job_id=job_id,
                     source_path=source_path,
                     canonical_audio=canonical_audio_path,
@@ -1561,7 +1563,7 @@ class STTPipeline:
             })
         self._log(logging.ERROR, "failed", job_ctx)
 
-    def _handle_bad_quality(
+    def _handle_quality_review(
         self,
         *,
         job_id: int,
@@ -1586,7 +1588,7 @@ class STTPipeline:
             raw_summary = quality_report.get("summary", "품질 위험")
         else:
             raw_summary = getattr(quality_report, "summary", "품질 위험")
-        safe_summary = _redact_sensitive_text(str(raw_summary))
+        safe_summary = inherited_review_reason(metadata) or _redact_sensitive_text(str(raw_summary))
         db.update_job(
             self.conn,
             job_id,
@@ -1616,7 +1618,7 @@ class STTPipeline:
             "pending_count": queue.get("PENDING", 0),
             "processing_count": queue.get("PROCESSING", 0),
         })
-        self._log(logging.WARNING, "bad quality transcript preserved for remediation: %s", {"job_id": str(job_id), "canonical_base": canonical_base}, safe_summary)
+        self._log(logging.WARNING, "transcript preserved for review: %s", {"job_id": str(job_id), "canonical_base": canonical_base}, safe_summary)
 
     # 하나의 파일에 대해 이동, 중복 처리, 전사, 저장, 알림까지 수행한다.
     def process_job(
@@ -1874,7 +1876,7 @@ class STTPipeline:
             self._write_output(txt_path, json_path, segments, transcript_text, metadata)
             self._validate_output_files(txt_path, json_path)
             if quality_report.health == "bad":
-                self._handle_bad_quality(
+                self._handle_quality_review(
                     job_id=job_id,
                     source_path=source_path,
                     canonical_audio=canonical_audio_final,
@@ -2203,7 +2205,7 @@ class STTPipeline:
             self._write_output(txt_path, json_path, segments, transcript_text, metadata)
             self._validate_output_files(txt_path, json_path)
             if quality_report.health == "bad":
-                self._handle_bad_quality(
+                self._handle_quality_review(
                     job_id=job_id,
                     source_path=source_path,
                     canonical_audio=canonical_audio,
@@ -2292,7 +2294,8 @@ class STTPipeline:
 
     def run(self, run_once: bool = False) -> None:
         # 파이프라인을 루프 또는 한 번 처리 모드로 실행하고 pause 상태를 반영한다.
-        needs_recovery = True
+        next_quality_repair: float | None = None
+        repair_interval = max(30, self.polling_interval_sec)
         self._log(logging.INFO, "pipeline start", {"job_id": "-", "canonical_base": "-"})
 
         while True:
@@ -2319,9 +2322,13 @@ class STTPipeline:
                 self._last_pause_log_at = 0.0
                 self._log(logging.INFO, "pipeline resumed", {"job_id": "-", "canonical_base": "-"})
 
-            if needs_recovery:
+            if next_quality_repair is None:
                 self.startup_recovery()
-                needs_recovery = False
+                next_quality_repair = time.monotonic() + repair_interval
+            elif time.monotonic() >= next_quality_repair:
+                # Bound repair work per poll so a stalled iCloud file cannot monopolize intake.
+                db.recover_processing_jobs(self.conn, self.stale_processing_hours, deferred_only=True)
+                next_quality_repair = time.monotonic() + repair_interval
 
             retry_limit = 1 if run_once else None
             retry_count = self.process_retryable_jobs(limit=retry_limit)

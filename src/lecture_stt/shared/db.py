@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 from lecture_stt.shared import utils
+from lecture_stt.shared.paths import RECOVERY_PAIR_PREFIX, RECOVERY_STAGING_PREFIX
+from lecture_stt.stt import quality_gate
 
 
 STATUS_PENDING = "PENDING"
@@ -15,6 +19,7 @@ STATUS_PROCESSING = "PROCESSING"
 STATUS_DONE = "DONE"
 STATUS_NEEDS_REVIEW = "NEEDS_REVIEW"
 STATUS_ERROR = "ERROR"
+QUALITY_REPAIR_WAIT = "품질 산출물 복구 대기"
 
 
 class TranscriptSchemaCompatibilityError(sqlite3.DatabaseError):
@@ -919,20 +924,15 @@ def _validate_recovered_quality_scorecard(
     if not isinstance(quality, dict):
         return None
     try:
-        from lecture_stt.stt.quality_gate import (
-            validate_quality_scorecard,
-            write_quality_scorecard,
-        )
-
-        validate_quality_scorecard(json_path, metadata)
+        quality_gate.validate_quality_scorecard(json_path, metadata)
     except FileNotFoundError:
         # Transcript JSON is written before its metadata-only scorecard. A crash
         # in that narrow window is safe to repair deterministically from the
         # persisted metadata; rebuilding also keeps downstream quality gates
         # from mistaking this result for a pre-scorecard legacy transcript.
         try:
-            write_quality_scorecard(json_path, metadata)
-            validate_quality_scorecard(json_path, metadata)
+            quality_gate.write_quality_scorecard(json_path, metadata)
+            quality_gate.validate_quality_scorecard(json_path, metadata)
         except (OSError, TypeError, ValueError) as exc:
             return f"복구된 전사 결과의 quality scorecard 재생성 실패: {exc}"
     except ValueError as exc:
@@ -942,48 +942,147 @@ def _validate_recovered_quality_scorecard(
     return None
 
 
-def _completed_transcript_quality(json_path: str | None, txt_path: str) -> tuple[str | None, str | None, str | None]:
-    """Read the persisted quality verdict used during interrupted-job recovery."""
-    if not json_path:
-        return None, None, None
+def _has_pinned_transcript(conn: sqlite3.Connection, row: sqlite3.Row, digest: str) -> bool:
+    """Check immutable delivery inputs and shared historical job paths before repair."""
+    path = row["transcript_json_path"]
+    return conn.execute(
+        """SELECT 1 FROM transcript_postprocess_jobs WHERE source_json_path=? OR source_json_sha256=?
+           UNION ALL SELECT 1 FROM transcript_deliveries WHERE source_json_path=? OR source_json_sha256=?
+           UNION ALL SELECT 1 FROM deliveries WHERE correction_json_path=? OR correction_json_sha256=?
+           UNION ALL SELECT 1 FROM jobs WHERE id!=? AND (transcript_json_path=? OR canonical_base=?)
+           LIMIT 1""",
+        (path, digest, path, digest, path, digest, row["id"], path, row["canonical_base"]),
+    ).fetchone() is not None
+
+
+def _publish_review_copy(
+    job_id: int, txt: Path, source: Path, payload: dict, metadata: dict
+) -> tuple[Path, Path]:
+    """Publish a complete alternate pair before changing the job's DB paths."""
+    directory = source.parent / f"{RECOVERY_PAIR_PREFIX}{job_id}"
+    target_txt, target_json = directory / txt.name, directory / source.name
+    metadata.update(transcript_txt_path=str(target_txt), transcript_json_path=str(target_json))
+    card = quality_gate.build_quality_scorecard(metadata, transcript_json_path=target_json)
+    files = {
+        target_txt.name: txt.read_bytes(),
+        target_json.name: json.dumps(payload, ensure_ascii=False, indent=2).encode(),
+        quality_gate.quality_scorecard_path(target_json).name: json.dumps(card, ensure_ascii=False, indent=2).encode(),
+    }
+    if not os.path.lexists(directory):
+        with tempfile.TemporaryDirectory(dir=source.parent, prefix=RECOVERY_STAGING_PREFIX) as temporary:
+            staged = Path(temporary) / "pair"
+            staged.mkdir(mode=0o700)
+            for name, data in files.items():
+                utils.atomic_write(staged / name, data)
+            utils._rename_no_replace(staged, directory)
+    # A restart can encounter the already published pair before DB commit.
+    if directory.is_symlink() or not directory.is_dir():
+        raise ValueError("복구 결과 경로 충돌")
+    for name, data in files.items():
+        file = directory / name
+        if file.is_symlink() or not file.is_file() or file.read_bytes() != data:
+            raise ValueError("기존 복구 결과가 현재 판정과 다릅니다")
+    return target_txt, target_json
+
+
+def _repair_empty_transcript(
+    conn: sqlite3.Connection, row: sqlite3.Row, payload: dict, serialized: bytes, text: str
+) -> dict:
+    txt, path = Path(row["transcript_txt_path"]), Path(row["transcript_json_path"])
+    previous_metadata = payload.get("metadata")
+    metadata = dict(previous_metadata) if isinstance(previous_metadata, dict) else {}
+    payload["metadata"] = metadata
+    previous = metadata.get("quality")
+    duration = previous.get("audio_duration_sec") if isinstance(previous, dict) else None
+    segments = [
+        {**item, "text": item.get("text") or ""}
+        for item in payload["segments"] if isinstance(item, dict)
+    ]
+    quality = quality_gate.evaluate(segments, text, audio_duration_sec=duration).to_dict()
+    engine = json.loads(row["engine_params"] or "{}")
+    if not isinstance(engine, dict):
+        raise ValueError("작업 메타데이터 형식 오류")
+    metadata.setdefault("canonical_base", row["canonical_base"])
+    metadata.setdefault("orig_name", row["orig_name"])
+    metadata["quality"] = quality
+
+    expected_card = quality_gate.build_quality_scorecard(metadata, transcript_json_path=path)
     try:
-        with Path(json_path).open("r", encoding="utf-8") as handle:
-            payload = json.load(handle)
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        return None, None, "복구된 전사 JSON을 읽을 수 없음"
-    if not isinstance(payload, dict):
-        return None, None, "복구된 전사 JSON 형식 확인 필요"
+        card_matches = json.loads(quality_gate.quality_scorecard_path(path).read_bytes()) == expected_card
+    except (FileNotFoundError, ValueError):
+        card_matches = False
+    if metadata != previous_metadata or not card_matches:
+        if path.read_bytes() != serialized or txt.read_text(encoding="utf-8") != text:
+            raise OSError("복구 중 원전사 파일이 변경되었습니다.")
+        if _has_pinned_transcript(conn, row, hashlib.sha256(serialized).hexdigest()):
+            txt, path = _publish_review_copy(row["id"], txt, path, payload, metadata)
+        else:
+            # Publish the derived sidecar first. If interrupted, the PROCESSING
+            # row still points to the original JSON and the repair is repeatable.
+            if not card_matches:
+                quality_gate.write_quality_scorecard(path, metadata)
+            if metadata != previous_metadata:
+                utils.atomic_write(path, payload)
+        quality_gate.validate_quality_scorecard(path, metadata)
+    engine.update(quality=quality, transcript_txt_path=str(txt), transcript_json_path=str(path))
+    return {
+        "engine_params": json.dumps(engine, ensure_ascii=False),
+        "transcript_txt_path": str(txt),
+        "transcript_json_path": str(path),
+    }
+
+
+def _completed_transcript_quality(
+    conn: sqlite3.Connection, row: sqlite3.Row
+) -> tuple[str | None, str | None, str | None, dict]:
+    json_path, txt_path = row["transcript_json_path"], row["transcript_txt_path"]
+    try:
+        serialized = Path(json_path).read_bytes()
+        payload = json.loads(serialized)
+        if not isinstance(payload, dict):
+            raise ValueError("복구된 전사 JSON 형식 확인 필요")
+        text = Path(txt_path).read_text(encoding="utf-8")
+        segments = payload["segments"]
+        if not text.strip() or not any(
+            isinstance(segment, dict) and str(segment.get("text") or "").strip()
+            for segment in segments
+        ):
+            fields = _repair_empty_transcript(conn, row, payload, serialized, text)
+            return "bad", payload["metadata"]["quality"]["summary"], None, fields
+    except (KeyError, TypeError, ValueError) as exc:
+        return None, None, f"복구된 전사 산출물 검증 실패: {exc}", {}
     metadata = payload.get("metadata")
     if not isinstance(metadata, dict):
-        metadata = {}
+        return None, None, None, {}
     scorecard_error = _validate_recovered_quality_scorecard(json_path, metadata)
-    try:
-        has_text = _transcript_contains_text(Path(txt_path))
-    except (OSError, UnicodeError):
-        return None, None, "복구된 전사 TXT를 읽을 수 없음"
-    segments = payload.get("segments")
-    if not has_text or not isinstance(segments, list) or not any(
-        isinstance(segment, dict) and str(segment.get("text") or "").strip()
-        for segment in segments
-    ):
-        return "bad", "인식된 발화 없음", scorecard_error
+    hold = quality_gate.inherited_review_reason(metadata)
+    if hold:
+        return "held", hold, scorecard_error, {}
     quality = metadata.get("quality")
     if not isinstance(quality, dict):
-        return None, None, scorecard_error
+        return None, None, scorecard_error, {}
     health = quality.get("health")
     summary = quality.get("summary")
     normalized_health = health.strip().lower() if isinstance(health, str) else None
     normalized_summary = summary.strip() if isinstance(summary, str) and summary.strip() else None
-    return normalized_health, normalized_summary, scorecard_error
+    return normalized_health, normalized_summary, scorecard_error, {}
 
 
-def recover_processing_jobs(conn: sqlite3.Connection, stale_processing_hours: int = 6) -> Dict[str, int]:
+def recover_processing_jobs(
+    conn: sqlite3.Connection, stale_processing_hours: int = 6, *, deferred_only: bool = False
+) -> Dict[str, int]:
     # 시작 시 끊긴 PROCESSING 작업을 정상 종료/재시도/오류로 복구한다.
     now = datetime.now().astimezone()
     stale_seconds = stale_processing_hours * 3600
     counts = {"done": 0, "needs_review": 0, "pending": 0, "error": 0}
 
-    rows = list_processing_jobs(conn)
+    if deferred_only:
+        rows = conn.execute(
+            "SELECT * FROM jobs WHERE status=? AND current_step=? ORDER BY updated_at, id LIMIT 1",
+            (STATUS_PROCESSING, QUALITY_REPAIR_WAIT),
+        ).fetchall()
+    else:
+        rows = list_processing_jobs(conn)
     for row in rows:
         job_id = row["id"]
         audio = row["canonical_audio_path"]
@@ -994,9 +1093,16 @@ def recover_processing_jobs(conn: sqlite3.Connection, stale_processing_hours: in
 
         # 시작 시 PROCESSING 작업을 복구해 중단된 실행이 계속 걸리지 않게 한다.
         # 오래된 상태인지는 메타 데이터로만 기록해 추적한다.
-        transcript_ready = _has_complete_transcripts(txt, json_path)
+        # A deferred repair already saw a complete pair. An unavailable file
+        # on its next read should wait; re-admitting its audio would lose that claim.
+        transcript_ready = row["current_step"] == QUALITY_REPAIR_WAIT or _has_complete_transcripts(txt, json_path)
         if transcript_ready:
-            quality_health, quality_summary, scorecard_error = _completed_transcript_quality(json_path, txt)
+            try:
+                quality_health, quality_summary, scorecard_error, fields = _completed_transcript_quality(conn, row)
+            except OSError as exc:
+                # Keep the recovery claim retryable when iCloud or the disk is unavailable.
+                update_job(conn, job_id, current_step=QUALITY_REPAIR_WAIT, error_message=str(exc))
+                continue
             if scorecard_error:
                 set_status(
                     conn,
@@ -1011,7 +1117,7 @@ def recover_processing_jobs(conn: sqlite3.Connection, stale_processing_hours: in
                 )
                 counts["needs_review"] += 1
                 continue
-            if quality_health == "bad":
+            if quality_health in {"bad", "held"}:
                 set_status(
                     conn,
                     job_id,
@@ -1022,6 +1128,7 @@ def recover_processing_jobs(conn: sqlite3.Connection, stale_processing_hours: in
                     current_step="품질 검토 필요",
                     progress_pct=100,
                     eta_sec=0,
+                    **fields,
                 )
                 counts["needs_review"] += 1
                 continue

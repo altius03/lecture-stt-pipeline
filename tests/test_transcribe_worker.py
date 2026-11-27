@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 from pathlib import Path
+import errno
+import os
+import shutil
 import tempfile
+import wave
 import unittest
 from unittest import mock
 
+from lecture_stt.shared.temporary_wav import TemporaryWav, WORKSPACE_PREFIX
 from lecture_stt.stt.transcribe import EngineParams, STTWorker, build_vad_parameters
 
 
@@ -30,12 +35,13 @@ class TranscribeWorkerVadCompatibilityTests(unittest.TestCase):
             worker = STTWorker(self._params(), "/usr/bin/true", tmp)
             source = root / "input.m4a"
             wav = root / "example.wav"
-            wav.write_bytes(b"decoded")
-            with mock.patch.object(worker, "preprocess", return_value=wav), mock.patch.object(
+            with mock.patch.object(
                 worker, "transcribe", side_effect=RuntimeError("engine interrupted")
             ), self.assertRaises(RuntimeError):
                 worker.transcribe_file(source, "example")
             self.assertFalse(wav.exists())
+            self.assertEqual(list(root.glob(WORKSPACE_PREFIX + "*")), [])
+            self.assertFalse(worker._temporary_wavs)
 
             def failed_decoder(cmd, **kwargs):
                 Path(cmd[-1]).write_bytes(b"partial")
@@ -44,12 +50,75 @@ class TranscribeWorkerVadCompatibilityTests(unittest.TestCase):
             with mock.patch("subprocess.run", side_effect=failed_decoder), self.assertRaises(RuntimeError):
                 worker.preprocess(source, "example")
             self.assertFalse(wav.exists())
+            self.assertEqual(list(root.glob(WORKSPACE_PREFIX + "*")), [])
+            self.assertFalse(worker._temporary_wavs)
 
             wav.write_bytes(b"original WAV recording")
             with mock.patch("subprocess.run", side_effect=failed_decoder), self.assertRaises(RuntimeError):
                 worker.preprocess(wav, "example")
             self.assertEqual(wav.read_bytes(), b"original WAV recording")
             self.assertEqual(list(root.glob("*.wav")), [wav])
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg required")
+    def test_ffmpeg_publishes_seekable_pcm_in_the_reserved_inode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "input.wav"
+            with wave.open(str(source), "wb") as fixture:
+                fixture.setparams((1, 2, 16000, 0, "NONE", ""))
+                fixture.writeframes(bytes(32000))
+            worker = STTWorker(self._params(), shutil.which("ffmpeg"), tmp)
+            wav = worker.preprocess(source, "input")
+            self.addCleanup(worker.cleanup_tmp, wav)
+            self.assertEqual(worker._wav_duration_sec(wav), 1.0)
+            witness, = wav.parent.glob("owner-*")
+            self.assertTrue(witness.samefile(wav))
+            self.assertFalse(source.samefile(wav))
+            worker.cleanup_tmp(wav)
+            self.assertFalse(wav.parent.exists())
+            self.assertEqual(source.stat().st_nlink, 1)
+
+    def test_no_hardlink_support_uses_live_handle_for_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worker = STTWorker(self._params(), "/usr/bin/true", tmp)
+            with mock.patch.object(os, "link", side_effect=OSError(errno.ENOTSUP, "unsupported")):
+                wav = worker.preprocess(root / "input.m4a", "input")
+            self.assertEqual(list(wav.parent.glob("owner-*")), [])
+            worker.cleanup_tmp(wav)
+            self.assertFalse(wav.parent.exists())
+
+    def test_unsupported_lock_preserves_orphan_without_stopping_retention(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worker = STTWorker(self._params(), "/usr/bin/true", tmp)
+            with mock.patch("fcntl.flock", side_effect=OSError(errno.ENOTSUP, "unavailable")):
+                wav = worker.preprocess(root / "input.m4a", "input")
+            self.assertEqual(list(wav.parent.glob("owner-*")), [])
+            worker.cleanup_tmp(wav)
+            self.assertFalse(wav.parent.exists())
+
+            wav = worker.preprocess(root / "another.m4a", "another")
+            witness, = wav.parent.glob("owner-*")
+            with mock.patch("fcntl.flock", side_effect=OSError(errno.EPERM, "unavailable")):
+                self.assertIsNone(TemporaryWav.reopen(wav.parent, witness))
+            self.assertTrue(wav.exists())
+            worker.cleanup_tmp(wav)
+
+    def test_worker_cleanup_keeps_replacement_and_unowned_wavs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worker = STTWorker(self._params(), "/usr/bin/true", tmp)
+            source = root / "source.m4a"
+            source.write_bytes(b"source")
+            wav = worker.preprocess(source, "lecture")
+            replacement = root / "replacement.wav"
+            replacement.write_bytes(b"independent")
+            replacement.replace(wav)
+            worker.cleanup_tmp(wav)
+            self.assertEqual(wav.read_bytes(), b"independent")
+            worker.cleanup_tmp(source)
+            self.assertEqual(source.read_bytes(), b"source")
 
     def test_build_vad_parameters_supports_faster_whisper_11_and_12_signatures(self) -> None:
         class Vad11:

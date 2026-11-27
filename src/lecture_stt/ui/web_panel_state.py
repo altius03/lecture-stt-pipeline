@@ -20,7 +20,9 @@ from pathlib import Path
 from typing import Any
 
 from lecture_stt.shared import db
-from lecture_stt.shared.paths import env_file, package_env, resolve_config_path, runtime_env, venv_python
+from lecture_stt.shared.paths import (
+    env_file, iter_transcript_files, package_env, resolve_config_path, runtime_env, venv_python,
+)
 from lecture_stt.storage_v2.analytics import (
     disabled_transcription_analytics,
     read_transcription_analytics,
@@ -143,12 +145,7 @@ class ControlState:
 
         self.config_data = self._load_config()
         paths = self.config_data.get("paths", {})
-        resolved_env = runtime_env(dotenv_path=env_file(self.repo_root))
-        self.db_path = resolve_config_path(
-            str(paths.get("db_path", "state/jobs.sqlite3")),
-            base_dir=self.repo_root,
-            env=resolved_env,
-        )
+        self.db_path = self._configured_db_path(self.config_data)
         self.pause_flag = self.db_path.parent / "paused"
         self.log_path = self._resolve_log_path()
         self.watch_folder = self._resolve_optional_path(paths.get("watch_folder"))
@@ -215,6 +212,15 @@ class ControlState:
         if not isinstance(loaded, dict):
             raise ValueError(f"Invalid config format: {self.config_path}")
         return loaded
+
+    def _configured_db_path(self, config: dict[str, Any]) -> Path:
+        paths = config.get("paths", {})
+        if not isinstance(paths, dict):
+            raise ValueError("paths 설정이 올바르지 않습니다.")
+        value = paths.get("db_path", "state/jobs.sqlite3")
+        if not isinstance(value, str):
+            raise ValueError("작업 DB 경로는 문자열이어야 합니다.")
+        return resolve_config_path(value, base_dir=self.repo_root, env=self._runtime_env())
 
     def _save_config(self, config_data: dict[str, Any]) -> bool:
         payload = yaml.safe_dump(config_data, allow_unicode=True, sort_keys=False)
@@ -2499,7 +2505,7 @@ class ControlState:
             return "missing"
         try:
             sets: set[tuple[str, str]] = set()
-            for item in path.rglob("*"):
+            for item in iter_transcript_files(path):
                 if (
                     not item.is_file()
                     or item.is_symlink()
@@ -2530,11 +2536,9 @@ class ControlState:
 
         try:
             config = self._load_config()
-            paths = config.get("paths")
-            if not isinstance(paths, dict) or not isinstance(paths.get("db_path"), str):
-                raise ValueError("작업 DB 설정이 없습니다.")
-            configured_db = resolve_config_path(paths["db_path"], base_dir=self.repo_root, env=self._runtime_env())
-            if configured_db != self.db_path:
+            if not config:
+                raise ValueError("설정 파일이 비어 있습니다.")
+            if self._configured_db_path(config) != self.db_path:
                 raise ValueError("작업 DB 경로가 변경되었습니다.")
             delivery = config.get("transcript_delivery", {})
             if not isinstance(delivery, dict):

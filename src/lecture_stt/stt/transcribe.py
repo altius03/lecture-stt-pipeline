@@ -5,13 +5,13 @@ import inspect
 import logging
 import os
 import subprocess
-import tempfile
 import time
 import wave
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, List, Tuple
 
+from lecture_stt.shared.temporary_wav import TemporaryWav
 from lecture_stt.shared.utils import ensure_dir
 
 logger = logging.getLogger(__name__)
@@ -74,6 +74,7 @@ class STTWorker:
         self.ffmpeg_path = ffmpeg_path
         self.tmp_dir = Path(tmp_dir)
         ensure_dir(self.tmp_dir)
+        self._temporary_wavs: dict[Path, TemporaryWav] = {}
         self._model = None
         self._vad_options_cls = vad_options_cls
 
@@ -111,15 +112,10 @@ class STTWorker:
         if not os.path.exists(self.ffmpeg_path):
             raise FileNotFoundError(f"ffmpeg not found at {self.ffmpeg_path}")
 
-        wav_path = self.tmp_dir / f"{canonical_base}.wav"
-        try:
-            # Keep the usual name for retention reporting, but never overwrite
-            # a pre-existing file (including a WAV source in a shared folder).
-            fd = os.open(wav_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        except FileExistsError:
-            fd, unique_path = tempfile.mkstemp(dir=self.tmp_dir, prefix="stt-", suffix=".wav")
-            wav_path = Path(unique_path)
-        os.close(fd)
+        output = TemporaryWav.create(self.tmp_dir, src_audio, canonical_base)
+        wav_path = output.path
+        self._temporary_wavs[wav_path] = output
+        output_fd = output.handle.fileno()
 
         cmd = [
             self.ffmpeg_path,
@@ -138,12 +134,13 @@ class STTWorker:
             "pcm_s16le",
             "-f",
             "wav",
-            str(wav_path),
+            f"/dev/fd/{output_fd}",
         ]
         logger.info("Preprocessing audio %s -> %s", src_audio, wav_path)
         try:
             result = subprocess.run(
                 cmd,
+                pass_fds=(output_fd,),
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -156,6 +153,8 @@ class STTWorker:
                 raise RuntimeError(
                     f"ffmpeg preprocessing failed (exit={result.returncode}): {error_output or 'unknown error'}"
                 )
+            if not output.matches_output():
+                raise OSError("Decoder output was replaced during preprocessing")
         except BaseException:
             self.cleanup_tmp(wav_path)
             raise
@@ -278,8 +277,10 @@ class STTWorker:
 
     def cleanup_tmp(self, wav_path: Path) -> None:
         # 임시 WAV 생성 파일을 정리해 디스크 사용을 회수한다.
+        output = self._temporary_wavs.pop(wav_path, None)
+        if output is None:
+            return
         try:
-            if wav_path.exists():
-                wav_path.unlink()
+            output.remove()
         except Exception:
             logger.warning("Failed to clean temp file %s", wav_path, exc_info=True)
