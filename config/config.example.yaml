@@ -12,6 +12,8 @@ app:
   # local web console own an exact immutable binary when macOS denies iCloud
   # access to a newly launched background service.
   # controller_runtime: launchd
+  # Optional on Darwin console deployments; honor explicit stops and pauses.
+  # console_controller_autostart: false
   # controller_label: com.geonha.lecture-stt-controller
   # controller_kill_switch: "~/Library/Application Support/lecture_stt/controller/controller.disabled"
   # Binary and both parent dirs must be mode 0500 + Darwin user-immutable:

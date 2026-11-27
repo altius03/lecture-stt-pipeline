@@ -8,7 +8,9 @@ import json
 import mimetypes
 import os
 import re
+import signal
 import sqlite3
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -1252,12 +1254,14 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.send_header("Connection", "keep-alive")
         self.end_headers()
 
+        stopping = getattr(getattr(self, "server", None), "stopping", None)
+        self.close_connection = True
         last_state_signature: str | None = None
         log_offset: int | None = None
         last_heartbeat = time.monotonic()
 
         try:
-            while True:
+            while stopping is None or not stopping.is_set():
                 snapshot = self._client_snapshot()
                 signature = _state_stream_signature(snapshot)
                 sent_event = False
@@ -1295,7 +1299,10 @@ class RequestHandler(BaseHTTPRequestHandler):
                     sleep_sec = max(0.5, float(poll_interval))
                 except (TypeError, ValueError):
                     sleep_sec = 1.0
-                time.sleep(sleep_sec)
+                if stopping is None:
+                    time.sleep(sleep_sec)
+                elif stopping.wait(sleep_sec):
+                    return
         except (BrokenPipeError, ConnectionResetError, TimeoutError):
             return
 
@@ -1744,15 +1751,37 @@ def main() -> None:
         audit.addHandler(handler)
     audit.setLevel(logging.INFO)
     audit.propagate = False
-    STATE.set_shutdown_handler(server.shutdown)
+    stopping = server.stopping = threading.Event()
+    supervisor = None
+
+    def stop_server() -> None:
+        stopping.set()
+        server.shutdown()
+
+    STATE.set_shutdown_handler(stop_server)
     print(f"Web control panel running at http://{host}:{port}")
     print("Press Ctrl+C to stop.")
+    def interrupt_server(_signum, _frame) -> None:
+        raise KeyboardInterrupt
+
+    previous_sigterm = None
     try:
+        if threading.current_thread() is threading.main_thread():
+            previous_sigterm = signal.signal(signal.SIGTERM, interrupt_server)
+        if STATE.console_supervision_enabled():
+            supervisor = threading.Thread(target=STATE.supervise_console_controller, args=(stopping,),
+                                          name="console-controller-supervisor", daemon=True)
+            supervisor.start()
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        stopping.set()
+        if previous_sigterm is not None:
+            signal.signal(signal.SIGTERM, previous_sigterm)
         server.server_close()
+        if supervisor is not None:
+            supervisor.join()
 
 
 if __name__ == "__main__":
