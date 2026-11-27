@@ -596,7 +596,7 @@ function LibraryDetail({
         </div>
         {outsideCurrentPage ? (
           <p className="notice-copy">
-            현재 선택한 녹음은 첫 페이지 밖에 있어도 detail을 별도 read-only 조회로 유지합니다.
+            선택한 녹음은 현재 목록 밖에 있습니다.
           </p>
         ) : null}
         <dl className="recording-library-definition-grid">
@@ -777,6 +777,7 @@ interface RecordingLibraryPanelProps {
 export function RecordingLibraryPanel({
   selectedStorageKey,
 }: RecordingLibraryPanelProps) {
+  const [offset, setOffset] = useState(0)
   const {
     list,
     detail,
@@ -789,6 +790,7 @@ export function RecordingLibraryPanel({
   } = useRecordingLibrary({
     enabled: true,
     selectedStorageKey,
+    offset,
   })
   const previewTarget =
     detail && list?.capabilities?.transcript_preview === true
@@ -819,7 +821,7 @@ export function RecordingLibraryPanel({
       <LoadingBlock
         eyebrow="Recording Library"
         title="녹음 보관함을 읽는 중입니다."
-        description="첫 페이지 summary와 선택한 recording detail을 분리된 read-only query로 확인합니다."
+        description="녹음 목록을 불러오는 중입니다."
       />
     )
   }
@@ -867,9 +869,13 @@ export function RecordingLibraryPanel({
 
       <div className="dashboard-screen-grid recording-library-grid">
         <SectionCard label="Recording Library" title="storage_key와 표시 이름을 분리한 목록">
-          <p className="notice-copy">
-            첫 페이지 {list.filters.limit}건만 읽고, hash detail은 선택된 storage_key 하나를 별도 read-only 조회로 유지합니다.
-          </p>
+          <nav aria-label="녹음 목록 페이지" className="action-row">
+            <button type="button" disabled={offset === 0}
+              onClick={() => setOffset(Math.max(0, offset - list.filters.limit))}>이전 페이지</button>
+            <span>{list.total}건 중 {list.summaries.length ? offset + 1 : 0}–{offset + list.summaries.length}건</span>
+            <button type="button" disabled={offset + list.filters.limit >= list.total}
+              onClick={() => setOffset(offset + list.filters.limit)}>다음 페이지</button>
+          </nav>
           <LibraryList summaries={list.summaries} selectedStorageKey={selectedStorageKey} />
         </SectionCard>
 

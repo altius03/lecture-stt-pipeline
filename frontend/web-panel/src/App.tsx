@@ -202,11 +202,9 @@ export default function App() {
     error,
     pendingAction,
     pendingNotificationSelection,
-    pendingNotificationApplyNow,
     runAction,
     saveNotificationSelection,
     retry,
-    logResetKey,
     realtimeConnected,
     streamEndpoint,
   } = usePanelState({
@@ -226,7 +224,6 @@ export default function App() {
     eventsEndpoint: streamEndpoint === PANEL_EVENTS_ENDPOINT ? PANEL_EVENTS_ENDPOINT : null,
     pollIntervalSec: state?.summary.poll_interval_sec ?? 1,
     enabled: state !== null && logsEnabled,
-    resetKey: logResetKey,
   })
 
   useEffect(() => {
@@ -317,6 +314,7 @@ export default function App() {
       description: "알림과 운영 기본값",
     },
   ]
+  const canControl = panelState.actions.can_control !== false
   const sharedError = error ?? logsError
   const currentScreenItem = screenItems.find((item) => item.id === currentScreen) ?? screenItems[0]
   const currentScreenCopy = SCREEN_COPY[currentScreen]
@@ -329,8 +327,8 @@ export default function App() {
         ? "네 source는 이 화면에서만 새로 읽습니다. 상태 변경·확정·승격은 각 guarded workbench의 비활성 기본값과 plan/count/digest/allow-write guard를 그대로 따릅니다."
         : currentScreen === "library"
           ? currentRoute.libraryStorageKey
-            ? "선택한 storage_key detail은 별도 read-only query로 읽고, 목록 첫 페이지와 독립적으로 유지합니다."
-            : "Storage v2 보관함은 첫 페이지 summary와 선택된 recording detail만 on-demand로 읽습니다."
+            ? "선택한 storage_key detail은 별도 read-only query로 읽고, 현재 목록와 독립적으로 유지합니다."
+            : "Storage v2 보관함은 페이지별 목록와 선택된 recording detail만 on-demand로 읽습니다."
           : currentScreen === "timetable"
             ? "시간표 확정은 plan/count/digest/allow-write guard를 통과한 작업만 실행합니다."
             : currentScreen === "settings"
@@ -353,13 +351,14 @@ export default function App() {
 
         <section className="overview-grid dashboard-screen-grid" aria-label="처리 제어">
           <RuntimeCard
+            canControl={canControl}
             runtimeState={panelState.runtime_state}
             summary={panelState.summary}
             pauseAction={panelState.actions.pause_action}
             pauseLabel={panelState.actions.pause_label}
             pendingAction={pendingAction}
             onAction={(action) => {
-              void runAction(action)
+              void runAction(action).catch(() => {})
             }}
           />
 
@@ -390,6 +389,7 @@ export default function App() {
         </section>
 
         <ActivityPanel
+          canControl={canControl}
           jobs={panelState.jobs_v2}
           logs={logs}
           error={logsError}
@@ -401,7 +401,7 @@ export default function App() {
           onToggleAutoFollow={setAutoFollow}
           onJumpToLatest={jumpToLatest}
           onAction={(action) => {
-            void runAction(action)
+            void runAction(action).catch(() => {})
           }}
         />
       </>
@@ -427,7 +427,7 @@ export default function App() {
               { label: "새로고침 힌트", value: panelState.summary.refresh_hint },
             ]}
           />
-          <p className="notice-copy">알림 변경과 테마 전환은 상단 헤더에서 바로 적용합니다.</p>
+          <p className="notice-copy">상단에서 알림 채널을 선택하면 다음 작업부터 적용됩니다.</p>
         </SectionCard>
 
         <SectionCard label="Unconnected" title="아직 연결되지 않은 설정" tone="muted">
@@ -461,20 +461,21 @@ export default function App() {
   return (
     <main className="app-shell">
       <PanelHero
+        canControl={canControl}
         runtimeState={panelState.runtime_state}
         summary={panelState.summary}
         realtimeConnected={realtimeConnected}
         currentScreenLabel={currentScreenItem.label}
         notification={panelState.notification}
         pendingNotificationSelection={pendingNotificationSelection}
-        pendingNotificationApplyNow={pendingNotificationApplyNow}
         theme={theme}
-        onNotificationSave={(selection, applyNow) => {
-          void saveNotificationSelection(selection, applyNow)
+        onNotificationSave={(selection) => {
+          void saveNotificationSelection(selection).catch(() => {})
         }}
         onThemeChange={setThemeMode}
       />
 
+      {!canControl ? <p className="notice-copy" role="status">이 접속은 읽기 전용입니다. 워커 제어·이력 정리·검토 결과 변경은 운영자 권한으로 접속해 주세요.</p> : null}
       {sharedError ? <ErrorBanner message={sharedError} /> : null}
 
       <section className="control-layout" aria-label="Lecture STT 운영 현황">

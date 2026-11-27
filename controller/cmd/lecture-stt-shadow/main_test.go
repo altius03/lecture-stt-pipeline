@@ -42,7 +42,17 @@ func TestMainSIGTERMEmitsInterruptedReportAndReapsDescendants(t *testing.T) {
 	parentPIDPath := filepath.Join(t.TempDir(), "fake-python.pid")
 	childPIDPath := filepath.Join(t.TempDir(), "fake-python-child.pid")
 	grandchildPIDPath := filepath.Join(t.TempDir(), "fake-python-grandchild.pid")
-	fakePython := writeSIGTERMFixturePython(t, watchRoot, parentPIDPath, childPIDPath, grandchildPIDPath)
+	// Release the grandchild's next forks at the cancellation boundary.
+	forkGate := filepath.Join(t.TempDir(), "fork-gate")
+	if err := syscall.Mkfifo(forkGate, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gate, err := os.OpenFile(forkGate, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gate.Close()
+	fakePython := writeSIGTERMFixturePython(t, watchRoot, parentPIDPath, childPIDPath, grandchildPIDPath, forkGate)
 	configPath := writeCommandIntegrationConfig(t, watchRoot, audioRoot, transcriptRoot, errorRoot, tmpRoot, dbPath)
 
 	args := []string{
@@ -61,6 +71,23 @@ func TestMainSIGTERMEmitsInterruptedReportAndReapsDescendants(t *testing.T) {
 	}
 	command := exec.Command(testBinary, args...)
 	command.Env = append(os.Environ(), "GO_WANT_SHADOW_MAIN_HELPER=1")
+	detachedPIDPath := filepath.Join(t.TempDir(), "detached.pid")
+	var unrelated *exec.Cmd
+	if runtime.GOOS == "darwin" {
+		// Identical executable and separate PGID, but outside the helper's tree.
+		unrelatedPIDPath := filepath.Join(t.TempDir(), "unrelated.pid")
+		unrelated = exec.Command(testBinary, "-test.run=^TestShadowDetachedFixtureProcess$")
+		unrelated.Env = append(os.Environ(), "SHADOW_DETACHED_PID="+unrelatedPIDPath)
+		if err := unrelated.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			_ = unrelated.Process.Kill()
+			_ = unrelated.Wait()
+		}()
+		waitForPIDFile(t, unrelatedPIDPath)
+		command.Env = append(command.Env, "SHADOW_FIXTURE_BINARY="+testBinary, "SHADOW_DETACHED_PID="+detachedPIDPath)
+	}
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	command.Stdout = &stdout
@@ -72,8 +99,14 @@ func TestMainSIGTERMEmitsInterruptedReportAndReapsDescendants(t *testing.T) {
 	waitForPIDFile(t, parentPIDPath)
 	waitForPIDFile(t, childPIDPath)
 	waitForPIDFile(t, grandchildPIDPath)
+	if runtime.GOOS == "darwin" {
+		waitForPIDFile(t, detachedPIDPath)
+	}
 
 	cleanupStarted := time.Now()
+	if _, err := gate.WriteString("fork\n"); err != nil {
+		t.Fatal(err)
+	}
 	if err := command.Process.Signal(syscall.SIGTERM); err != nil {
 		t.Fatal(err)
 	}
@@ -100,12 +133,108 @@ func TestMainSIGTERMEmitsInterruptedReportAndReapsDescendants(t *testing.T) {
 		t.Fatalf("unexpected command report after SIGTERM: %#v", report)
 	}
 
-	for _, pidPath := range []string{parentPIDPath, childPIDPath, grandchildPIDPath} {
-		pid := readPIDFile(t, pidPath)
-		if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
-			t.Fatalf("fixture descendant still exists after SIGTERM cleanup: pid=%d err=%v", pid, err)
+	leader := readPIDFile(t, parentPIDPath)
+	known := map[int]bool{
+		leader: true, readPIDFile(t, childPIDPath): true, readPIDFile(t, grandchildPIDPath): true,
+	}
+	if runtime.GOOS == "darwin" {
+		known[readPIDFile(t, detachedPIDPath)] = true
+	}
+	for {
+		members := fixtureProcessStates(t, leader, known)
+		if !hasLiveFixtureMember(members) {
+			// The helper owns and must reap the direct child. Orphaned
+			// grandchildren are reaped asynchronously by the system.
+			for _, member := range members {
+				if member.pid == leader {
+					t.Fatalf("direct helper was not reaped: %+v", member)
+				}
+			}
+			if unrelated != nil && !hasLiveFixtureMember(fixtureProcessStates(t, unrelated.Process.Pid, nil)) {
+				t.Fatal("unrelated fixture in a separate process group was terminated")
+			}
+			if len(members) > 0 {
+				t.Logf("exited fixture descendants awaiting OS reaping: %+v", members)
+			}
+			break
+		}
+		if time.Since(cleanupStarted) >= 2*time.Second {
+			t.Fatalf("live fixture descendants survived cancellation: pgid=%d members=%+v", leader, members)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+type fixtureProcessState struct {
+	pid, parent, group int
+	state              string
+}
+
+func fixtureProcessStates(t *testing.T, group int, known map[int]bool) []fixtureProcessState {
+	t.Helper()
+	// Use an independent observer. Only report numeric identities and state
+	// for this fixture, never other process arguments or environment data.
+	output, err := exec.Command("ps", "-ax", "-o", "pid=,ppid=,pgid=,state=").Output()
+	if err != nil {
+		t.Fatalf("inspect fixture processes: %v", err)
+	}
+	var result []fixtureProcessState
+	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+		var process fixtureProcessState
+		if _, err := fmt.Sscan(line, &process.pid, &process.parent, &process.group, &process.state); err != nil {
+			t.Fatalf("could not decode process state: %v", err)
+		}
+		if process.group == group || known[process.pid] {
+			result = append(result, process)
 		}
 	}
+	return result
+}
+
+func hasLiveFixtureMember(members []fixtureProcessState) bool {
+	for _, member := range members {
+		if !strings.HasPrefix(member.state, "Z") {
+			return true
+		}
+	}
+	return false
+}
+
+func TestExitedButUnreapedFixtureMemberIsNotLive(t *testing.T) {
+	// Keep an actual exited process waitable so the zombie observation does
+	// not depend on how quickly the host reaps adopted grandchildren.
+	cmd := exec.Command("sh", "-c", "exit 0")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer cmd.Wait()
+	pid := cmd.Process.Pid
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		members := fixtureProcessStates(t, pid, nil)
+		if len(members) == 1 && members[0].pid == pid && !hasLiveFixtureMember(members) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("could not observe the fixture as a zombie: %+v", members)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestShadowDetachedFixtureProcess(t *testing.T) {
+	path := os.Getenv("SHADOW_DETACHED_PID")
+	if path == "" {
+		return
+	}
+	if err := syscall.Setpgid(0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(15 * time.Second)
 }
 
 func TestShadowMainHelperProcess(t *testing.T) {
@@ -128,7 +257,7 @@ func TestShadowMainHelperProcess(t *testing.T) {
 	os.Exit(0)
 }
 
-func writeSIGTERMFixturePython(t *testing.T, watchRoot, parentPIDPath, childPIDPath, grandchildPIDPath string) string {
+func writeSIGTERMFixturePython(t *testing.T, watchRoot, parentPIDPath, childPIDPath, grandchildPIDPath, forkGate string) string {
 	t.Helper()
 	descendantPath := filepath.Join(t.TempDir(), "descendant-helper")
 	descendantScript := `#!/bin/sh
@@ -137,13 +266,15 @@ set -eu
 mode="$1"
 if [ "$mode" = "child" ]; then
   echo $$ > "$2"
-  "$0" grandchild "$3" &
+  "$0" grandchild "$3" "$4" &
   while :; do sleep 60; done
 fi
 
 if [ "$mode" = "grandchild" ]; then
   echo $$ > "$2"
-  while :; do sleep 60; done
+  IFS= read -r _ < "$3"
+  for n in 1 2 3 4 5 6 7 8; do sleep 60 & done
+  wait
 fi
 
 exit 2
@@ -167,8 +298,11 @@ JSON
     exit 0
   fi
   if [ "$3" = "lockstep-scan" ]; then
+    if [ -n "${SHADOW_DETACHED_PID:-}" ]; then
+      "$SHADOW_FIXTURE_BINARY" -test.run='^TestShadowDetachedFixtureProcess$' &
+    fi
     echo $$ > %q
-    %q child %q %q &
+    %q child %q %q %q &
     while [ ! -s %q ] || [ ! -s %q ]; do
       sleep 0.01
     done
@@ -177,7 +311,7 @@ JSON
 fi
 
 exit 2
-`, shadow.ConfigSchemaVersion, watchRoot, parentPIDPath, descendantPath, childPIDPath, grandchildPIDPath, childPIDPath, grandchildPIDPath)
+`, shadow.ConfigSchemaVersion, watchRoot, parentPIDPath, descendantPath, childPIDPath, grandchildPIDPath, forkGate, childPIDPath, grandchildPIDPath)
 	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -223,8 +357,10 @@ func waitForPIDFile(t *testing.T, path string) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		if _, err := os.Stat(path); err == nil {
-			return
+		if value, err := os.ReadFile(path); err == nil {
+			if pid, err := strconv.Atoi(strings.TrimSpace(string(value))); err == nil && pid > 1 {
+				return
+			}
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("pid file was not published: %s", path)

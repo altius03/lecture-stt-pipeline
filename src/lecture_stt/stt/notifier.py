@@ -101,8 +101,8 @@ class BaseNotifier:
             if self._transport_send(content):
                 logger.info("%s notification sent successfully", self.provider_name.capitalize())
                 return True
-        except Exception:
-            logger.exception("Failed to send %s notification", self.provider_name.capitalize())
+        except Exception as exc:
+            logger.error("%s notification failed (%s)", self.provider_name, type(exc).__name__)
         return False
 
     def _transport_send(self, content: str) -> bool:
@@ -249,13 +249,9 @@ class DiscordNotifier(BaseNotifier):
             if 200 <= response.status_code < 300:
                 logger.info("Discord webhook URL verified successfully")
             else:
-                logger.error(
-                    "Discord webhook URL verification failed: %s %s",
-                    response.status_code,
-                    self._truncate(response.text, 200),
-                )
-        except Exception:
-            logger.exception("Discord webhook URL verification failed")
+                logger.error("Discord webhook URL verification failed (HTTP %s)", response.status_code)
+        except Exception as exc:
+            logger.error("Discord webhook URL verification failed (%s)", type(exc).__name__)
 
     def _transport_send(self, content: str) -> bool:
         if not self.webhook_url:
@@ -265,11 +261,7 @@ class DiscordNotifier(BaseNotifier):
         if 200 <= response.status_code < 300:
             return True
 
-        logger.error(
-            "Discord webhook failed: %s %s",
-            response.status_code,
-            self._truncate(response.text, 500),
-        )
+        logger.error("Discord webhook failed (HTTP %s)", response.status_code)
         return False
 
 
@@ -324,13 +316,9 @@ class TelegramNotifier(BaseNotifier):
                 if body.get("ok", True):
                     logger.info("Telegram bot token verified successfully")
                     return
-            logger.error(
-                "Telegram bot verification failed: %s %s",
-                response.status_code,
-                self._truncate(response.text, 200),
-            )
+            logger.error("Telegram bot verification failed (HTTP %s)", response.status_code)
         except Exception as exc:
-            logger.error("Telegram bot verification failed: %s", exc, exc_info=False)
+            logger.error("Telegram bot verification failed (%s)", type(exc).__name__)
 
     def _transport_send(self, content: str) -> bool:
         if not self.bot_token or not self.chat_id:
@@ -350,11 +338,7 @@ class TelegramNotifier(BaseNotifier):
             if body.get("ok", True):
                 return True
 
-        logger.error(
-            "Telegram sendMessage failed: %s %s",
-            response.status_code,
-            self._truncate(response.text, 500),
-        )
+        logger.error("Telegram sendMessage failed (HTTP %s)", response.status_code)
         return False
 
 

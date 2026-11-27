@@ -5,6 +5,7 @@ import {
   FALLBACK_PANEL_ENDPOINTS,
   PANEL_EVENTS_ENDPOINT,
   PANEL_STATE_EVENTS_ENDPOINT,
+  fetchHistoryPlan,
   fetchPanelState,
   postNotificationSelection,
   postPanelAction,
@@ -28,8 +29,6 @@ export function usePanelState({ logsEnabled = false }: UsePanelStateOptions = {}
   const pollTimerRef = useRef<number | null>(null)
   const [pendingAction, setPendingAction] = useState<PanelAction | null>(null)
   const [pendingNotificationSelection, setPendingNotificationSelection] = useState<NotificationSelection | null>(null)
-  const [pendingNotificationApplyNow, setPendingNotificationApplyNow] = useState(false)
-  const [logResetKey, setLogResetKey] = useState(0)
   const [realtimeConnected, setRealtimeConnected] = useState(false)
   const [streamError, setStreamError] = useState<string | null>(null)
   const [stateOnlyUnavailable, setStateOnlyUnavailable] = useState(false)
@@ -123,15 +122,17 @@ export function usePanelState({ logsEnabled = false }: UsePanelStateOptions = {}
     mutationFn: async (action: PanelAction) => {
       const cachedState = queryClient.getQueryData<PanelState>(PANEL_STATE_QUERY_KEY)
       const endpoints = cachedState?.actions.endpoints ?? stateQuery.data?.actions.endpoints ?? FALLBACK_PANEL_ENDPOINTS
+      if (action === "clear_history") {
+        const plan = await fetchHistoryPlan(endpoints[action])
+        if (!window.confirm(`다른 원장에서 참조하지 않는 완료 이력 ${plan.count}건을 정리할까요? 오류 복구 기록과 운영 로그는 보존합니다.`)) return
+        return postPanelAction(endpoints[action], new URLSearchParams({ digest: plan.digest }).toString())
+      }
       return postPanelAction(endpoints[action])
     },
     onMutate: async (action) => {
       setPendingAction(action)
     },
-    onSuccess: async (_response, action) => {
-      if (action === "clear_history") {
-        setLogResetKey((current) => current + 1)
-      }
+    onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: PANEL_STATE_QUERY_KEY })
     },
     onSettled: async () => {
@@ -140,27 +141,26 @@ export function usePanelState({ logsEnabled = false }: UsePanelStateOptions = {}
   })
 
   const notificationMutation = useMutation({
-    mutationFn: async ({ selection, applyNow }: { selection: NotificationSelection; applyNow: boolean }) => {
+    mutationFn: async (selection: NotificationSelection) => {
       const cachedState = queryClient.getQueryData<PanelState>(PANEL_STATE_QUERY_KEY)
       const endpoints = cachedState?.actions.endpoints ?? stateQuery.data?.actions.endpoints ?? FALLBACK_PANEL_ENDPOINTS
-      return postNotificationSelection(endpoints.notification, selection, { applyNow })
+      return postNotificationSelection(endpoints.notification, selection, { applyNow: false })
     },
-    onMutate: async ({ selection, applyNow }) => {
+    onMutate: async (selection) => {
       setPendingNotificationSelection(selection)
-      setPendingNotificationApplyNow(applyNow)
     },
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: PANEL_STATE_QUERY_KEY })
     },
     onSettled: async () => {
       setPendingNotificationSelection(null)
-      setPendingNotificationApplyNow(false)
     },
   })
 
   const error =
-    streamError ||
+    (notificationMutation.error && toErrorMessage(notificationMutation.error, "알림 채널을 저장하지 못했습니다.")) ||
     (actionMutation.error && toErrorMessage(actionMutation.error, "패널 작업 요청에 실패했습니다.")) ||
+    streamError ||
     (stateQuery.error && toErrorMessage(stateQuery.error, "패널 상태를 불러오지 못했습니다.")) ||
     null
 
@@ -170,15 +170,15 @@ export function usePanelState({ logsEnabled = false }: UsePanelStateOptions = {}
     error,
     pendingAction,
     pendingNotificationSelection,
-    pendingNotificationApplyNow,
-    logResetKey,
     realtimeConnected,
     streamEndpoint,
     runAction: async (action: PanelAction) => {
+      if (notificationMutation.isError) notificationMutation.reset()
       await actionMutation.mutateAsync(action)
     },
-    saveNotificationSelection: async (selection: NotificationSelection, applyNow: boolean = false) => {
-      await notificationMutation.mutateAsync({ selection, applyNow })
+    saveNotificationSelection: async (selection: NotificationSelection) => {
+      if (actionMutation.isError) actionMutation.reset()
+      await notificationMutation.mutateAsync(selection)
     },
     retry: async () => {
       await stateQuery.refetch()

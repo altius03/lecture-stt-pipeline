@@ -10,10 +10,11 @@ interface ActionBarProps {
   actions: ActionItem[]
   pendingAction: PanelAction | null
   onAction: (action: PanelAction) => void
+  canControl?: boolean
   compact?: boolean
 }
 
-export function ActionBar({ actions, pendingAction, onAction, compact = false }: ActionBarProps) {
+export function ActionBar({ actions, pendingAction, onAction, canControl = true, compact = false }: ActionBarProps) {
   const classNames = compact ? "action-row compact-row" : "action-row"
   const isBusy = pendingAction !== null
 
@@ -32,7 +33,7 @@ export function ActionBar({ actions, pendingAction, onAction, compact = false }:
             key={item.action}
             className={buttonClassName}
             type="button"
-            disabled={isBusy}
+            disabled={isBusy || (!canControl && item.action !== "refresh")}
             onClick={() => {
               onAction(item.action)
             }}

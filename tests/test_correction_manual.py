@@ -88,6 +88,12 @@ class CorrectionManualModeTests(unittest.TestCase):
                 scan_interval_sec=60,
             )
 
+            for name in (".recovered-job-3", ".quality-recovery-temp/pair"):
+                recovery = txt.parent / name
+                recovery.mkdir(parents=True)
+                (recovery / txt.name).write_bytes(txt.read_bytes())
+                (recovery / js.name).write_bytes(js.read_bytes())
+
             pairs = CorrectionWorker(config)._collect_pending_pairs()
 
             self.assertEqual(len(pairs), 1)

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import hmac
 import html
+import ipaddress
+import logging
 import json
 import mimetypes
 import os
 import re
+import sqlite3
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -271,6 +275,11 @@ class RequestHandler(BaseHTTPRequestHandler):
         self._write_bytes(code, encoded, content_type)
 
     def _write_json(self, code: int, payload: dict) -> None:
+        capabilities = payload.get("capabilities")
+        if isinstance(capabilities, dict) and self._control_actor() is None:
+            write_flags = {"status_writes_enabled", "promotions_enabled", "confirmations_enabled"}
+            capabilities = {key: False if key in write_flags else value for key, value in capabilities.items()}
+            payload = {**payload, "capabilities": capabilities}
         self._write(code, json.dumps(payload, ensure_ascii=False), "application/json; charset=utf-8")
 
     def _write_sse_event(self, name: str, payload: dict) -> None:
@@ -292,42 +301,49 @@ class RequestHandler(BaseHTTPRequestHandler):
             content_type = "text/css; charset=utf-8"
         self._write_bytes(200, path.read_bytes(), content_type or "application/octet-stream")
 
+    def _control_response(self, outcome: tuple[int, str]) -> None:
+        status, notice = outcome
+        if status != 200:
+            self._api_error(status, notice)
+            return
+        self._write_json(status, {"ok": True, "notice": notice})
+
     def _action_start(self) -> None:
         assert STATE is not None
-        STATE.start()
-        self._write_json(200, {"ok": True, "notice": STATE.notice})
+        self._control_response(STATE.start())
 
     def _action_pause(self) -> None:
         assert STATE is not None
-        STATE.pause()
-        self._write_json(200, {"ok": True, "notice": STATE.notice})
+        self._control_response(STATE.pause())
 
     def _action_resume(self) -> None:
         assert STATE is not None
-        STATE.resume()
-        self._write_json(200, {"ok": True, "notice": STATE.notice})
+        self._control_response(STATE.resume())
 
     def _action_stop(self) -> None:
         assert STATE is not None
-        STATE.stop()
-        self._write_json(200, {"ok": True, "notice": STATE.notice})
+        self._control_response(STATE.stop())
 
     def _action_refresh(self) -> None:
         self._write_json(200, {"ok": True})
 
     def _action_clear_history(self) -> None:
         assert STATE is not None
-        if not STATE.clear_history():
-            self._api_error(500, STATE.notice)
+        try:
+            fields = self._read_form_fields()
+            digest = fields.get("digest", "")
+            if set(fields) != {"digest"} or not _SHA256_RE.fullmatch(digest):
+                raise ValueError("정리할 대상 건수를 먼저 확인해 주세요.")
+        except ValueError as exc:
+            self._api_error(400, str(exc))
             return
-        self._write_json(200, {"ok": True, "notice": STATE.notice})
+        self._control_response(STATE.clear_history(digest))
 
-    def _action_notification_update(self, selection: str, apply_now: bool = True) -> None:
+    def _action_notification_update(self, selection: str, apply_now: bool = False) -> None:
         assert STATE is not None
         try:
+            # Older clients can still send apply_now. Configuration changes never stop the worker.
             directory_synced = STATE.update_notification_selection(selection)
-            if apply_now:
-                STATE.restart_worker_for_notification()
             if directory_synced is False:
                 STATE.notice += " 디렉터리 동기화를 확인하지 못해 재시작 후 설정 유지 여부를 확인해야 합니다."
         except RuntimeError as exc:
@@ -1055,6 +1071,11 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         self._write_json(200, result)
 
+    def _client_snapshot(self) -> dict:
+        assert STATE is not None
+        snapshot = STATE.snapshot(include_log=False)
+        return {**snapshot, "actions": {**snapshot["actions"], "can_control": self._control_actor() is not None}}
+
     def _serve_event_stream(
         self,
         *,
@@ -1077,7 +1098,7 @@ class RequestHandler(BaseHTTPRequestHandler):
 
         try:
             while True:
-                snapshot = STATE.snapshot(include_log=False)
+                snapshot = self._client_snapshot()
                 signature = _state_stream_signature(snapshot)
                 sent_event = False
 
@@ -1154,9 +1175,17 @@ class RequestHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if parsed.path == "/api/clear_history/plan":
+            assert STATE is not None
+            try:
+                self._write_json(200, STATE.history_plan())
+            except (ValueError, sqlite3.Error):
+                self._api_error(503, "현재 설정과 정리 대상을 확인하지 못했습니다.")
+            return
+
         if parsed.path == "/api/state":
             assert STATE is not None
-            self._write_json(200, STATE.snapshot())
+            self._write_json(200, self._client_snapshot())
             return
 
         if parsed.path == "/api/logs":
@@ -1293,7 +1322,45 @@ class RequestHandler(BaseHTTPRequestHandler):
 
         self._write(404, "Not Found", "text/plain; charset=utf-8")
 
+    def _control_actor(self) -> str | None:
+        server = getattr(self, "server", None)
+        if server is None:  # Direct handler calls in unit tests
+            return "local"
+        try:
+            peer_local = ipaddress.ip_address(self.client_address[0]).is_loopback
+        except ValueError:
+            return None
+        if not peer_local or not server.loopback_listener:
+            return None
+        proxy_headers = ("forwarded", "via", "tailscale-user-login")
+        forwarded = any(
+            key.lower() in proxy_headers or key.lower().startswith("x-forwarded-")
+            for key in self.headers
+        )
+        if not server.shared_mode and not forwarded:
+            return "local"
+        # Shared deployments require a proxy with authenticated operators. The
+        # proxy injects this secret only for their requests over its loopback hop.
+        token = server.control_token
+        credential = self.headers.get("Authorization", "")
+        if token and hmac.compare_digest(credential.encode(), f"Bearer {token}".encode()):
+            operator = self.headers.get("X-Lecture-STT-Operator", "")
+            if re.fullmatch(r"[\w.@+-]{1,128}", operator, re.ASCII):
+                return "operator/" + operator
+            return "operator"
+        return None
+
+    def send_response(self, code: int, message: str | None = None) -> None:
+        if getattr(self, "command", None) == "POST":
+            route = self.path.partition("?")[0]
+            logging.getLogger("lecture_stt.panel.audit").info(
+                "actor=%s peer=%s method=POST route=%r status=%d",
+                getattr(self, "_actor", None) or "denied", self.client_address[0], route[:250], code,
+            )
+        super().send_response(code, message)
+
     def do_POST(self) -> None:  # noqa: N802
+        self._actor = None
         if not self._trusted_host():
             self._api_error(403, "Untrusted Host")
             return
@@ -1314,6 +1381,16 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._api_error(403, "Cross-origin request is not allowed")
             return
         parsed = urlparse(self.path)
+        read_only = parsed.path == "/api/refresh" or (
+            parsed.path.startswith("/api/storage-v2/") and
+            parsed.path.endswith(("/confirmation/plan", "/promotion/plan"))
+        )
+        self._actor = self._control_actor()
+        if self._actor is None:
+            if not read_only:
+                self._api_error(403, "공유 패널은 읽기 전용입니다. 운영자 권한으로 접속해 주세요.")
+                return
+            self._actor = "viewer"
 
         if parsed.path.startswith("/api/"):
             archive_review_route = self._archive_review_case_route(parsed.path)
@@ -1450,9 +1527,20 @@ def main() -> None:
         raise RuntimeError(f"Cannot bind web control panel to {host}:{port}. {exc}") from exc
 
     server.allowed_hosts = {f"{name}:{server.server_port}" for name in ("127.0.0.1", "localhost")}
-    configured_hosts = runtime_env(dotenv_path=env_file(root)).get("WEB_PANEL_ALLOWED_HOSTS", "")
+    settings = runtime_env(dotenv_path=env_file(root))
+    configured_hosts = settings.get("WEB_PANEL_ALLOWED_HOSTS", "")
     server.allowed_hosts.update(name.strip().lower() for name in configured_hosts.split(",") if name.strip())
 
+    server.loopback_listener = ipaddress.ip_address(server.server_address[0]).is_loopback
+    server.control_token = settings.get("WEB_PANEL_CONTROL_TOKEN", "").strip()
+    server.shared_mode = bool(configured_hosts.strip() or server.control_token) or not server.loopback_listener
+    audit = logging.getLogger("lecture_stt.panel.audit")
+    if not audit.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(asctime)s %(name)s %(message)s"))
+        audit.addHandler(handler)
+    audit.setLevel(logging.INFO)
+    audit.propagate = False
     STATE.set_shutdown_handler(server.shutdown)
     print(f"Web control panel running at http://{host}:{port}")
     print("Press Ctrl+C to stop.")

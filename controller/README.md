@@ -15,8 +15,10 @@ One ownership cycle:
    rejects invalid marker types;
 3. removes only stale controller-owned plan manifests after validating their
    type, owner, mode, and link count;
-4. asks Python for the next exact retry plan and dispatches it through the
-   guarded retry apply contract when present;
+4. asks Python to recover interrupted DB/staging work under the worker lock,
+   including on an empty inbox. If a retry input is missing, unsafe, or
+   differs from its admission checksum, Python preserves that row for review,
+   then selects the next eligible retry for guarded dispatch;
 5. runs the existing Go/Python lockstep stability comparison, asks Python to
    plan each mutually stable fresh source, verifies the closed plan in Go, and
    re-plans immediately before dispatch;

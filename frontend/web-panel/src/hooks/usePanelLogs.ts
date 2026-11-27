@@ -18,7 +18,7 @@ interface UsePanelLogsOptions {
   eventsEndpoint?: string | null
   pollIntervalSec: number
   enabled: boolean
-  resetKey: number
+  resetKey?: number
 }
 
 const EMPTY_LOG_STATE: PanelLogState = {

@@ -82,6 +82,10 @@ jobs:
         working-directory: controller
         run: go test -race ./...
 
+      - name: Repeat macOS controller shutdown regression tests
+        working-directory: controller
+        run: go test -race -count=10 -run '^(TestMainSIGTERMEmitsInterruptedReportAndReapsDescendants|TestExitedButUnreapedFixtureMemberIsNotLive)$' ./cmd/lecture-stt-shadow
+
       - name: Vet Go controller
         working-directory: controller
         run: go vet ./...

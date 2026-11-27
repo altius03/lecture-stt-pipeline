@@ -6,15 +6,15 @@ import type { NotificationSelection, NotificationState, PanelSummary, RuntimeSta
 import type { ThemeMode } from "../../hooks/useThemeMode"
 
 interface PanelHeroProps {
+  canControl?: boolean
   runtimeState: RuntimeState
   summary: PanelSummary
   realtimeConnected: boolean
   currentScreenLabel: string
   notification: NotificationState
   pendingNotificationSelection: NotificationSelection | null
-  pendingNotificationApplyNow: boolean
   theme: ThemeMode
-  onNotificationSave: (selection: NotificationSelection, applyNow?: boolean) => void
+  onNotificationSave: (selection: NotificationSelection) => void
   onThemeChange: (nextTheme: ThemeMode) => void
 }
 
@@ -28,13 +28,13 @@ function formatCurrentTime(now: Date): string {
 }
 
 export function PanelHero({
+  canControl,
   runtimeState,
   summary,
   realtimeConnected,
   currentScreenLabel,
   notification,
   pendingNotificationSelection,
-  pendingNotificationApplyNow,
   theme,
   onNotificationSave,
   onThemeChange,
@@ -88,9 +88,9 @@ export function PanelHero({
 
       <div className="panel-command-bar" role="group" aria-label="빠른 제어">
         <NotificationToggle
+          canControl={canControl}
           notification={notification}
           pendingSelection={pendingNotificationSelection}
-          pendingApplyNow={pendingNotificationApplyNow}
           onSave={onNotificationSave}
         />
         <button

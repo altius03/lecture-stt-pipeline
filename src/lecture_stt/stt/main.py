@@ -8,8 +8,8 @@ from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
 import re
-import shutil
 import sqlite3
+import stat
 import sys
 import time
 import traceback
@@ -48,8 +48,9 @@ from lecture_stt.shared.paths import (
     repo_root,
     resolve_config_path,
     resolve_executable,
+    runtime_env,
 )
-from lecture_stt.stt.notifier import SUPPORTED_PROVIDERS, build_notifier
+from lecture_stt.stt.notifier import NoopNotifier, SUPPORTED_PROVIDERS, build_notifier
 from lecture_stt.stt.postprocess import postprocess
 from lecture_stt.stt.profiles import (
     legacy_unknown_snapshot,
@@ -58,6 +59,7 @@ from lecture_stt.stt.profiles import (
 )
 from lecture_stt.stt.quality_gate import (
     evaluate as quality_evaluate,
+    inherited_review_reason,
     validate_quality_scorecard,
     write_quality_scorecard,
 )
@@ -69,9 +71,13 @@ from lecture_stt.stt.controller_gate import (
     normalize_controller_kill_switch_path,
 )
 from lecture_stt.stt.retry_job import (
+    NEXT_PLAN_SCHEMA_VERSION,
+    RetryInputUnavailable,
+    RetryInputBusy,
     RetryJobConflictError,
     RetryJobContractError,
     build_next_retry_job_plan,
+    existing_controller_database,
     build_retry_job_plan,
     load_retry_job_plan,
     retry_job_result,
@@ -191,6 +197,60 @@ def load_config(config_path: str = "config/config.yaml") -> dict:
 
     return loaded
 
+
+def _notification_env(env: Mapping[str, str]) -> dict[str, str]:
+    keys = ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "TELEGRAM_MESSAGE_THREAD_ID", "DISCORD_WEBHOOK_URL")
+    return {key: env[key] for key in keys if key in env}
+
+
+def _parse_bool(name: str, value: Any) -> bool:
+    # 문자열/정수 입력이 섞여도 의도한 불리언으로 안전하게 해석한다.
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off"}:
+            return False
+    raise ValueError(f"Config error: {name} must be a boolean")
+
+
+def _validate_notification(notification: dict) -> None:
+    provider = str(notification.get("provider", "auto") or "auto").strip().lower()
+    if provider not in SUPPORTED_PROVIDERS:
+        raise ValueError(
+            f"Config error: notification.provider must be one of {sorted(SUPPORTED_PROVIDERS)}"
+        )
+
+    for key in ["enabled", "send_start", "send_success", "send_review", "send_failure"]:
+        if key in notification:
+            notification[key] = _parse_bool(f"notification.{key}", notification[key])
+
+    dual_send = notification.get("dual_send_providers", [])
+    if dual_send is None:
+        dual_send = []
+    if isinstance(dual_send, str):
+        dual_send = [item.strip() for item in dual_send.split(",") if item.strip()]
+    if not isinstance(dual_send, list):
+        raise ValueError("Config error: notification.dual_send_providers must be a list or string")
+
+    normalized_dual: list[str] = []
+    for item in dual_send:
+        value = str(item).strip().lower()
+        if not value:
+            continue
+        if value not in SUPPORTED_PROVIDERS or value == "auto":
+            raise ValueError(
+                "Config error: notification.dual_send_providers contains unsupported provider"
+            )
+        normalized_dual.append(value)
+    notification["provider"] = provider
+    notification["dual_send_providers"] = normalized_dual
+
+
 def validate_config(
     config_path: str,
     config: dict,
@@ -206,20 +266,6 @@ def validate_config(
         if not isinstance(section, dict):
             raise ValueError(f"Config error in {config_path_obj}: missing/invalid section '{name}'")
         return section
-
-    def parse_bool(name: str, value: Any) -> bool:
-        # 문자열/정수 입력이 섞여도 의도한 불리언으로 안전하게 해석한다.
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, int) and value in (0, 1):
-            return bool(value)
-        if isinstance(value, str):
-            normalized = value.strip().lower()
-            if normalized in {"1", "true", "yes", "y", "on"}:
-                return True
-            if normalized in {"0", "false", "no", "n", "off"}:
-                return False
-        raise ValueError(f"Config error: {name} must be a boolean")
 
     app = require_section("app")
     paths = require_section("paths")
@@ -366,51 +412,21 @@ def validate_config(
         raise ValueError("Config error: transcribe.beam_size must be an integer") from exc
     if beam_size <= 0:
         raise ValueError("Config error: transcribe.beam_size must be greater than 0")
-    transcribe["vad_filter"] = parse_bool("transcribe.vad_filter", transcribe["vad_filter"])
-    transcribe["word_timestamps"] = parse_bool("transcribe.word_timestamps", transcribe["word_timestamps"])
+    transcribe["vad_filter"] = _parse_bool("transcribe.vad_filter", transcribe["vad_filter"])
+    transcribe["word_timestamps"] = _parse_bool("transcribe.word_timestamps", transcribe["word_timestamps"])
     if "condition_on_previous_text" in transcribe:
-        transcribe["condition_on_previous_text"] = parse_bool(
+        transcribe["condition_on_previous_text"] = _parse_bool(
             "transcribe.condition_on_previous_text", transcribe["condition_on_previous_text"]
         )
     if "keep_model_loaded" in transcribe:
-        transcribe["keep_model_loaded"] = parse_bool(
+        transcribe["keep_model_loaded"] = _parse_bool(
             "transcribe.keep_model_loaded", transcribe["keep_model_loaded"]
         )
 
-    if notification:
-        provider = str(notification.get("provider", "auto") or "auto").strip().lower()
-        if provider not in SUPPORTED_PROVIDERS:
-            raise ValueError(
-                f"Config error: notification.provider must be one of {sorted(SUPPORTED_PROVIDERS)}"
-            )
-
-        for key in ["enabled", "send_start", "send_success", "send_review", "send_failure"]:
-            if key in notification:
-                notification[key] = parse_bool(f"notification.{key}", notification[key])
-
-        dual_send = notification.get("dual_send_providers", [])
-        if dual_send is None:
-            dual_send = []
-        if isinstance(dual_send, str):
-            dual_send = [item.strip() for item in dual_send.split(",") if item.strip()]
-        if not isinstance(dual_send, list):
-            raise ValueError("Config error: notification.dual_send_providers must be a list or string")
-
-        normalized_dual: list[str] = []
-        for item in dual_send:
-            value = str(item).strip().lower()
-            if not value:
-                continue
-            if value not in SUPPORTED_PROVIDERS or value == "auto":
-                raise ValueError(
-                    "Config error: notification.dual_send_providers contains unsupported provider"
-                )
-            normalized_dual.append(value)
-        notification["provider"] = provider
-        notification["dual_send_providers"] = normalized_dual
+    _validate_notification(notification)
 
     if transcript_delivery:
-        enabled = parse_bool(
+        enabled = _parse_bool(
             "transcript_delivery.enabled",
             transcript_delivery.get("enabled", False),
         )
@@ -587,7 +603,8 @@ def setup_logging(log_file: str, max_bytes: int, backup_count: int) -> logging.L
 
 class STTPipeline:
     # 전체 전사 워크플로우의 오케스트레이션을 담당한다.
-    def __init__(self, config: dict, logger: logging.Logger):
+    def __init__(self, config: dict, logger: logging.Logger, *, notifications_enabled: bool = True):
+        self.config_path: str | None = None
         self.config = _normalize_config_paths(config)
         self.logger = logger
 
@@ -640,11 +657,31 @@ class STTPipeline:
         self._last_pause_log_at = 0.0
 
         self.conn = db.init_db(str(self.db_path))
-        self.notifier = build_notifier(
-            self.config,
-            env=os.environ,
-            state_dir=self.db_path.parent,
+        self.notification_overrides = _notification_env(os.environ)
+        self._active_notification_env = self.notification_overrides.copy()
+        self.notifier = (
+            build_notifier(self.config, env=self._active_notification_env, state_dir=self.db_path.parent)
+            if notifications_enabled else NoopNotifier()
         )
+
+    def _refresh_notifications(self) -> None:
+        if self.config_path is None:
+            return
+        try:
+            latest = load_config(self.config_path).get("notification", {})
+            if not isinstance(latest, dict):
+                raise ValueError("invalid notification section")
+            normalized = _ensure_config_defaults({"notification": latest})["notification"]
+            _validate_notification(normalized)
+            current_env = _notification_env(runtime_env(self.notification_overrides, dotenv_path=env_file()))
+            if normalized != self.config["notification"] or current_env != self._active_notification_env:
+                updated = {**self.config, "notification": normalized}
+                notifier = build_notifier(updated, env=current_env, state_dir=self.db_path.parent)
+                self.config["notification"] = normalized
+                self._active_notification_env = current_env
+                self.notifier = notifier
+        except (OSError, TypeError, ValueError):
+            self.logger.warning("Could not refresh notification settings; keeping current channel")
 
     @staticmethod
     def _to_stage_progress(step: str) -> int:
@@ -797,7 +834,30 @@ class STTPipeline:
             return None
         return max(1, int(sum(samples) / len(samples)))
 
-    # 시작 시 PROCESSING으로 남은 작업을 정리해 중복 처리/중단 상태를 회복한다.
+    def prepare_controller_cycle(self, kill_switch_path: Path) -> dict[str, Any]:
+        ensure_controller_execution_unpaused(self.config)
+        ensure_controller_kill_switch_inactive(kill_switch_path)
+        self.startup_recovery()
+        for row in self._retryable_transcription_rows():
+            ensure_controller_execution_unpaused(self.config)
+            ensure_controller_kill_switch_inactive(kill_switch_path)
+            try:
+                plan = build_retry_job_plan(self.config, job_id=row["id"])
+                if row["sha256"] and plan["audio"]["sha256"] != row["sha256"]:
+                    raise RetryInputUnavailable("retry audio checksum differs from the admitted recording")
+                return {"schema_version": NEXT_PLAN_SCHEMA_VERSION, "status": "planned", "plan": plan}
+            except RetryInputUnavailable as exc:
+                with self.conn:
+                    self.conn.execute(
+                        "UPDATE jobs SET status=?, current_step=?, error_message=?, updated_at=? "
+                        "WHERE id=? AND status=? AND updated_at=? AND current_step=?",
+                        (STATUS_NEEDS_REVIEW, "전사 재시도 입력 확인 필요", str(exc), utils.now_iso(),
+                         row["id"], STATUS_PENDING, row["updated_at"], row["current_step"]),
+                    )
+            except RetryInputBusy as exc:
+                self.logger.warning("Deferring retry job %s: %s", row["id"], exc)
+        return {"schema_version": NEXT_PLAN_SCHEMA_VERSION, "status": "empty", "plan": None}
+
     def startup_recovery(self) -> None:
         restored_staged, cleared_jobs = self._recover_staged_claims()
         if restored_staged or cleared_jobs:
@@ -870,7 +930,9 @@ class STTPipeline:
                     create=False,
                 )
             txt_target = transcript_parent / f"{base_candidate}.txt"
-            if not (audio_target.exists() or txt_target.exists()):
+            if not any(os.path.lexists(path) for path in (
+                audio_target, txt_target, txt_target.with_suffix(".json"), txt_target.with_suffix(".quality.json")
+            )):
                 break
             base_candidate = f"{safe_stem}__{utils.local_timestamp()}__{utils.short_id(6)}"
 
@@ -976,6 +1038,34 @@ class STTPipeline:
             )
         return candidate
 
+    @staticmethod
+    def _audio_identity(path: Path) -> dict[str, int]:
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("audio claim must be a regular file")
+        return {"device": info.st_dev, "inode": info.st_ino, "size": info.st_size,
+                "mtime_ns": info.st_mtime_ns}
+
+    def _reattach_moved_claim(self, row: sqlite3.Row) -> bool:
+        evidence = self._load_engine_params(row["engine_params"]).get("move_claim")
+        if not isinstance(evidence, dict) or not row["sha256"]:
+            return False
+        name = evidence.get("name")
+        if not isinstance(name, str) or Path(name).name != name or name in {"", ".", ".."}:
+            return False
+        candidate = self.audio_dir / name
+        try:
+            if self._audio_identity(candidate) != evidence.get("identity"):
+                return False
+            if utils.compute_sha256(candidate) != row["sha256"]:
+                return False
+            if self._audio_identity(candidate) != evidence["identity"]:
+                return False
+        except (OSError, ValueError):
+            return False
+        db.update_job(self.conn, row["id"], canonical_audio_path=str(candidate), current_step="파일 이동")
+        return True
+
     def _recover_staged_claims(self) -> tuple[int, int]:
         restored = 0
         cleared_jobs = 0
@@ -991,7 +1081,7 @@ class STTPipeline:
                 restored += 1
 
         rows = self.conn.execute(
-            "SELECT id, canonical_audio_path, current_step FROM jobs "
+            "SELECT id, canonical_audio_path, current_step, engine_params, sha256 FROM jobs "
             "WHERE status IN (?, ?) ORDER BY id ASC",
             (STATUS_PENDING, STATUS_PROCESSING),
         ).fetchall()
@@ -1005,6 +1095,8 @@ class STTPipeline:
             except ValueError:
                 in_staging = False
             if not in_staging and str(row["current_step"] or "") != "로컬 staging":
+                continue
+            if self._reattach_moved_claim(row):
                 continue
             if audio_path in requeued_paths:
                 db.delete_job(self.conn, int(row["id"]))
@@ -1181,15 +1273,14 @@ class STTPipeline:
                 return False
 
             segments = prior_payload.get("segments")
-            if not isinstance(segments, list):
+            if not isinstance(segments, list) or not all(isinstance(item, dict) for item in segments):
                 return False
 
-            shutil.copy2(prior_txt, txt_path)
             text = "\n".join(
                 [
-                    str(item.get("text", "")).strip()
+                    str(item.get("text") or "").strip()
                     for item in segments
-                    if str(item.get("text", "")).strip()
+                    if str(item.get("text") or "").strip()
                 ]
             )
 
@@ -1235,10 +1326,16 @@ class STTPipeline:
                 if isinstance(prior_metadata, dict)
                 else None
             )
-            if isinstance(prior_quality, dict):
+            if (text.strip() and isinstance(prior_quality, dict)
+                    and prior_quality.get("health") in ("good", "warn", "bad")
+                    and isinstance(prior_quality.get("quality_score"), int)
+                    and isinstance(prior_quality.get("summary"), str)):
                 metadata["quality"] = dict(prior_quality)
             else:
                 metadata["quality"] = quality_evaluate(segments, text).to_dict()
+            if duplicate["status"] == STATUS_NEEDS_REVIEW and metadata["quality"].get("health") != "bad":
+                # Reusing bytes does not resolve an existing operator or recovery hold.
+                metadata["review_hold_source_job_id"] = int(duplicate["id"])
 
             db.update_job(
                 self.conn,
@@ -1251,8 +1348,8 @@ class STTPipeline:
             self._validate_output_files(txt_path, json_path)
             self._update_progress(job_id, "전사문 생성(TXT/JSON)")
             replay_health = str(metadata["quality"].get("health", "")).strip().lower()
-            if replay_health == "bad":
-                self._handle_bad_quality(
+            if replay_health == "bad" or inherited_review_reason(metadata):
+                self._handle_quality_review(
                     job_id=job_id,
                     source_path=source_path,
                     canonical_audio=canonical_audio_path,
@@ -1466,7 +1563,7 @@ class STTPipeline:
             })
         self._log(logging.ERROR, "failed", job_ctx)
 
-    def _handle_bad_quality(
+    def _handle_quality_review(
         self,
         *,
         job_id: int,
@@ -1491,7 +1588,7 @@ class STTPipeline:
             raw_summary = quality_report.get("summary", "품질 위험")
         else:
             raw_summary = getattr(quality_report, "summary", "품질 위험")
-        safe_summary = _redact_sensitive_text(str(raw_summary))
+        safe_summary = inherited_review_reason(metadata) or _redact_sensitive_text(str(raw_summary))
         db.update_job(
             self.conn,
             job_id,
@@ -1521,7 +1618,7 @@ class STTPipeline:
             "pending_count": queue.get("PENDING", 0),
             "processing_count": queue.get("PROCESSING", 0),
         })
-        self._log(logging.WARNING, "bad quality transcript preserved for remediation: %s", {"job_id": str(job_id), "canonical_base": canonical_base}, safe_summary)
+        self._log(logging.WARNING, "transcript preserved for review: %s", {"job_id": str(job_id), "canonical_base": canonical_base}, safe_summary)
 
     # 하나의 파일에 대해 이동, 중복 처리, 전사, 저장, 알림까지 수행한다.
     def process_job(
@@ -1531,6 +1628,7 @@ class STTPipeline:
         single_job_plan: Mapping[str, Any] | None = None,
         kill_switch_path: Path | None = None,
     ) -> dict[str, Any]:
+        self._refresh_notifications()
         recorded_at = self._recorded_at_for_source(source_path)
         paths = self._job_paths(source_path, recorded_at=recorded_at)
         canonical_base = paths["canonical_base"]
@@ -1578,6 +1676,11 @@ class STTPipeline:
                     ensure_controller_execution_unpaused(self.config)
                     ensure_controller_kill_switch_inactive(kill_switch_path)
                 source_path = revalidate_single_job_plan(self.config, single_job_plan)
+            if utils.is_paused(self.config):
+                return single_job_result(
+                    plan_sha256=str(single_job_plan["plan_sha256"]) if single_job_plan else "",
+                    status="busy", job_id=None,
+                )
             try:
                 utils.safe_move_file(source_path, staging_source)
             except FileNotFoundError:
@@ -1648,10 +1751,18 @@ class STTPipeline:
             # 안정적인 로컬 staging에서 canonical audio 경로로 옮겨 후속 처리를 시작한다.
             fail_step = "파일 이동"
             self._update_progress(job_id, "파일 이동", 20)
+            identity = self._audio_identity(staging_source)
+            sha256 = utils.compute_sha256(staging_source)
+            if self._audio_identity(staging_source) != identity:
+                raise RuntimeError("Staged audio changed during hashing")
+            admission = self._load_engine_params(db.get_job(self.conn, job_id)["engine_params"])
+            admission["move_claim"] = {"name": canonical_audio.name, "identity": identity}
+            db.update_job(self.conn, job_id, sha256=sha256, engine_params=json.dumps(admission))
             utils.safe_move_file(staging_source, canonical_audio)
             canonical_audio_final = canonical_audio
             source_claim_path = canonical_audio_final
-            sha256 = utils.compute_sha256(canonical_audio_final)
+            if self._audio_identity(canonical_audio_final) != identity:
+                raise RuntimeError("Audio identity changed during admission")
             db.update_job(
                 self.conn,
                 job_id,
@@ -1690,10 +1801,12 @@ class STTPipeline:
                     json_path=json_path,
                     duplicate=duplicate,
                 ):
-                    self._log(logging.INFO, "dedupe completed", job_ctx)
+                    replay_row = db.get_job(self.conn, job_id)
+                    status = "needs_review" if replay_row["status"] == STATUS_NEEDS_REVIEW else "completed"
+                    self._log(logging.INFO, "dedupe %s", job_ctx, status)
                     return single_job_result(
                         plan_sha256=str(single_job_plan["plan_sha256"]) if single_job_plan else "",
-                        status="completed",
+                        status=status,
                         job_id=job_id,
                     )
 
@@ -1763,7 +1876,7 @@ class STTPipeline:
             self._write_output(txt_path, json_path, segments, transcript_text, metadata)
             self._validate_output_files(txt_path, json_path)
             if quality_report.health == "bad":
-                self._handle_bad_quality(
+                self._handle_quality_review(
                     job_id=job_id,
                     source_path=source_path,
                     canonical_audio=canonical_audio_final,
@@ -1963,7 +2076,7 @@ class STTPipeline:
     def process_retryable_jobs(self, *, limit: int | None = None) -> int:
         processed = 0
         for row in self._retryable_transcription_rows():
-            if limit is not None and processed >= limit:
+            if utils.is_paused(self.config) or (limit is not None and processed >= limit):
                 break
             self._process_retryable_transcription_job(row)
             processed += 1
@@ -1991,6 +2104,9 @@ class STTPipeline:
                 fail_step = "전사 재시도 입력 확인"
                 raise FileNotFoundError(f"Missing retry input audio: {canonical_audio}")
 
+            if utils.is_paused(self.config):
+                return
+            self._refresh_notifications()
             if exact_claim is None:
                 claimed = db.claim_job_for_processing(self.conn, job_id)
             else:
@@ -2089,7 +2205,7 @@ class STTPipeline:
             self._write_output(txt_path, json_path, segments, transcript_text, metadata)
             self._validate_output_files(txt_path, json_path)
             if quality_report.health == "bad":
-                self._handle_bad_quality(
+                self._handle_quality_review(
                     job_id=job_id,
                     source_path=source_path,
                     canonical_audio=canonical_audio,
@@ -2178,7 +2294,8 @@ class STTPipeline:
 
     def run(self, run_once: bool = False) -> None:
         # 파이프라인을 루프 또는 한 번 처리 모드로 실행하고 pause 상태를 반영한다.
-        self.startup_recovery()
+        next_quality_repair: float | None = None
+        repair_interval = max(30, self.polling_interval_sec)
         self._log(logging.INFO, "pipeline start", {"job_id": "-", "canonical_base": "-"})
 
         while True:
@@ -2205,6 +2322,14 @@ class STTPipeline:
                 self._last_pause_log_at = 0.0
                 self._log(logging.INFO, "pipeline resumed", {"job_id": "-", "canonical_base": "-"})
 
+            if next_quality_repair is None:
+                self.startup_recovery()
+                next_quality_repair = time.monotonic() + repair_interval
+            elif time.monotonic() >= next_quality_repair:
+                # Bound repair work per poll so a stalled iCloud file cannot monopolize intake.
+                db.recover_processing_jobs(self.conn, self.stale_processing_hours, deferred_only=True)
+                next_quality_repair = time.monotonic() + repair_interval
+
             retry_limit = 1 if run_once else None
             retry_count = self.process_retryable_jobs(limit=retry_limit)
             if retry_count:
@@ -2212,7 +2337,7 @@ class STTPipeline:
                     return
                 continue
 
-            stable_files = self.watcher.scan_stable_files()
+            stable_files = self.watcher.scan_once() if run_once else self.watcher.scan_stable_files()
             if not stable_files:
                 if run_once:
                     return
@@ -2220,6 +2345,8 @@ class STTPipeline:
                 continue
 
             for path in stable_files:
+                if utils.is_paused(self.config):
+                    break
                 self.process_job(path)
                 if run_once:
                     return
@@ -2245,6 +2372,11 @@ def parse_args() -> argparse.Namespace:
         "--single-job-manifest",
         metavar="PATH",
         help="Execute exactly one previously planned single-job manifest",
+    )
+    worker_plan_group.add_argument(
+        "--prepare-controller-cycle",
+        action="store_true",
+        help="Recover interrupted intake and select an eligible controller retry under the worker lock",
     )
     worker_plan_group.add_argument(
         "--plan-next-retry-job",
@@ -2315,11 +2447,13 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     # 진입점: 제어 커맨드를 우선 처리하고, 기본 실행은 파이프라인 시작이다.
     args = parse_args()
+    notification_overrides = _notification_env(os.environ)
     load_dotenv(str(env_file()), override=False)
 
     if args.pause or args.resume or args.status:
         if (
             args.once
+            or args.prepare_controller_cycle
             or args.plan_single_job
             or args.single_job_manifest
             or args.plan_retry_job is not None
@@ -2535,6 +2669,19 @@ def main() -> None:
         except (ControllerGateError, TerminalErrorRecoveryContractError) as exc:
             print(f"Terminal-error-recovery execution rejected: {exc}", file=sys.stderr)
             raise SystemExit(2) from exc
+    elif args.prepare_controller_cycle:
+        if (not args.allow_write or args.once or args.enable_single_job or args.enable_retry_job
+                or args.enable_terminal_error_recovery or args.expected_count is not None
+                or args.expected_plan_sha256 is not None):
+            raise SystemExit("controller preparation requires --allow-write and --controller-kill-switch only")
+        try:
+            controller_kill_switch_path = normalize_controller_kill_switch_path(
+                args.controller_kill_switch, operation="controller cycle preparation"
+            )
+            ensure_controller_kill_switch_inactive(controller_kill_switch_path)
+            ensure_controller_execution_unpaused(_normalize_config_paths(config))
+        except ControllerGateError as exc:
+            raise SystemExit(str(exc)) from exc
     elif (
         args.enable_single_job
         or args.enable_retry_job
@@ -2548,7 +2695,10 @@ def main() -> None:
             "worker execution guards require a single-job, retry-job, or terminal-error-recovery manifest"
         )
 
-    config = validate_config(args.config, config)
+    if args.prepare_controller_cycle:
+        config = validate_config(args.config, config, check_writable=False)
+    else:
+        config = validate_config(args.config, config)
     logging_cfg = config["logging"]
     logger = setup_logging(
         logging_cfg["file"],
@@ -2556,14 +2706,16 @@ def main() -> None:
         int(logging_cfg["backup_count"]),
     )
 
-    logger.info("Loaded and validated configuration from %s", args.config)
+    if not args.prepare_controller_cycle:
+        logger.info("Loaded and validated configuration from %s", args.config)
     lock_path = Path(config["paths"]["db_path"]).parent / "stt.lock"
     wait_for_lock = _env_flag("LECTURE_STT_LOCK_WAIT")
     try:
-        if wait_for_lock:
+        if wait_for_lock and not args.prepare_controller_cycle:
             logger.info("Waiting for main worker lock at %s", lock_path)
         with SingleInstanceLock(lock_path, blocking=wait_for_lock):
-            logger.info("Acquired main worker lock at %s", lock_path)
+            if not args.prepare_controller_cycle:
+                logger.info("Acquired main worker lock at %s", lock_path)
             if controller_kill_switch_path is not None:
                 try:
                     if terminal_error_recovery_plan is None:
@@ -2584,7 +2736,30 @@ def main() -> None:
                             file=sys.stderr,
                         )
                     raise SystemExit(2) from exc
+            if args.prepare_controller_cycle:
+                assert controller_kill_switch_path is not None
+                try:
+                    with existing_controller_database(Path(config["paths"]["db_path"])) as (guard, _):
+                        staging = Path(config["paths"]["tmp_dir"]) / "inbox_staging"
+                        active = guard.execute(
+                            "SELECT 1 FROM jobs WHERE status IN (?, ?) LIMIT 1",
+                            (STATUS_PROCESSING, STATUS_PENDING),
+                        ).fetchone()
+                        if active or (staging.exists() and any(staging.iterdir())):
+                            pipeline = STTPipeline(config=config, logger=logger, notifications_enabled=False)
+                            try:
+                                result = pipeline.prepare_controller_cycle(controller_kill_switch_path)
+                            finally:
+                                pipeline.conn.close()
+                        else:
+                            result = {"schema_version": NEXT_PLAN_SCHEMA_VERSION, "status": "empty", "plan": None}
+                except (ControllerGateError, RetryJobContractError) as exc:
+                    raise SystemExit(str(exc)) from exc
+                print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+                return
             pipeline = STTPipeline(config=config, logger=logger)
+            pipeline.config_path = args.config
+            pipeline.notification_overrides = notification_overrides
             if single_job_plan is not None:
                 try:
                     result = pipeline.process_single_job_plan(
@@ -2595,7 +2770,7 @@ def main() -> None:
                     print(f"Single-job execution rejected: {exc}", file=sys.stderr)
                     raise SystemExit(2) from exc
                 print(json.dumps(result, ensure_ascii=False, sort_keys=True))
-                if result["status"] == "retry_pending":
+                if result["status"] in {"retry_pending", "busy"}:
                     raise SystemExit(75)
                 if result["status"] in {"failed", "skipped"}:
                     raise SystemExit(2)
@@ -2611,7 +2786,7 @@ def main() -> None:
                     print(f"Retry-job execution rejected: {exc}", file=sys.stderr)
                     raise SystemExit(2) from exc
                 print(json.dumps(result, ensure_ascii=False, sort_keys=True))
-                if result["status"] == "retry_pending":
+                if result["status"] in {"retry_pending", "busy"}:
                     raise SystemExit(75)
                 if result["status"] == "failed":
                     raise SystemExit(2)
@@ -2637,6 +2812,8 @@ def main() -> None:
             pipeline.run(run_once=args.once)
     except BlockingIOError:
         logger.warning("Another STT worker is already running; exiting (lock=%s)", lock_path)
+        if args.prepare_controller_cycle:
+            raise SystemExit(75)
         if single_job_plan is not None:
             print(
                 json.dumps(

@@ -27,6 +27,26 @@ class _FakeResponse:
 
 
 class NotifierTests(unittest.TestCase):
+    def test_failed_transports_log_only_safe_diagnostics(self) -> None:
+        for provider in ("discord", "telegram"):
+            for failure in (OSError("private-test-value"), _FakeResponse(401, "private-test-value")):
+                with self.subTest(provider=provider, failure=type(failure).__name__), tempfile.TemporaryDirectory() as tmp:
+                    args = {"side_effect": failure} if isinstance(failure, Exception) else {"return_value": failure}
+                    with (
+                        mock.patch("lecture_stt.stt.notifier.requests.get", **args),
+                        mock.patch("lecture_stt.stt.notifier.requests.post", **args),
+                        self.assertLogs("lecture_stt.stt.notifier", "ERROR") as logs,
+                    ):
+                        notifier = build_notifier(
+                            {"notification": {"provider": provider}},
+                            env={"TELEGRAM_BOT_TOKEN": "private-test-value", "TELEGRAM_CHAT_ID": "123",
+                                 "DISCORD_WEBHOOK_URL": "https://example.invalid/private-test-value"},
+                            state_dir=tmp,
+                        )
+                        notifier.notify_success({"job_id": 9})
+                    self.assertNotIn("private-test-value", "\n".join(logs.output))
+                    self.assertFalse((Path(tmp) / "notified" / f"{provider}_success_9").exists())
+
     def test_auto_provider_falls_back_to_discord(self) -> None:
         with mock.patch("lecture_stt.stt.notifier.requests.get", return_value=_FakeResponse()):
             notifier = build_notifier(

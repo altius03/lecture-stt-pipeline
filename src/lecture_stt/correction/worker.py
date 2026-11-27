@@ -16,6 +16,7 @@ from typing import Optional
 
 from lecture_stt.shared.paths import (
     env_file,
+    iter_transcript_files,
     repo_root,
     resolve_config_path,
     runtime_env,
@@ -100,7 +101,7 @@ class CorrectionWorker:
         txt_paths: dict[str, Path] = {}
         json_paths: dict[str, Path] = {}
 
-        for path in src.rglob("*"):
+        for path in iter_transcript_files(src):
             if not path.is_file() or path.is_symlink():
                 continue
             if is_temporary_file(path):

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import zlib
 from dataclasses import dataclass
@@ -38,6 +39,7 @@ class QualityReport:
     audio_duration_sec: float | None
     chars_per_audio_min: float | None
     coverage_ratio: float | None
+    long_gaps: list[dict[str, float]]
     quality_score: int            # 0~100, 높을수록 건강함
     health: str                   # "good" | "warn" | "bad"
     summary: str                  # 사람이 읽을 수 있는 한 줄 요약
@@ -56,6 +58,7 @@ class QualityReport:
             "nonempty_segments": self.nonempty_segments,
             "nonspace_chars": self.nonspace_chars,
             "last_segment_end_sec": round(self.last_segment_end_sec, 3),
+            "long_gaps": self.long_gaps,
             "quality_score": self.quality_score,
             "health": self.health,
             "summary": self.summary,
@@ -77,6 +80,13 @@ def quality_scorecard_path(transcript_json_path: str | Path) -> Path:
 
 def _copy_present(mapping: Mapping[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
     return {key: mapping[key] for key in keys if key in mapping and mapping[key] is not None}
+
+
+def inherited_review_reason(metadata: Mapping[str, Any]) -> str | None:
+    source_id = metadata.get("review_hold_source_job_id")
+    if type(source_id) is int and source_id > 0:
+        return f"원본 작업 #{source_id}의 검토 보류를 계승했습니다."
+    return None
 
 
 def build_quality_scorecard(
@@ -118,6 +128,7 @@ def build_quality_scorecard(
             "audio_duration_sec",
             "chars_per_audio_min",
             "coverage_ratio",
+            "long_gaps",
         ),
     )
     model = _copy_present(
@@ -150,6 +161,8 @@ def build_quality_scorecard(
         "model": model,
         "artifacts": artifacts,
     }
+    if inherited_review_reason(metadata):
+        scorecard["review_hold_source_job_id"] = metadata["review_hold_source_job_id"]
     profile = metadata.get("profile")
     if isinstance(profile, Mapping):
         profile_snapshot = _copy_present(
@@ -212,6 +225,9 @@ def validate_quality_scorecard(transcript_json_path: str | Path, metadata: Mappi
     ):
         if scorecard.get(key) != expected[key]:
             raise ValueError(f"Quality scorecard {key} does not match transcript metadata")
+
+    if scorecard.get("review_hold_source_job_id") != expected.get("review_hold_source_job_id"):
+        raise ValueError("Quality scorecard inherited review hold does not match transcript metadata")
 
     if "profile" in expected and scorecard.get("profile") != expected["profile"]:
         raise ValueError("Quality scorecard profile does not match transcript metadata")
@@ -292,6 +308,25 @@ def evaluate(
             chars_per_audio_min = nonspace_chars / duration_min
         coverage_ratio = min(1.0, last_segment_end_sec / normalized_duration_sec)
 
+    # Merge overlapping recognized intervals before measuring internal gaps.
+    intervals = []
+    for segment in segments:
+        if not str(segment.get("text") or "").strip():
+            continue
+        try:
+            start, end = float(segment["start"]), float(segment["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if math.isfinite(start) and math.isfinite(end) and 0 <= start <= end:
+            intervals.append((start, end))
+    long_gaps = []
+    previous_end = None
+    for start, end in sorted(intervals):
+        if previous_end is not None and start - previous_end >= 300:
+            long_gaps.append({"start_sec": previous_end, "end_sec": start,
+                              "duration_sec": round(start - previous_end, 3)})
+        previous_end = end if previous_end is None else max(previous_end, end)
+
     rep_mass = _compression_ratio(text)
     empty_ratio = (empty / total) if total else 0.0
     dot_noise_ratio = (dot_noise / total) if total else 0.0
@@ -332,6 +367,11 @@ def evaluate(
                 score -= 20.0
                 issues.append("오디오 길이 대비 세그먼트 수가 적음")
 
+    if not nonempty_segments or not nonspace_chars:
+        duration_critical = True
+        score = 0
+        issues.insert(0, "인식된 발화 없음")
+
     quality_score = max(0, min(100, int(round(score))))
     if rep_mass >= bad_threshold:
         issues.append("반복 비율이 매우 높음")
@@ -368,6 +408,17 @@ def evaluate(
         health = "good"
         summary = f"정상 (점수 {quality_score}/100). 반복/노이즈 징후가 크지 않습니다."
 
+    if long_gaps:
+        if health == "good":
+            health = "warn"
+            summary = f"품질 주의 (점수 {quality_score}/100)."
+        first_gap = long_gaps[0]
+        summary += (
+            f" 5분 이상 무전사 구간 {len(long_gaps)}곳"
+            f" (첫 구간 {first_gap['start_sec']:.0f}~{first_gap['end_sec']:.0f}초,"
+            f" {first_gap['duration_sec']:.0f}초), 원음 확인 필요."
+        )
+
     report = QualityReport(
         total_segments=total,
         empty_segments=empty,
@@ -385,6 +436,7 @@ def evaluate(
         chars_per_audio_min=chars_per_audio_min,
         coverage_ratio=coverage_ratio,
         quality_score=quality_score,
+        long_gaps=long_gaps,
         health=health,
         summary=summary,
     )

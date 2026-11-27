@@ -313,7 +313,8 @@ func executeNextRetryContext(
 		"lecture_stt.stt.main",
 		"--config",
 		options.Shadow.ConfigPath,
-		"--plan-next-retry-job",
+		"--prepare-controller-cycle", "--allow-write",
+		"--controller-kill-switch", options.Shadow.KillSwitchPath,
 	)
 	if err != nil || exitCode != 0 {
 		return OwnershipExecution{}, false, errors.New("next retry plan command failed")

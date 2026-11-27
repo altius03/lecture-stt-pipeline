@@ -49,6 +49,10 @@ class PostprocessExecutionError(PostprocessError):
     """The configured postprocess generator failed to return a valid payload."""
 
 
+class PostprocessInputTooLarge(PostprocessError):
+    """An operator can increase the configured input bound and retry this job."""
+
+
 class PostprocessValidationError(PostprocessError):
     """The generator returned output that violates the expected contract."""
 
@@ -466,8 +470,9 @@ def generate_correction(
     }
     source_chars = len(json.dumps(prompt_payload, ensure_ascii=False))
     if source_chars > settings.max_correction_chars:
-        raise PostprocessExecutionError(
-            f"Correction input exceeds max_correction_chars: {source_chars}"
+        raise PostprocessInputTooLarge(
+            f"교정 입력 {source_chars}자, max_correction_chars 한도 {settings.max_correction_chars}자. "
+            "한도를 조정한 뒤 후처리 워커를 재시작하고 requeue 하세요."
         )
 
     if settings.backend == GENERATOR_BACKEND_FAKE:
@@ -517,8 +522,9 @@ def generate_summary(
     if not normalized_text:
         raise PostprocessValidationError("Corrected transcript text is empty")
     if len(normalized_text) > settings.max_summary_chars:
-        raise PostprocessExecutionError(
-            f"Summary input exceeds max_summary_chars: {len(normalized_text)}"
+        raise PostprocessInputTooLarge(
+            f"요약 입력 {len(normalized_text)}자, max_summary_chars 한도 {settings.max_summary_chars}자. "
+            "한도를 조정한 뒤 후처리 워커를 재시작하고 requeue 하세요."
         )
     if settings.backend == GENERATOR_BACKEND_FAKE:
         payload = {

@@ -78,7 +78,7 @@ class WebPanelStateSnapshotTests(unittest.TestCase):
         self.assertEqual(snapshot["runtime_state"]["source"], "web")
         self.assertEqual(snapshot["notification"]["selection"], "telegram")
         self.assertFalse(snapshot["notification"]["restart_required"])
-        self.assertTrue(snapshot["notification"]["can_apply_now"])
+        self.assertFalse(snapshot["notification"]["can_apply_now"])
         self.assertEqual(snapshot["actions"]["pause_action"], "pause")
         self.assertEqual(snapshot["actions"]["endpoints"]["state"], "/api/state")
         self.assertEqual(snapshot["actions"]["endpoints"]["notification"], "/api/notification")
@@ -170,7 +170,7 @@ class WebPanelStateSnapshotTests(unittest.TestCase):
             self.assertEqual(saved["notification"]["dual_send_providers"], ["discord"])
             self.assertTrue(saved["notification"]["enabled"])
             self.assertTrue(saved["notification"]["send_review"])
-            self.assertIn("다음 시작부터 적용", state.notice)
+            self.assertIn("다음 작업부터 적용", state.notice)
 
     def test_save_config_keeps_original_when_replace_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1315,7 +1315,7 @@ class WebPanelControllerExecutionOwnerTests(unittest.TestCase):
             self.assertFalse(paused.exists())
             self.assertIn("재개", state.notice)
             self.assertEqual(run_mock.call_args_list[0].args[0][:2], ["launchctl", "print"])
-            self.assertEqual(run_mock.call_args_list[1].args[0][:3], ["launchctl", "kickstart", "-k"])
+            self.assertEqual(run_mock.call_args_list[1].args[0], ["launchctl", "kickstart", state._controller_service_target()])
 
     def test_controller_start_fails_closed_when_service_not_loaded(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1874,24 +1874,44 @@ class WebPanelControllerExecutionOwnerTests(unittest.TestCase):
             self.assertIn("lecture_stt.stt.main", " ".join(popen_mock.call_args.args[0]))
             self.assertIn("실행중", state.notice)
 
-    def test_restart_worker_for_notification_restarts_and_clears_flag(self) -> None:
-        state = object.__new__(web_panel_state.ControlState)
-        state._notification_restart_required = True
-        state.notice = "대기중"
-        state.start = mock.Mock(side_effect=lambda: setattr(state, "_notification_restart_required", False))
-        state.stop = mock.Mock()
-        state._is_managed_running = mock.Mock(return_value=True)
-        state._find_worker_pids = mock.Mock(return_value=[1234])
-        state._wait_for_worker_shutdown = mock.Mock(return_value=True)
-        state._set_poll_boost = mock.Mock()
+    def test_external_worker_identity_filters_other_config_and_reused_pid(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_config(root)
+            state = web_panel_state.ControlState(root)
+            def worker(pid, config):
+                proc = mock.Mock(pid=pid, info={"name": "Python"})
+                proc.uids.return_value.effective = os.geteuid()
+                proc.cwd.return_value = str(root)
+                proc.cmdline.return_value = ["python", "-m", state.worker_module, "--config", str(config)]
+                proc.is_running.return_value = True
+                return proc
+            own = worker(21, state.config_path)
+            foreign = worker(22, root / "foreign.yaml")
+            reused = worker(23, state.config_path)
+            reused.is_running.side_effect = [True, False]
+            other_checkout = worker(24, state.config_path)
+            other_checkout.cwd.return_value = str(root / "other")
+            ambiguous = worker(25, state.config_path)
+            ambiguous.cmdline.return_value[3] = "--conf"
+            with mock.patch.object(web_panel_state.psutil, "process_iter",
+                                   return_value=[own, foreign, reused, other_checkout, ambiguous]):
+                status, _ = state.stop()
+            self.assertEqual(status, 200)
+            own.terminate.assert_called_once()
+            foreign.terminate.assert_not_called()
+            reused.terminate.assert_not_called()
+            other_checkout.terminate.assert_not_called()
+            ambiguous.terminate.assert_not_called()
 
-        state.restart_worker_for_notification()
-
-        state.stop.assert_called_once_with()
-        state.start.assert_called_once_with()
-        state._wait_for_worker_shutdown.assert_called_once_with()
-        self.assertFalse(state._notification_restart_required)
-        self.assertIn("즉시 적용", state.notice)
+    def test_folder_counts_share_cached_walk_between_snapshots(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_config(root)
+            state = web_panel_state.ControlState(root)
+            with mock.patch.object(state, "_count_transcript_sets", return_value="2") as walk:
+                self.assertEqual(state._folder_counts(), state._folder_counts())
+            walk.assert_called_once()
 
     def test_log_stream_delta_marks_reset_after_truncate(self) -> None:
         state = object.__new__(web_panel_state.ControlState)
@@ -2000,18 +2020,23 @@ class WebPanelControllerExecutionOwnerTests(unittest.TestCase):
             state.db_path = db_path
             state.log_path = log_path
             state.notice = ""
+            state.repo_root = root
+            state.config_path = root / "config.yaml"
+            state.config_path.write_text(f"paths:\n  db_path: {db_path}\n")
             state.config_data = {"transcript_delivery": {"enabled": False}}
             state._set_poll_boost = mock.Mock()
 
-            state.clear_history()
+            self.assertEqual(state.history_plan()["count"], 1)
+            self.assertEqual(state.clear_history("0" * 64)[0], 409)
+            self.assertEqual(state.clear_history(state.history_plan()["digest"])[0], 200)
 
             with sqlite3.connect(db_path) as conn:
                 jobs = conn.execute("SELECT id, status FROM jobs ORDER BY id").fetchall()
                 queued = conn.execute("SELECT source_job_id FROM transcript_postprocess_jobs").fetchall()
-            self.assertEqual(jobs, [(1, "DONE"), (3, "NEEDS_REVIEW"), (4, "PROCESSING"), (5, "DONE"), (7, "DONE")])
+            self.assertEqual(jobs, [(1, "DONE"), (2, "ERROR"), (3, "NEEDS_REVIEW"), (4, "PROCESSING"), (5, "DONE"), (7, "DONE")])
             self.assertEqual(queued, [(1,)])
-            self.assertEqual(log_path.read_text(encoding="utf-8"), "")
-            self.assertIn("다른 원장이 참조하는 작업", state.notice)
+            self.assertEqual(log_path.read_text(encoding="utf-8"), "old log")
+            self.assertIn("미참조 완료 이력 1건", state.notice)
 
     def test_clear_history_preserves_unqueued_done_when_delivery_enabled(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2026,18 +2051,21 @@ class WebPanelControllerExecutionOwnerTests(unittest.TestCase):
             state = object.__new__(web_panel_state.ControlState)
             state.db_path = db_path
             state.log_path = Path(temp_dir) / "missing.log"
-            state.config_data = {"transcript_delivery": {"enabled": True}}
+            state.repo_root = Path(temp_dir)
+            state.config_path = state.repo_root / "config.yaml"
+            state.config_path.write_text(f"paths:\n  db_path: {db_path}\ntranscript_delivery:\n  enabled: true\n")
+            state.config_data = {"transcript_delivery": {"enabled": False}}
             state.notice = ""
             state._set_poll_boost = mock.Mock()
 
-            state.clear_history()
+            self.assertEqual(state.clear_history(state.history_plan()["digest"])[0], 200)
 
             with sqlite3.connect(db_path) as conn:
                 self.assertEqual(
                     conn.execute("SELECT id, status FROM jobs ORDER BY id").fetchall(),
-                    [(1, "DONE")],
+                    [(1, "DONE"), (2, "ERROR")],
                 )
-            self.assertIn("후처리 재조정 대상은 보존", state.notice)
+            self.assertIn("0건", state.notice)
 
     def test_clear_history_reports_db_failure_without_truncating_log(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2047,12 +2075,68 @@ class WebPanelControllerExecutionOwnerTests(unittest.TestCase):
             state = object.__new__(web_panel_state.ControlState)
             state.db_path = root / "jobs.sqlite3"
             state.log_path = log_path
+            state.repo_root = root
+            state.config_path = root / "config.yaml"
             state.config_data = {}
             state.notice = ""
 
-            self.assertFalse(state.clear_history())
-            self.assertIn("이력 초기화 실패", state.notice)
+            self.assertEqual(state.clear_history("0" * 64)[0], 500)
+            self.assertIn("이력 정리 실패", state.notice)
             self.assertEqual(log_path.read_text(encoding="utf-8"), "keep log")
+
+    def test_history_plan_and_apply_use_the_default_db_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "config/config.yaml"
+            config.parent.mkdir()
+            config.write_text("paths: {watch_folder: inbox}\n", encoding="utf-8")
+            (root / "state").mkdir()
+            state = web_panel_state.ControlState(root)
+            self.assertEqual(state.db_path, root / "state/jobs.sqlite3")
+            with sqlite3.connect(state.db_path) as conn:
+                conn.execute(
+                    "INSERT INTO jobs (status, created_at, updated_at, orig_inbox_path, orig_name,"
+                    " canonical_base, canonical_audio_path) VALUES "
+                    "('DONE','2026-01-01','2026-01-01','inbox/a.wav','a.wav','a','audio/a.wav')"
+                )
+            plan = state.history_plan()
+            self.assertEqual(plan["count"], 1)
+
+            for changed in ("paths: {db_path: state/other.sqlite3}", "paths: {db_path: null}", ""):
+                with self.subTest(changed=changed):
+                    config.write_text(changed, encoding="utf-8")
+                    self.assertEqual(state.clear_history(plan["digest"])[0], 500)
+            config.write_text("paths: {}\n", encoding="utf-8")
+            self.assertEqual(state.clear_history(plan["digest"])[0], 200)
+            self.assertEqual(state.history_plan()["count"], 0)
+
+    def test_history_apply_rereads_current_delivery_policy_and_refuses_unreadable_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_config(root)
+            state = web_panel_state.ControlState(root)
+            db_path = root / "history.sqlite3"
+            state.db_path = db_path
+            config = f"paths:\n  db_path: {db_path}\ntranscript_delivery:\n  enabled: "
+            state.config_path.write_text(config + "'off'\n")
+            with sqlite3.connect(db_path) as conn:
+                conn.execute("CREATE TABLE jobs (id INTEGER PRIMARY KEY,status TEXT)")
+                conn.execute("INSERT INTO jobs VALUES(7,'DONE')")
+            plan = state.history_plan()
+            self.assertEqual(plan["count"], 1)
+            for enabled in ("'true'", "1", "'ON'", "'y'"):
+                state.config_path.write_text(config + enabled)
+                self.assertEqual(state.history_plan()["count"], 0)
+                self.assertEqual(state.clear_history(plan["digest"])[0], 409)
+            for invalid in (config + "maybe", config + "[", "", "paths: []"):
+                state.config_path.write_text(invalid)
+                with self.assertRaises(ValueError):
+                    state.history_plan()
+                self.assertEqual(state.clear_history(plan["digest"])[0], 500)
+            state.config_path.unlink()
+            self.assertEqual(state.clear_history(plan["digest"])[0], 500)
+            with sqlite3.connect(db_path) as conn:
+                self.assertEqual(conn.execute("SELECT id FROM jobs").fetchone()[0], 7)
 
     def test_transcript_count_ignores_quality_scorecard_sidecars(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2073,6 +2157,12 @@ class WebPanelControllerExecutionOwnerTests(unittest.TestCase):
                 (course_dir / "same_stem.txt").write_text("transcript", encoding="utf-8")
                 (course_dir / "same_stem.json").write_text("{}", encoding="utf-8")
                 (course_dir / "same_stem.quality.json").write_text("{}", encoding="utf-8")
+
+            for name in (".recovered-job-3", ".quality-recovery-temp/pair"):
+                recovery = course_dir / name
+                recovery.mkdir(parents=True)
+                (recovery / "same_stem.txt").write_text("review copy")
+                (recovery / "same_stem.json").write_text("{}")
 
             self.assertEqual(
                 web_panel_state.ControlState._count_transcript_sets(transcript_dir),

@@ -375,11 +375,21 @@ export async function fetchLogs(endpoint: string, offset: number | null): Promis
   return decodeLogPayload(payload)
 }
 
-export async function postPanelAction(endpoint: string): Promise<PanelActionResponse> {
+export async function fetchHistoryPlan(endpoint: string): Promise<{ count: number; digest: string }> {
+  const response = await fetch(endpoint + "/plan", { cache: "no-store" })
+  const plan = await response.json()
+  if (!response.ok || !Number.isSafeInteger(plan?.count) || plan.count < 0 ||
+      typeof plan.digest !== "string" || !/^[0-9a-f]{64}$/.test(plan.digest)) {
+    throw new Error("정리할 이력 목록을 확인하지 못했습니다.")
+  }
+  return { count: plan.count, digest: plan.digest }
+}
+
+export async function postPanelAction(endpoint: string, body = ""): Promise<PanelActionResponse> {
   const response = await fetch(endpoint, {
     method: "POST",
     headers: FORM_HEADERS,
-    body: "",
+    body,
   })
   const payload = await readJson(response)
   const decoded = decodePanelActionResponse(payload)

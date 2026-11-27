@@ -5,10 +5,14 @@ import hashlib
 import json
 import os
 import shutil
+import sqlite3
 import stat
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
+from contextlib import closing, redirect_stdout
+from io import StringIO
 from pathlib import Path
 from unittest import mock
 
@@ -495,6 +499,24 @@ class TranscriptPostprocessTests(unittest.TestCase):
             shared_db.get_transcript_postprocess_job(self.conn, valid_id)
         )
 
+    def test_reconciliation_advances_past_invalid_rows_between_valid_pages(self) -> None:
+        valid_ids = []
+        for index in range(4):
+            if index % 2 == 0:
+                self._insert_invalid_done_job(canonical_base="broken", source_suffix=f"broken{index}")
+            else:
+                job_id, _, _ = self._insert_done_job(
+                    canonical_base=f"260101CA_2_{index}",
+                    recorded_at="2026-01-01T10:30:00+09:00",
+                    source_suffix=f"good{index}",
+                )
+                valid_ids.append(job_id)
+        for expected in valid_ids:
+            result = td.reconcile_completed_jobs(self.conn, settings=self.settings, limit=1)
+            successes = [r["source_job_id"] for r in result["results"] if r["status"] != "error"]
+            self.assertEqual(successes, [expected])
+        self.assertEqual(td.reconcile_completed_jobs(self.conn, settings=self.settings)["errors"], 2)
+
     def _load_legacy_compat_settings(
         self,
         legacy_activation_cutoff: str,
@@ -929,6 +951,244 @@ class TranscriptPostprocessTests(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 td._write_bytes_no_overwrite(b"replacement", destination)
         self.assertEqual(destination.read_bytes(), b"original")
+
+    def test_no_link_fallback_publishes_only_complete_file(self) -> None:
+        destination = self.root / "published.txt"
+        move = td.utils.safe_move_file
+
+        def inspect_complete_temp(src: Path, dst: Path) -> None:
+            self.assertFalse(dst.exists())
+            self.assertEqual(src.read_bytes(), b"complete")
+            move(src, dst)
+
+        with (
+            mock.patch.object(td.os, "link", side_effect=OSError(errno.ENOTSUP, "unsupported")),
+            mock.patch.object(td.utils, "safe_move_file", side_effect=inspect_complete_temp),
+        ):
+            td._write_bytes_no_overwrite(b"complete", destination)
+        self.assertEqual(destination.read_bytes(), b"complete")
+        self.assertEqual(list(destination.parent.glob(".published.txt.*.tmp")), [])
+
+    def test_unavailable_atomic_publication_leaves_no_final_file(self) -> None:
+        destination = self.root / "unsupported.txt"
+        with (
+            mock.patch.object(td.os, "link", side_effect=OSError(errno.ENOTSUP, "unsupported")),
+            mock.patch.object(td.utils, "safe_move_file", side_effect=OSError(errno.ENOTSUP, "unsupported")),
+            self.assertRaises(OSError),
+        ):
+            td._write_bytes_no_overwrite(b"complete", destination)
+        self.assertFalse(destination.exists())
+
+    def test_missing_source_is_retried_and_restored_source_delivers_once(self) -> None:
+        job_id, row = self._queue_job()
+        path = Path(row["source_txt_path"])
+        away = path.rename(path.with_suffix(".unavailable"))
+        self.assertEqual(self.distributor.process_pending()["results"][0]["status"], "PENDING")
+        current = shared_db.get_transcript_postprocess_job(self.conn, job_id)
+        self.assertEqual(current["correction_attempt_count"], 1)
+        self.assertEqual(current["last_error_code"], "FILESYSTEM_ERROR")
+        away.rename(path)
+        self.assertEqual(self.distributor.process_pending()["delivered"], 1)
+        self.assertEqual(self.distributor.process_pending()["processed"], 0)
+
+    def test_unsafe_source_remains_terminal(self) -> None:
+        job_id, row = self._queue_job()
+        path = Path(row["source_txt_path"])
+        path.symlink_to(path.rename(path.with_suffix(".moved")))
+        self.assertEqual(self.distributor.process_pending()["error"], 1)
+        current = shared_db.get_transcript_postprocess_job(self.conn, job_id)
+        self.assertEqual(current["last_error_code"], "TRANSCRIPTDELIVERYUNSAFEPATHERROR")
+
+    def _confirmed_requeue(self, row, **overrides):
+        arguments = {
+            "source_job_id": row["source_job_id"],
+            "course_code": "CS201",
+            "source_txt_sha256": row["source_txt_sha256"],
+            "source_json_sha256": row["source_json_sha256"],
+            "settings": self.settings,
+        }
+        return td.requeue_confirmed_job(self.conn, **(arguments | overrides))
+
+    def test_requeue_named_course_verifies_digests_and_is_idempotent(self) -> None:
+        from lecture_stt.downstream import transcript_status, worker
+
+        job_id, row = self._queue_job(canonical_base="장소 녹음", profile_key="general")
+        self.assertEqual(row["status"], "SKIPPED")
+        with self.assertRaises(td.TranscriptDeliveryConflictError):
+            self._confirmed_requeue(row, source_json_sha256="0" * 64)
+        with self.assertRaises(td.TranscriptDeliveryConflictError):
+            self._confirmed_requeue(row, course_code="MISSING")
+        self.assertEqual(shared_db.get_transcript_postprocess_job(self.conn, job_id)["status"], "SKIPPED")
+        config = mock.Mock(spec=worker.TranscriptWorkerConfig, enabled=True, db_path=self.db_path,
+                           active_semester_path=self.active_path, postprocess_settings=self.settings)
+        with (
+            mock.patch.object(transcript_status, "load_transcript_worker_config", return_value=config),
+            redirect_stdout(StringIO()),
+        ):
+            self.assertEqual(transcript_status.main([
+                "requeue", str(job_id), "--course-code", "CS201",
+                "--source-txt-sha256", row["source_txt_sha256"],
+                "--source-json-sha256", row["source_json_sha256"],
+            ]), 0)
+        self.assertEqual(self._confirmed_requeue(row), "PENDING")
+        self.assertEqual(self.distributor.process_pending()["delivered"], 1)
+        self.assertEqual(self._confirmed_requeue(row), "DELIVERED")
+        self.assertEqual(self.distributor.process_pending()["processed"], 0)
+        self.assertEqual(shared_db.get_transcript_postprocess_job(self.conn, job_id)["route_method"], "operator_confirmed")
+
+    def test_duplicate_confirmation_during_summary_retains_staged_correction(self) -> None:
+        job_id, row = self._queue_job(canonical_base="장소 녹음", profile_key="general")
+        self.assertEqual(self._confirmed_requeue(row), "PENDING")
+        generate_summary = td.generate_summary
+
+        def replay_before_summary(*args, **kwargs):
+            with closing(sqlite3.connect(self.db_path)) as other:
+                other.row_factory = sqlite3.Row
+                before = dict(shared_db.get_transcript_postprocess_job(other, job_id))
+                self.assertEqual(before["correction_status"], "READY")
+                self.assertEqual(td.requeue_confirmed_job(
+                    other,
+                    source_job_id=job_id,
+                    course_code="CS201",
+                    source_txt_sha256=row["source_txt_sha256"],
+                    source_json_sha256=row["source_json_sha256"],
+                    settings=self.settings,
+                ), "PENDING")
+                self.assertEqual(td.enqueue_completed_job(
+                    other, source_job_id=job_id, settings=self.settings
+                ), "PENDING")
+                self.assertEqual(dict(shared_db.get_transcript_postprocess_job(other, job_id)), before)
+            return generate_summary(*args, **kwargs)
+
+        with mock.patch.object(td, "generate_summary", side_effect=replay_before_summary):
+            self.assertEqual(self.distributor.process_pending()["delivered"], 1)
+        self.assertEqual(self.distributor.process_pending()["processed"], 0)
+        done = shared_db.get_transcript_postprocess_job(self.conn, job_id)
+        self.assertEqual([done[key] for key in ("correction_attempt_count", "summary_attempt_count",
+                                                "delivery_attempt_count")], [1, 1, 1])
+
+    def test_requeue_keeps_sqlite_writable_during_source_and_semester_io(self) -> None:
+        _, row = self._queue_job(canonical_base="미분류", profile_key="general")
+        self.conn.execute("CREATE TABLE progress(event TEXT)")
+        self.conn.commit()
+        with closing(sqlite3.connect(self.db_path, timeout=0)) as other:
+            def observing(operation, name):
+                def perform(*args, **kwargs):
+                    with other:
+                        other.execute("INSERT INTO progress VALUES (?)", (name,))
+                    return operation(*args, **kwargs)
+                return perform
+            with (
+                mock.patch.object(td, "_read_regular_file_bytes", observing(td._read_regular_file_bytes, "source")),
+                mock.patch.object(td, "load_active_semester", observing(td.load_active_semester, "semester")),
+                mock.patch.object(td, "_active_snapshot_sha256", observing(td._active_snapshot_sha256, "hash")),
+                mock.patch.object(td, "_build_queue_fields", observing(td._build_queue_fields, "destinations")),
+            ):
+                self.assertEqual(self._confirmed_requeue(row), "PENDING")
+        events = [record[0] for record in self.conn.execute("SELECT event FROM progress")]
+        self.assertCountEqual(events, ["source", "source", "semester", "hash", "destinations"])
+
+    def test_requeue_does_not_overwrite_changes_during_confirmation(self) -> None:
+        for change in ("source_row", "queue_pin", "source_file", "active_semester"):
+            with self.subTest(change=change):
+                job_id, row = self._queue_job(canonical_base=change, profile_key="general", source_suffix=change)
+                build = td._build_queue_fields
+                def concurrent_change(*args, **kwargs):
+                    fields = build(*args, **kwargs)
+                    if change == "active_semester":
+                        copy = self.active_path.with_suffix(".new")
+                        copy.write_bytes(self.active_path.read_bytes())
+                        copy.replace(self.active_path)
+                    elif change == "source_file":
+                        Path(row["source_txt_path"]).write_text("새 내용", encoding="utf-8")
+                    else:
+                        with closing(sqlite3.connect(self.db_path, timeout=0)) as other, other:
+                            if change == "source_row":
+                                other.execute("UPDATE jobs SET orig_name='updated.wav' WHERE id=?", (job_id,))
+                            else:
+                                other.execute("UPDATE transcript_postprocess_jobs SET destination_txt_path='reserved' "
+                                              "WHERE source_job_id=?", (job_id,))
+                    return fields
+                with mock.patch.object(td, "_build_queue_fields", side_effect=concurrent_change):
+                    with self.assertRaises(td.TranscriptDeliveryConflictError):
+                        self._confirmed_requeue(row)
+                saved = shared_db.get_transcript_postprocess_job(self.conn, job_id)
+                self.assertEqual(saved["status"], "SKIPPED")
+                if change == "queue_pin":
+                    self.assertEqual(saved["destination_txt_path"], "reserved")
+
+    def test_requeue_returns_already_delivered_when_concurrent_confirmation_wins(self) -> None:
+        job_id, row = self._queue_job(canonical_base="미분류", profile_key="general")
+        build = td._build_queue_fields
+        with closing(sqlite3.connect(self.db_path, timeout=0)) as other:
+            other.row_factory = sqlite3.Row
+            def complete_on_other_connection(*args, **kwargs):
+                fields = build(*args, **kwargs)
+                with mock.patch.object(td, "_build_queue_fields", build):
+                    self.assertEqual(td.requeue_confirmed_job(
+                        other, source_job_id=job_id, course_code="CS201",
+                        source_txt_sha256=row["source_txt_sha256"],
+                        source_json_sha256=row["source_json_sha256"], settings=self.settings,
+                    ), "PENDING")
+                    self.assertEqual(td.TranscriptDeliveryDistributor(other, self.settings).process_pending()["delivered"], 1)
+                return fields
+            with mock.patch.object(td, "_build_queue_fields", side_effect=complete_on_other_connection):
+                self.assertEqual(self._confirmed_requeue(row), "DELIVERED")
+        done = shared_db.get_transcript_postprocess_job(self.conn, job_id)
+        for stage in ("correction", "summary", "delivery"):
+            self.assertEqual(done[f"{stage}_attempt_count"], 1)
+
+    def test_skipped_legacy_row_with_stage_intent_is_never_redirected(self) -> None:
+        job_id, row = self._queue_job(canonical_base="장소 녹음", profile_key="general")
+        shared_db.update_transcript_postprocess_job(self.conn, job_id, correction_stage_json_sha256="f" * 64)
+        before = dict(shared_db.get_transcript_postprocess_job(self.conn, job_id))
+        with self.assertRaises(td.TranscriptDeliveryConflictError):
+            self._confirmed_requeue(row)
+        self.assertEqual(dict(shared_db.get_transcript_postprocess_job(self.conn, job_id)), before)
+
+    def test_requeue_refuses_changed_source_and_changed_semester(self) -> None:
+        _, row = self._queue_job(canonical_base="장소 녹음", profile_key="general")
+        txt_path = Path(row["source_txt_path"])
+        original = txt_path.read_bytes()
+        txt_path.write_bytes(b"changed")
+        with self.assertRaises(td.TranscriptDeliveryConflictError):
+            self._confirmed_requeue(row)
+        txt_path.write_bytes(original)
+        self.active_path.write_bytes(self.active_path.read_bytes() + b"\n")
+        with self.assertRaises(td.TranscriptDeliveryConflictError):
+            self._confirmed_requeue(row)
+
+    def test_input_size_review_can_resume_after_limit_increase(self) -> None:
+        for stage in ("correction", "summary"):
+            with self.subTest(stage=stage):
+                job_id, row = self._queue_job(canonical_base=f"260101CA_2_{1 if stage == 'correction' else 2}",
+                                              source_suffix=stage)
+                limited = replace(self.settings, generator=replace(
+                    self.settings.generator, **{f"max_{stage}_chars": 1}
+                ))
+                distributor = td.TranscriptDeliveryDistributor(self.conn, limited)
+                result = distributor.process_pending()
+                self.assertEqual(result["needs_review"], 1)
+                current = shared_db.get_transcript_postprocess_job(self.conn, job_id)
+                self.assertEqual(current["last_error_code"], "INPUT_TOO_LARGE")
+                self.assertEqual(current["last_error_stage"], stage)
+                self.assertIn(f"max_{stage}_chars", current["last_error"])
+                self.assertEqual(current[f"{stage}_attempt_count"], 0)
+                self.assertEqual(distributor.process_pending()["processed"], 0)
+                self.assertEqual(self._confirmed_requeue(row), "PENDING")
+                self.assertEqual(self.distributor.process_pending()["delivered"], 1)
+                current = shared_db.get_transcript_postprocess_job(self.conn, job_id)
+                self.assertEqual(current["correction_attempt_count"], 1)
+
+    def test_reconciliation_decodes_only_unqueued_rows(self) -> None:
+        self._queue_job(source_suffix="queued")
+        new_id, _, _ = self._insert_done_job(canonical_base="260101CA_2", source_suffix="new",
+                                              recorded_at="2026-01-01T11:00:00+09:00")
+        with mock.patch.object(td, "_safe_engine_params", wraps=td._safe_engine_params) as decode:
+            result = td.reconcile_completed_jobs(self.conn, settings=self.settings, limit=1, dry_run=True)
+        self.assertEqual([row["source_job_id"] for row in result["results"]], [new_id])
+        # One parse for cutoff and one for routing the same unqueued source.
+        self.assertEqual(decode.call_count, 2)
 
     def test_no_overwrite_output_is_private_under_common_umask(self) -> None:
         destination = self.root / "private-output.txt"

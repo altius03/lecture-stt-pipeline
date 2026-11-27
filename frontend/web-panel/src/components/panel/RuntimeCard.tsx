@@ -4,6 +4,7 @@ import { SectionCard } from "../ui/SectionCard"
 import type { PanelAction, PanelSummary, RuntimeState } from "../../types"
 
 interface RuntimeCardProps {
+  canControl?: boolean
   runtimeState: RuntimeState
   summary: PanelSummary
   pauseAction: "pause" | "resume"
@@ -13,6 +14,7 @@ interface RuntimeCardProps {
 }
 
 export function RuntimeCard({
+  canControl,
   runtimeState,
   summary,
   pauseAction,
@@ -32,6 +34,7 @@ export function RuntimeCard({
       />
       <p className="notice-copy">{summary.notice}</p>
       <ActionBar
+        canControl={canControl}
         actions={[
           { action: "start", label: "시작", tone: "secondary" },
           { action: pauseAction, label: pauseLabel, tone: "secondary" },

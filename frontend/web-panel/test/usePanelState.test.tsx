@@ -10,6 +10,7 @@ import {
   PANEL_EVENTS_ENDPOINT,
   PANEL_STATE_EVENTS_ENDPOINT,
   fetchPanelState,
+  fetchHistoryPlan,
   postNotificationSelection,
   postPanelAction,
 } from "../src/lib/panelApi"
@@ -29,6 +30,7 @@ vi.mock("../src/lib/panelApi", () => ({
     clear_history: "/api/clear_history",
   },
   fetchPanelState: vi.fn(),
+  fetchHistoryPlan: vi.fn(),
   postNotificationSelection: vi.fn(),
   postPanelAction: vi.fn(),
   PANEL_EVENTS_ENDPOINT: "/api/events",
@@ -292,12 +294,13 @@ describe("usePanelState", () => {
     await waitFor(() => {
       expect(fetchPanelStateMock).toHaveBeenCalledTimes(2)
       expect(fetchPanelStateMock).toHaveBeenLastCalledWith("/api/runtime/state")
-      expect(result.current.logResetKey).toBe(0)
       expect(result.current.pendingAction).toBeNull()
     })
   })
 
-  it("bumps logResetKey only for clear_history", async () => {
+  it("sends only the confirmed clear_history plan", async () => {
+    vi.mocked(fetchHistoryPlan).mockResolvedValue({ count: 3, digest: "a".repeat(64) })
+    const confirm = vi.spyOn(window, "confirm").mockReturnValueOnce(false).mockReturnValueOnce(true)
     fetchPanelStateMock.mockResolvedValue(createPanelState())
     postPanelActionMock.mockResolvedValue({ ok: true, notice: "cleared" })
 
@@ -314,9 +317,13 @@ describe("usePanelState", () => {
     })
 
     await waitFor(() => {
-      expect(postPanelActionMock).toHaveBeenCalledWith("/api/runtime/clear_history")
-      expect(result.current.logResetKey).toBe(1)
+      expect(confirm).toHaveBeenCalledWith(expect.stringContaining("3건"))
+      expect(postPanelActionMock).not.toHaveBeenCalled()
     })
+
+    await act(async () => { await result.current.runAction("clear_history") })
+    expect(postPanelActionMock).toHaveBeenCalledWith("/api/runtime/clear_history", "digest=" + "a".repeat(64))
+    confirm.mockRestore()
   })
 
   it("updates panel state from SSE events without a full refetch", async () => {
@@ -382,27 +389,12 @@ describe("usePanelState", () => {
     })
   })
 
-  it("passes applyNow when saving and restarting notification settings", async () => {
+  it("shows notification save errors", async () => {
     fetchPanelStateMock.mockResolvedValue(createPanelState())
-    postNotificationSelectionMock.mockResolvedValue({ ok: true, notice: "restarted" })
-
-    const { result } = renderHook(() => usePanelState(), {
-      wrapper: createWrapper(),
-    })
-
-    await waitFor(() => {
-      expect(result.current.state?.actions.endpoints.notification).toBe("/api/runtime/notification")
-    })
-
-    await act(async () => {
-      await result.current.saveNotificationSelection("discord", true)
-    })
-
-    await waitFor(() => {
-      expect(postNotificationSelectionMock).toHaveBeenCalledWith("/api/runtime/notification", "discord", {
-        applyNow: true,
-      })
-      expect(result.current.pendingNotificationApplyNow).toBe(false)
-    })
+    postNotificationSelectionMock.mockRejectedValue(new Error("저장 실패"))
+    const { result } = renderHook(() => usePanelState(), { wrapper: createWrapper() })
+    await waitFor(() => expect(result.current.state).not.toBeNull())
+    await act(async () => { await result.current.saveNotificationSelection("discord").catch(() => {}) })
+    await waitFor(() => expect(result.current.error).toBe("저장 실패"))
   })
 })

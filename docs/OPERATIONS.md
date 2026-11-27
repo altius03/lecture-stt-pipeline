@@ -218,6 +218,23 @@ bash scripts/distribute_status.sh list --only-problems
 
 과거 `transcript_deliveries` 직접 전달 원장과 `deliveries` correction/summary 247개 row는 감사·Storage v2 archive evidence로 보존한다. 현재 worker는 새 `transcript_postprocess_jobs`만 처리하며, 새 row는 course-scoped staging 경로를 pin하고 기존 row의 평면 경로는 그대로 존중한다.
 
+### 잘못 분류됐거나 입력 한도를 넘긴 강의 복구
+
+`bash scripts/distribute_status.sh show ID`에서 단계·오류와 큐가 기록한 원전사 지문을 확인한다. 원전사 TXT·JSON의 SHA-256과 운영자가 확인한 과목 코드로 한 건을 다시 등록한다.
+
+```bash
+bash scripts/distribute_status.sh requeue ID --course-code CODE \
+  --source-txt-sha256 TXT_SHA256 --source-json-sha256 JSON_SHA256
+```
+
+`INPUT_TOO_LARGE`면 `last_error`의 입력 길이와 한도를 확인한다. 해당 단계의 `max_correction_chars` 또는 `max_summary_chars`를 모델이 처리할 수 있는 범위로 조정하고 후처리 워커가 새 설정을 읽은 뒤 재등록한다. TXT·JSON 지문과 학기·과목 경로를 읽는 동안 다른 작업은 DB에 계속 기록할 수 있다. 재등록 직전에 원전사 행과 큐 상태를 다시 대조하며 이미 완료한 교정 결과는 보존한다. 일시적인 파일 접근 실패는 재시도하며, 시도 한도를 모두 썼다면 원본을 복원한 뒤 재등록한다.
+
+### 웹 패널을 공유할 때
+
+개인용 loopback 접속에서는 기존 제어를 사용할 수 있다. `WEB_PANEL_ALLOWED_HOSTS`에 공유 도메인을 넣거나, 운영자 토큰을 설정하거나, 외부 인터페이스에 바인딩하면 공유 모드가 된다. 공유 모드에서 익명 사용자는 조회만 할 수 있다. 전사 본문 미리보기는 별도 설정이며, 켜면 조회 권한을 가진 사용자에게 본문이 보인다.
+
+공유할 때는 프록시가 Host를 다시 쓰더라도 서버가 공유 모드를 식별하도록 허용 호스트 또는 운영자 토큰을 명시한다. 공유 환경에서 운영자 제어가 필요하면 패널은 loopback에 바인딩하고 인증 프록시에서 TLS와 운영자 접근 권한을 적용한다. 프록시는 외부 요청의 `Authorization`과 `X-Lecture-STT-Operator`를 제거하고, 검증한 운영자의 조회·SSE·변경 요청에만 서버가 설정한 `WEB_PANEL_CONTROL_TOKEN`과 일치하는 Bearer 헤더를 주입한다. 운영자 식별자 헤더는 선택 사항이다. 토큰은 서버와 프록시에만 설정한다. 공유 모드의 로컬 브라우저도 같은 운영자 경로를 사용한다. 토큰 설정 변경은 패널 재시작 뒤 반영된다. 서버의 변경 요청 로그에는 주체·경로·결과가 기록된다.
+
 ## 5. Log policy
 
 확정 정책:
@@ -261,7 +278,7 @@ Launchd stdout/stderr rotation dry-run:
 - legacy `/Users/geonha/lecture_stt`는 2026-05-20 cleanup에서 삭제하지 않고 `~/Library/Application Support/lecture_stt/cleanup_archives/cleanup-20260520T014307Z/legacy_root`로 이동 보존했다.
 - repo 안 empty runtime folders는 placeholder로 유지한다.
 - repo-local stale tmp/log/state-log payloads는 2026-05-20 cleanup에서 `~/Library/Application Support/lecture_stt/cleanup_archives/cleanup-20260520T014307Z`로 이동 보존했다. iCloud audio/transcript cleanup 후보도 영구삭제하지 않고 `lecture_recordings/90_cleanup_archive/cleanup-20260520T014307Z`로 이동 보존했다.
-- Transcript cleanup retention은 `{stem}.txt`, `{stem}.json`, `{stem}.quality.json`을 한 transcript set으로 묶어 판단한다. `retain_min_transcripts`는 파일 개수가 아니라 primary transcript set 개수 기준이며, apply 시 sidecar만 남거나 primary transcript만 삭제되는 상태가 되지 않도록 함께 보존/정리한다. Orphan-only `{stem}.quality.json`은 최소 보존 슬롯을 소비하지 않는다.
+- `cleanup.py --apply`는 STT 잠금과 DB를 확인한 뒤 기간이 지난 작업용 WAV만 정리한다. 완료 작업의 원음 해시가 일치해야 하며 대기·검토·미전달 작업과 원음·전사·품질 기록은 보존한다. 워커가 만든 임시 디렉터리에서 WAV와 소유 확인용 하드링크가 일치할 때만 삭제한다. 예전 방식의 WAV, 교체된 파일, 파일시스템이 하드링크·잠금을 지원하지 않거나 중단으로 증거가 일부만 남은 사본은 디스크에 남는다. 기존 `retain_min_transcripts` 설정은 더 이상 필요하지 않다.
 
 관련 이력/rollback 문서:
 

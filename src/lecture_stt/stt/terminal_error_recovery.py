@@ -315,25 +315,18 @@ def _load_direct_file_evidence(root: Path, relative_path: str, *, label: str) ->
         os.close(root_fd)
 
 
-def _open_db_guard(path: Path) -> tuple[int, dict[str, int]]:
+def _existing_db_identity(path: Path) -> dict[str, int]:
+    # Opening then closing a raw descriptor would release the process's POSIX
+    # locks, including locks held by another live SQLite connection.
     try:
-        flags = (
-            os.O_RDONLY
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0)
-            | getattr(os, "O_NONBLOCK", 0)
-        )
-        fd = os.open(path, flags)
-        db_stat = os.fstat(fd)
-        if not stat.S_ISREG(db_stat.st_mode):
-            os.close(fd)
-            raise TerminalErrorRecoveryConflictError("jobs db must be a regular file")
-        if db_stat.st_nlink != 1:
-            os.close(fd)
-            raise TerminalErrorRecoveryConflictError("jobs db must have exactly one hard link")
-        return fd, _db_identity_from_stat_result(db_stat)
+        info = path.lstat()
     except OSError as exc:
         raise TerminalErrorRecoveryConflictError(f"jobs db is not safely openable: {path}") from exc
+    if not stat.S_ISREG(info.st_mode):
+        raise TerminalErrorRecoveryConflictError("jobs db must be a regular file")
+    if info.st_nlink != 1:
+        raise TerminalErrorRecoveryConflictError("jobs db must have exactly one hard link")
+    return _db_identity_from_stat_result(info)
 
 
 def _assert_db_path_identity(path: Path, expected_identity: Mapping[str, Any], *, label: str) -> None:
@@ -526,10 +519,9 @@ def build_terminal_error_recovery_plan(
     transcript_root = Path(
         _require_string(paths.get("transcript_folder"), "config.paths.transcript_folder")
     )
-    db_guard_fd, db_identity = _open_db_guard(db_path)
-    conn: sqlite3.Connection | None = None
+    db_identity = _existing_db_identity(db_path)
+    conn = _readonly_db_connection(db_path)
     try:
-        conn = _readonly_db_connection(db_path)
         _assert_database_list_main_matches(conn, db_path, db_identity)
         row = _select_job_row(conn, job_id)
         error_job = _error_job_payload(
@@ -538,9 +530,7 @@ def build_terminal_error_recovery_plan(
             transcript_root=transcript_root,
         )
     finally:
-        if conn is not None:
-            conn.close()
-        os.close(db_guard_fd)
+        conn.close()
     _assert_db_path_identity(db_path, db_identity, label="jobs db path")
 
     source = _load_direct_file_evidence(
