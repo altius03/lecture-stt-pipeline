@@ -65,6 +65,40 @@ class WebPanelRequestHandlerTests(unittest.TestCase):
             {"127.0.0.1:8765", "localhost:8765", "panel.example.ts.net"},
         )
 
+    def test_supervisor_starts_only_after_successful_bind_and_stops_with_server(self):
+        state = mock.Mock()
+        state.console_supervision_enabled.return_value = True
+        server = mock.Mock(server_port=8765, server_address=("127.0.0.1", 8765))
+        entered = web_panel.threading.Event()
+        def supervise(stop):
+            entered.set()
+            stop.wait(2)
+        state.supervise_console_controller.side_effect = supervise
+        def serve():
+            self.assertTrue(entered.wait(2))
+        server.serve_forever.side_effect = serve
+        with mock.patch.object(web_panel, "ControlState", return_value=state), \
+             mock.patch.object(web_panel, "runtime_env", return_value={}), \
+             mock.patch.object(web_panel, "ThreadingHTTPServer", side_effect=[OSError("address busy"), server]):
+            with self.assertRaisesRegex(RuntimeError, "bind"):
+                web_panel.main()
+            state.supervise_console_controller.assert_not_called()
+            web_panel.main()
+        state.supervise_console_controller.assert_called_once_with(server.stopping)
+        self.assertTrue(server.stopping.is_set())
+        server.server_close.assert_called_once()
+
+    def test_sse_exits_when_panel_is_stopping(self):
+        handler = object.__new__(web_panel.RequestHandler)
+        handler.server = mock.Mock(stopping=web_panel.threading.Event())
+        handler.server.stopping.set()
+        handler.send_response = handler.send_header = handler.end_headers = mock.Mock()
+        handler._client_snapshot = mock.Mock()
+        web_panel.STATE = mock.Mock()
+        handler._serve_event_stream()
+        handler._client_snapshot.assert_not_called()
+        self.assertTrue(handler.close_connection)
+
     def test_exit_only_requests_server_shutdown(self) -> None:
         handler = object.__new__(web_panel.RequestHandler)
         handler._write_json = mock.Mock()

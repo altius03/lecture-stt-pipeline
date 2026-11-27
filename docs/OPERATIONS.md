@@ -240,6 +240,12 @@ bash scripts/distribute_status.sh requeue ID --course-code CODE \
 
 공유할 때는 프록시가 Host를 다시 쓰더라도 서버가 공유 모드를 식별하도록 허용 호스트 또는 운영자 토큰을 명시한다. 공유 환경에서 운영자 제어가 필요하면 패널은 loopback에 바인딩하고 인증 프록시에서 TLS와 운영자 접근 권한을 적용한다. 프록시는 외부 요청의 `Authorization`과 `X-Lecture-STT-Operator`를 제거하고, 검증한 운영자의 조회·SSE·변경 요청에만 서버가 설정한 `WEB_PANEL_CONTROL_TOKEN`과 일치하는 Bearer 헤더를 주입한다. 운영자 식별자 헤더는 선택 사항이다. 토큰은 서버와 프록시에만 설정한다. 공유 모드의 로컬 브라우저도 같은 운영자 경로를 사용한다. 토큰 설정 변경은 패널 재시작 뒤 반영된다. 서버의 변경 요청 로그에는 주체·경로·결과가 기록된다.
 
+### Mac mini에서 콘솔 컨트롤러를 자동 운영할 때
+
+독립 컨트롤러 LaunchAgent에서 녹음 폴더 관측이 실패하고 권한이 있는 패널에서 시작한 컨트롤러가 정상 주기를 완료하는 경우, 패널의 console 모드를 사용할 수 있다. 컨트롤러 전용 LaunchAgent와 기존 Python 상시 감시기를 먼저 내리고 로그인 자동 실행도 중지한다. 웹 패널과 후처리 워커의 LaunchAgent는 유지한다.
+
+`app.execution_owner: controller`, `app.controller_runtime: console`, `app.console_controller_autostart: true`를 함께 설정하면 로그인 후 웹 패널이 기동하면서 컨트롤러를 확인한다. 실행 중인 컨트롤러의 PID·생성 시각·실행 파일을 확인해 재사용한다. 중지 마커 또는 일시정지 상태에서는 자동 재개하지 않는다. 운영 상태 확인 시 패널 응답에 더해 새 컨트롤러가 기록한 정상 감시 주기와 DB 상태를 대조한다.
+
 ### SSH 운영자 접속
 
 공유 프록시가 운영자 인증 헤더를 주입할 수 없는 환경에서는 SSH 계정 소유자가 별도 Unix 소켓으로 접속할 수 있다. 운영 서버에 `WEB_PANEL_CONTROL_TOKEN`을 설정하고 같은 값을 소유자 전용(0600) 토큰 파일에 둔다. 소켓 부모 디렉터리는 운영자 소유 0700이어야 한다. `controller/cmd/lecture-stt-operator-proxy`를 대상 OS용으로 빌드해 운영자 전용 디렉터리의 `panel-proxy`로 설치한다.

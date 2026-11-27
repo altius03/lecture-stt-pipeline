@@ -432,6 +432,7 @@ flowchart LR
 - 복구 시 transcript metadata에 품질 보고서가 있는데 scorecard sidecar만 없는 저장 직후 crash window라면 metadata-only scorecard를 결정적으로 재생성한 뒤 검증한다. Sidecar가 malformed이거나 재생성할 수 없으면 산출물을 삭제하지 않고 `NEEDS_REVIEW`로 격리한다.
 
 ## 제어 계층
+- macOS console 모드에서 명시적으로 자동 기동을 켜면 웹 패널이 기존 프로세스의 신원을 확인하고, 운영자가 중지하거나 일시정지한 상태를 유지한다. 별도 controller LaunchAgent와 Python 상시 워커가 동시에 접수를 소유하지 않도록 확인한다.
 - 현재 주 제어 UI는 `src/lecture_stt/ui/web_panel.py`다.
 - 웹 제어 백엔드 상태/워커 제어 로직은 `src/lecture_stt/ui/web_panel_state.py`로 분리되어 있다.
 - 내장 HTTP 서버가 워커 시작, 일시정지, 재개, 중지, 로그 tail, DB 상태 조회를 제공한다.

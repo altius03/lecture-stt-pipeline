@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import json
 import os
 import sqlite3
@@ -1514,6 +1515,138 @@ class WebPanelControllerExecutionOwnerTests(unittest.TestCase):
             )
             + "\n"
         )
+
+    def _supervision_fixture(self, root):
+        _, state_dir, marker, _, _ = self._console_fixture(root)
+        cfg = root / "config/config.yaml"
+        cfg.write_text(cfg.read_text().replace("app:\n", "app:\n  console_controller_autostart: true\n", 1))
+        state = web_panel_state.ControlState(root)
+        state._run_control_cmd = mock.Mock(return_value=self._completed_process(
+            ["launchctl", "print"], returncode=113, stderr=f'Could not find service "{state._controller_label()}"'
+        ))
+        state._find_worker_pids = mock.Mock(return_value=[])
+        return state, state_dir, marker
+
+    def test_console_supervision_requires_explicit_darwin_console_boolean(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state, _, _ = self._supervision_fixture(Path(tmp))
+            self.assertTrue(state.console_supervision_enabled())
+            app = state.config_data["app"]
+            for value in (None, False, 1, "true", "on"):
+                with self.subTest(value=value), mock.patch.dict(app, console_controller_autostart=value):
+                    self.assertFalse(state.console_supervision_enabled())
+            for change in ({"controller_runtime": "launchd"}, {"execution_owner": "python"}):
+                with mock.patch.dict(app, change):
+                    self.assertFalse(state.console_supervision_enabled())
+            with mock.patch.object(state, "_console_runtime_supported", return_value=False):
+                self.assertFalse(state.console_supervision_enabled())
+
+    def test_automatic_start_preserves_pause_and_stop_markers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state, _, marker = self._supervision_fixture(Path(tmp))
+            event = threading.Event()
+            with mock.patch.object(web_panel_state.subprocess, "Popen") as spawn:
+                marker.write_text("operator hold")
+                for mode in (0o600, 0o644):
+                    marker.chmod(mode)
+                    state._start_console_controller(stopping=event)
+                    self.assertEqual(marker.read_text(), "operator hold")
+                marker.unlink()
+                state.pause_flag.symlink_to(Path(tmp) / "absent")
+                state._start_console_controller(stopping=event)
+                self.assertTrue(state.pause_flag.is_symlink())
+                state.pause_flag.unlink()
+                state._set_paused(True)
+                state._start_console_controller(stopping=event)
+                self.assertTrue(state._is_paused())
+                spawn.assert_not_called()
+                state._run_control_cmd.assert_not_called()
+
+    def test_automatic_start_rejects_competing_or_unknown_owners(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state, state_dir, marker = self._supervision_fixture(Path(tmp))
+            event = threading.Event()
+            with mock.patch.object(web_panel_state.subprocess, "Popen") as spawn:
+                absent = state._run_control_cmd.return_value
+                state._run_control_cmd.return_value = self._completed_process([], returncode=0)
+                state._start_console_controller(stopping=event)
+                state._run_control_cmd.return_value = self._completed_process([], returncode=1)
+                with self.assertRaises(RuntimeError):
+                    state._start_console_controller(stopping=event)
+                state._run_control_cmd.return_value = absent
+                state._find_worker_pids.return_value = [42]
+                state._start_console_controller(stopping=event)
+                state._find_worker_pids.return_value = []
+                lock = state_dir / "controller.lock"
+                lock.touch(mode=0o600)
+                with lock.open() as handle:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    state._start_console_controller(stopping=event)
+                pid = Path(tmp) / "controller.pid"
+                pid.write_text("incomplete")
+                pid.chmod(0o600)
+                with self.assertRaises(RuntimeError):
+                    state._start_console_controller(stopping=event)
+                self.assertEqual(pid.read_text(), "incomplete")
+                self.assertFalse(marker.exists())
+                spawn.assert_not_called()
+
+    def test_automatic_adoption_and_restart_after_a_verified_exit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state, _, marker = self._supervision_fixture(Path(tmp))
+            event = threading.Event()
+            pid = Path(tmp) / "controller.pid"
+            pid.write_text(self._console_pid_payload(4242))
+            pid.chmod(0o600)
+            proc = mock.Mock(pid=4243)
+            proc.poll.return_value = None
+            birth = (1753684496, 123456)
+            with mock.patch.object(web_panel_state.subprocess, "Popen", return_value=proc) as spawn, \
+                 mock.patch.object(state, "_console_controller_process_matches", return_value=True) as matches, \
+                 mock.patch.object(state, "_console_controller_process_identity", return_value=(*birth, 4242)) as kernel, \
+                 mock.patch.object(state, "_set_paused", side_effect=AssertionError("must preserve manual pause")):
+                state._start_console_controller(stopping=event)
+                state._start_console_controller(stopping=event)
+                spawn.assert_not_called()
+                self.assertEqual(matches.call_count, 1)
+                kernel.side_effect = [None, (*birth, 4243)]
+                matches.side_effect = [False, False, True]
+                with mock.patch.object(web_panel_state.os, "kill", side_effect=ProcessLookupError):
+                    state._start_console_controller(stopping=event)
+                state._start_console_controller(stopping=event)
+                spawn.assert_called_once()
+                self.assertEqual(json.loads(pid.read_text())["pid"], 4243)
+                self.assertFalse(marker.exists())
+
+    def test_start_race_leaves_replaced_stop_marker_untouched(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state, _, marker = self._supervision_fixture(Path(tmp))
+            def changed(*_args, **_kwargs):
+                replacement = marker.with_suffix(".new")
+                replacement.write_text("manual")
+                replacement.chmod(0o600)
+                replacement.replace(marker)
+                raise OSError("injected launch failure")
+            with mock.patch.object(web_panel_state.subprocess, "Popen", side_effect=changed) as spawn:
+                with self.assertRaises(OSError):
+                    state._start_console_controller(stopping=threading.Event())
+                state._start_console_controller(stopping=threading.Event())
+                spawn.assert_called_once()
+                self.assertEqual(marker.read_text(), "manual")
+
+    def test_transient_spawn_failure_waits_before_retry_and_removes_only_own_gate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state, _, marker = self._supervision_fixture(Path(tmp))
+            stop = mock.Mock()
+            stop.is_set.return_value = False
+            stop.wait.side_effect = [False, True]
+            with mock.patch.object(web_panel_state.subprocess, "Popen", side_effect=OSError("offline")) as spawn:
+                state.supervise_console_controller(stop)
+                self.assertEqual(spawn.call_count, 2)
+                self.assertEqual(stop.wait.call_args_list, [mock.call(30.0), mock.call(30.0)])
+                self.assertFalse(marker.exists())
+                self.assertFalse((Path(tmp) / "controller.pid").exists())
+                self.assertIn("보류", state.notice)
 
     def test_console_controller_start_spawns_exact_guarded_command_without_launchctl(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import fcntl
 import hashlib
 import json
 import math
@@ -148,6 +149,7 @@ class ControlState:
     LOG_READ_BYTES = 65536
     RECENT_JOB_LIMIT = 20
     SUBPROCESS_TIMEOUT_SEC = 8.0
+    CONSOLE_SUPERVISION_INTERVAL_SEC = 30.0
 
     def __init__(self, repo_root: Path):
         self.repo_root = repo_root
@@ -159,6 +161,7 @@ class ControlState:
 
         self.worker_proc: subprocess.Popen | None = None
         self.controller_proc: subprocess.Popen | None = None
+        self._adopted_console_identity: tuple[int, tuple[int, int]] | None = None
         self.lock = threading.RLock()
         self._folder_cache_until = 0.0
         self._folder_cache: dict[str, str] = {}
@@ -1837,9 +1840,11 @@ class ControlState:
         finally:
             os.close(fd)
 
-    def _remove_controller_kill_switch_marker(self) -> None:
+    def _remove_controller_kill_switch_marker(self, expected: os.stat_result | None = None) -> None:
         path = self._controller_kill_switch_path()
         state = self._controller_kill_switch_state()
+        if expected is not None and (state != "active" or self._file_identity(path.lstat()) != self._file_identity(expected)):
+            raise RuntimeError("controller 시작 중 kill-switch marker가 변경되었습니다.")
         if state == "absent":
             return
         if state != "active":
@@ -1850,7 +1855,7 @@ class ControlState:
         except OSError as exc:
             raise RuntimeError("controller kill-switch marker 제거에 실패했습니다.") from exc
 
-    def _write_controller_kill_switch_marker(self) -> None:
+    def _write_controller_kill_switch_marker(self, *, exclusive: bool = False) -> os.stat_result | None:
         path = self._controller_kill_switch_path()
         try:
             parent = path.parent.lstat()
@@ -1871,7 +1876,9 @@ class ControlState:
         if state == "invalid":
             raise RuntimeError("controller kill-switch marker 상태가 올바르지 않습니다.")
         if state == "active":
-            return
+            if exclusive:
+                raise RuntimeError("controller 중지 표시가 적용되었습니다.")
+            return None
         try:
             flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
             if hasattr(os, "O_NOFOLLOW"):
@@ -1879,13 +1886,17 @@ class ControlState:
             fd = os.open(path, flags, 0o600)
             try:
                 os.fsync(fd)
+                created = os.fstat(fd)
             finally:
                 os.close(fd)
             observed = path.lstat()
-            if not stat.S_ISREG(observed.st_mode) or stat.S_ISLNK(observed.st_mode) or observed.st_nlink != 1:
+            if not os.path.samestat(created, observed) or not stat.S_ISREG(observed.st_mode) or stat.S_ISLNK(observed.st_mode) or observed.st_nlink != 1:
                 raise RuntimeError("controller kill-switch marker 상태가 올바르지 않습니다.")
             self._fsync_directory(path.parent)
+            return created
         except FileExistsError:
+            if exclusive:
+                raise RuntimeError("controller 시작 중 중지 표시가 적용되었습니다.")
             if self._controller_kill_switch_state() != "active":
                 raise RuntimeError(
                     "controller kill-switch marker 상태가 올바르지 않습니다."
@@ -1918,17 +1929,93 @@ class ControlState:
         except OSError as exc:
             raise RuntimeError("controller PID file 정리에 실패했습니다.") from exc
 
-    def _start_console_controller(self) -> None:
+    def console_supervision_enabled(self) -> bool:
+        app = self._app_config()
+        return (app.get("console_controller_autostart") is True
+                and self._console_runtime_supported() and self._is_console_controller())
+
+    def _autostart_paused(self) -> bool:
+        # An invalid entry, including a dangling symlink, also blocks automation.
+        try:
+            self.pause_flag.lstat()
+        except FileNotFoundError:
+            return False
+        return True
+
+    def _can_start_supervised_controller(self, settings: dict[str, Path]) -> bool:
+        if self._load_config().get("app") != self._app_config():
+            raise RuntimeError("controller 설정이 변경되었습니다. 패널 재시작 후 확인하세요.")
+        service = self._run_control_cmd(["/bin/launchctl", "print", self._controller_service_target()])
+        if service.returncode == 0:
+            return False
+        if service.returncode != 113 or f'Could not find service "{self._controller_label()}"' not in (service.stderr or ""):
+            raise RuntimeError("launchd controller 등록 상태를 확인할 수 없습니다.")
+        if self._is_managed_running() or self._find_worker_pids():
+            return False
+        # The PID file might be absent after an interrupted start. Do not disturb
+        # an existing controller holding the same nonblocking flock as the Go owner.
+        lock_path = settings["state_dir"] / "controller.lock"
+        try:
+            fd = self._secure_pid_file_fd(lock_path, create=False)
+        except FileNotFoundError:
+            return True
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        finally:
+            os.close(fd)
+        return True
+
+    def supervise_console_controller(self, stopping: threading.Event) -> None:
+        while not stopping.is_set():
+            try:
+                with self.lock:
+                    if not stopping.is_set() and self.console_supervision_enabled():
+                        self._start_console_controller(stopping=stopping)
+            except (OSError, RuntimeError, ValueError, subprocess.SubprocessError, yaml.YAMLError) as exc:
+                self.notice = f"controller 자동 시작 보류: {exc}"
+            if stopping.wait(self.CONSOLE_SUPERVISION_INTERVAL_SEC):
+                break
+
+    def _start_console_controller(self, *, stopping: threading.Event | None = None) -> None:
+        supervised = stopping is not None
+        if supervised:
+            if self._autostart_paused() or self._controller_kill_switch_state() != "absent":
+                return
+            if self.controller_proc is not None and self.controller_proc.poll() is None:
+                return
+            adopted = self._adopted_console_identity
+            if adopted is not None:
+                pid, birth = adopted
+                if self._console_controller_process_identity(pid) == (*birth, pid):
+                    return
+                self._adopted_console_identity = None
         settings = self._console_controller_settings()
-        existing = self._console_controller_pid(settings)
-        if existing is not None:
-            self._remove_controller_kill_switch_marker()
-            self._set_paused(False)
-            self.notice = "controller 실행을 재개했습니다."
+        identity = self._read_console_controller_identity(settings)
+        if identity is not None and self._console_controller_process_matches(*identity, settings):
+            if supervised:
+                self._adopted_console_identity = identity
+            else:
+                self._remove_controller_kill_switch_marker()
+                self._set_paused(False)
+                self.notice = "controller 실행을 재개했습니다."
             return
 
+        if supervised:
+            if not self._can_start_supervised_controller(settings):
+                return
+            if identity is not None:
+                try:
+                    os.kill(identity[0], 0)
+                except ProcessLookupError:
+                    pass
+                else:
+                    kernel = self._console_controller_process_identity(identity[0])
+                    if kernel is None or kernel[:2] == identity[1]:
+                        raise RuntimeError("기존 controller PID의 실행 신원을 확정할 수 없습니다.")
         self._remove_stale_console_pid_file(settings)
-        self._write_controller_kill_switch_marker()
+        marker = self._write_controller_kill_switch_marker(exclusive=supervised)
         pid_fd: int | None = None
         stdout_fd: int | None = None
         stderr_fd: int | None = None
@@ -1943,6 +2030,9 @@ class ControlState:
                 settings["binary"],
                 settings["binary"].parent.name,
             )
+            if stopping is not None and (stopping.is_set() or self._autostart_paused() or marker is None
+                               or self._file_identity(self._controller_kill_switch_path().lstat()) != self._file_identity(marker)):
+                raise RuntimeError("자동 시작 중 운영자 일시정지 또는 중지 표시가 변경되었습니다.")
             proc = subprocess.Popen(
                 self._console_controller_cmd(settings),
                 cwd=str(self.repo_root),
@@ -1986,8 +2076,13 @@ class ControlState:
                 settings,
             ):
                 raise RuntimeError("controller process 실행 identity가 올바르지 않습니다.")
-            self._remove_controller_kill_switch_marker()
-            self._set_paused(False)
+            if stopping is not None:
+                if stopping.is_set() or self._autostart_paused():
+                    raise RuntimeError("패널 종료 또는 일시정지로 controller 자동 시작을 중단했습니다.")
+                self._remove_controller_kill_switch_marker(expected=marker)
+            else:
+                self._remove_controller_kill_switch_marker()
+                self._set_paused(False)
             self.controller_proc = proc
             self.notice = "controller 실행을 시작했습니다."
         except Exception:
@@ -2001,11 +2096,15 @@ class ControlState:
                     except Exception:
                         pass
             try:
-                self._write_controller_kill_switch_marker()
+                if not supervised:
+                    self._write_controller_kill_switch_marker()
+                elif marker is not None and (proc is None or proc.poll() is not None):
+                    self._remove_controller_kill_switch_marker(expected=marker)
             except Exception:
                 pass
             try:
-                self._cleanup_console_pid_file(settings)
+                if pid_fd is not None and os.path.samestat(os.fstat(pid_fd), settings["pid_path"].lstat()):
+                    self._cleanup_console_pid_file(settings)
             except Exception:
                 pass
             raise
