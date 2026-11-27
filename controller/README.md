@@ -157,12 +157,11 @@ required all of these to be recorded:
    composes those guarded Python single/retry contracts; the historical
    readiness ledger alone is never a cutover authorization.
 
-Run the target-Darwin acceptance gate only against the repository's isolated
-fixtures:
+Run the target-Darwin acceptance gate from the repository root on macOS with
+the project Python environment installed. The gate uses isolated fixtures.
 
 ```sh
-LECTURE_STT_RUN_DARWIN_ACCEPTANCE=1 go test \
-  ./internal/shadow -run TestRunDarwinAcceptance20ConsecutiveRuns -count=1
+make controller-darwin
 ```
 
 The gate performs 20 consecutive temporary-root runs and requires exactly five

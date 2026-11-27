@@ -9,6 +9,8 @@
 
 - [이슈 #10](https://github.com/altius03/lecture-stt-pipeline/issues/10) · [main 운영 코드의 dev 통합](work-log/010-integrate-main.md) · [PR #11](https://github.com/altius03/lecture-stt-pipeline/pull/11)
 
+- [이슈 #15](https://github.com/altius03/lecture-stt-pipeline/issues/15) · [로컬과 CI 검증 명령 공용화](work-log/015-shared-ci.md)
+
 - [이슈 #7](https://github.com/altius03/lecture-stt-pipeline/issues/7) · [시스템·운영 이력 인수인계](work-log/007-system-handoff.md) · [main PR #8](https://github.com/altius03/lecture-stt-pipeline/pull/8) · [dev PR #9](https://github.com/altius03/lecture-stt-pipeline/pull/9)
 
 - [이슈 #4](https://github.com/altius03/lecture-stt-pipeline/issues/4) · [이슈별 작업 기록과 PR 검증 절차](work-log/004-issue-pr-workflow.md) · [main PR #5](https://github.com/altius03/lecture-stt-pipeline/pull/5) · [dev PR #6](https://github.com/altius03/lecture-stt-pipeline/pull/6)
