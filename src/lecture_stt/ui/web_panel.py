@@ -14,6 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from lecture_stt.downstream import panel_recovery
 from lecture_stt.shared.paths import env_file, repo_root, runtime_env
 from lecture_stt.storage_v2.archive_review import (
     ArchiveReviewConflictError,
@@ -41,6 +42,8 @@ from lecture_stt.ui.web_panel_state import ControlState
 _JS_SAFE_INTEGER_MAX = 9_007_199_254_740_991
 _CANONICAL_POSITIVE_INTEGER_RE = re.compile(r"^[1-9][0-9]*$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_RECOVERY_PATH = "/api/postprocess/recovery"
+_RECOVERY_JOB_PATH = re.compile(r"/api/postprocess/recovery/([1-9][0-9]{0,15})(/requeue)?")
 
 
 def react_dist_dir(root: Path | None = None) -> Path:
@@ -1076,6 +1079,76 @@ class RequestHandler(BaseHTTPRequestHandler):
         snapshot = STATE.snapshot(include_log=False)
         return {**snapshot, "actions": {**snapshot["actions"], "can_control": self._control_actor() is not None}}
 
+    def _recovery_list_options(self, query_string: str) -> dict:
+        query = parse_qs(query_string, keep_blank_values=True)
+        self._require_exact_query_keys(query, allowed=("view", "limit", "offset"))
+        views = query.get("view", ["missing"])
+        if len(views) != 1 or views[0] not in {"missing", "confirmed"}:
+            raise ValueError("조회할 작업 목록이 올바르지 않습니다.")
+        bounds_message = "페이지 크기는 1~100, 시작 위치는 0~100000이어야 합니다."
+        try:
+            limit = self._single_query_int(query, "limit", default=20)
+            offset = self._single_query_int(query, "offset", default=0)
+        except ValueError as exc:
+            raise ValueError(bounds_message) from exc
+        if not 1 <= limit <= 100 or not 0 <= offset <= 100_000:
+            raise ValueError(bounds_message)
+        return {"view": views[0], "limit": limit, "offset": offset}
+
+    def _recovery_confirmation(self) -> dict:
+        fields = self._read_json_object()
+        required = {"course_code", "source_txt_sha256", "source_json_sha256"}
+        if set(fields) != required:
+            raise ValueError("선택한 과목과 확인한 원전사 정보가 필요합니다.")
+        course = fields["course_code"]
+        if not isinstance(course, str) or not 1 <= len(course) <= 128 or course.strip() != course:
+            raise ValueError("과목 코드가 올바르지 않습니다.")
+        for key in ("source_txt_sha256", "source_json_sha256"):
+            if not isinstance(fields[key], str) or not _SHA256_RE.fullmatch(fields[key]):
+                raise ValueError("원전사 확인 정보가 올바르지 않습니다.")
+        return fields
+
+    def _handle_recovery(self, path: str, query: str, *, apply: bool = False) -> None:
+        assert STATE is not None
+        job_id = None
+        try:
+            if path == _RECOVERY_PATH and not apply:
+                options = self._recovery_list_options(query)
+            else:
+                match = _RECOVERY_JOB_PATH.fullmatch(path)
+                if not match or bool(match[2]) != apply:
+                    self._api_error(404, "복구 경로를 찾을 수 없습니다.")
+                    return
+                job_id = int(match[1])
+                if job_id > _JS_SAFE_INTEGER_MAX or query:
+                    raise ValueError("작업 번호 또는 조회 조건이 올바르지 않습니다.")
+                options = self._recovery_confirmation() if apply else {}
+        except ValueError as exc:
+            self._api_error(400, str(exc))
+            return
+
+        config, db = STATE.config_path, STATE.db_path
+        try:
+            if job_id is None:
+                result = panel_recovery.list_recovery(config, db, **options)
+            elif apply:
+                result = panel_recovery.apply_recovery(config, db, job_id=job_id, **options)
+            else:
+                result = panel_recovery.get_recovery(config, db, job_id=job_id)
+                if not result["can_requeue"] or self._control_actor() is None:
+                    result = {**result, "courses": [], "can_requeue": False,
+                              "source_txt_sha256": None, "source_json_sha256": None}
+        except panel_recovery.RecoveryNotFoundError:
+            self._api_error(404, "복구 작업을 찾을 수 없습니다.")
+        except panel_recovery.RecoveryDisabledError:
+            self._api_error(403, "강의 후처리가 꺼져 있습니다.")
+        except panel_recovery.RecoveryConflictError as exc:
+            self._api_error(409, str(exc))
+        except Exception:
+            self._api_error(503, "후처리 설정 또는 작업 기록을 읽을 수 없습니다.")
+        else:
+            self._write_json(200, result)
+
     def _serve_event_stream(
         self,
         *,
@@ -1144,6 +1217,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._api_error(403, "Untrusted Host")
             return
         parsed = urlparse(self.path)
+        if parsed.path == _RECOVERY_PATH or parsed.path.startswith(_RECOVERY_PATH + "/"):
+            self._handle_recovery(parsed.path, parsed.query)
+            return
         query = parse_qs(parsed.query)
 
         if parsed.path == "/api/storage-v2/analytics/transcriptions":
@@ -1393,6 +1469,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._actor = "viewer"
 
         if parsed.path.startswith("/api/"):
+            if parsed.path == _RECOVERY_PATH or parsed.path.startswith(_RECOVERY_PATH + "/"):
+                self._handle_recovery(parsed.path, parsed.query, apply=True)
+                return
             archive_review_route = self._archive_review_case_route(parsed.path)
             if archive_review_route is not None:
                 case_key, action_parts = archive_review_route

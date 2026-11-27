@@ -3458,3 +3458,46 @@ tbody td[colspan] {
     transition-duration: 0.01ms !important;
   }
 }
+
+.postprocess-recovery .panel-card-body,
+.recovery-detail,
+.recovery-form label {
+  display: grid;
+  gap: 0.65rem;
+}
+
+.recovery-toolbar,
+.recovery-form,
+.recovery-paging {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.65rem;
+}
+
+.recovery-toolbar { justify-content: space-between; }
+.recovery-form { align-items: flex-end; }
+.recovery-form select { max-width: 100%; }
+.recovery-form label { min-width: 0; }
+
+.recovery-list {
+  padding: 0;
+  margin: 0;
+  list-style: none;
+}
+.recovery-list li + li { border-top: 1px solid var(--border); }
+.recovery-record {
+  display: grid;
+  width: 100%;
+  gap: 0.2rem;
+  padding: 0.65rem;
+  text-align: left;
+  color: var(--text);
+  background: transparent;
+  border: 1px solid transparent;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+.recovery-record span { color: var(--muted); font-size: 0.85rem; }
+.recovery-record[aria-pressed="true"] { border-color: var(--color-focus); background: var(--row-selected); }
+.recovery-detail { border-top: 1px solid var(--border-strong); padding-top: 1rem; }

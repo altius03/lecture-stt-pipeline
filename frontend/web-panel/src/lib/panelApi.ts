@@ -5,6 +5,10 @@ import {
   decodeArchiveReviewPromotionResult,
   decodeArchiveReviewStatusResult,
 } from "./decodeArchiveReview"
+import {
+  decodeRecoveryDetail, decodeRecoveryList, decodeRequeueResult,
+  type RecoveryView, type RequeueRequest,
+} from "./decodePostprocessRecovery"
 import { decodeLogPayload, decodePanelActionResponse, decodePanelState } from "./decodePanelState"
 import {
   decodeRecordingDetail,
@@ -213,6 +217,34 @@ async function readJson(response: Response): Promise<unknown> {
   } catch (error) {
     throw new Error(toErrorMessage(error, "서버 응답을 해석하지 못했습니다."))
   }
+}
+
+const RECOVERY_ENDPOINT = "/api/postprocess/recovery"
+
+export async function fetchRecoveryList(view: RecoveryView, offset: number, limit: number, signal?: AbortSignal) {
+  const params = new URLSearchParams({ view, limit: String(limit), offset: String(offset) })
+  const response = await fetch(`${RECOVERY_ENDPOINT}?${params}`, { cache: "no-store", signal })
+  const payload = await readJson(response)
+  if (!response.ok) throw createApiError(response, payload, "강의 복구 목록을 불러오지 못했습니다.")
+  return decodeRecoveryList(payload)
+}
+
+export async function fetchRecoveryDetail(id: number, signal?: AbortSignal) {
+  const response = await fetch(`${RECOVERY_ENDPOINT}/${id}`, { cache: "no-store", signal })
+  const payload = await readJson(response)
+  if (!response.ok) throw createApiError(response, payload, "선택한 강의의 상태를 불러오지 못했습니다.")
+  return decodeRecoveryDetail(payload, id)
+}
+
+export async function requeueRecoveryJob(id: number, request: RequeueRequest) {
+  const response = await fetch(`${RECOVERY_ENDPOINT}/${id}/requeue`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(request),
+  })
+  const payload = await readJson(response)
+  if (!response.ok) throw createApiError(response, payload, "후처리 재등록에 실패했습니다.")
+  return decodeRequeueResult(payload, id)
 }
 
 export async function fetchPanelState(endpoint: string = FALLBACK_PANEL_ENDPOINTS.state): Promise<PanelState> {

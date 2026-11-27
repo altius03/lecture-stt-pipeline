@@ -60,6 +60,12 @@ vi.mock("../src/components/panel/RecordingLibraryPanel", () => ({
   },
 }))
 
+vi.mock("../src/components/panel/PostprocessRecoveryPanel", () => ({
+  PostprocessRecoveryPanel: ({ canControl }: { canControl: boolean }) => (
+    <div>PostprocessRecoveryPanel:{canControl ? "control" : "read"}</div>
+  ),
+}))
+
 vi.mock("../src/components/panel/UnifiedReviewPanel", () => ({
   UnifiedReviewPanel: (props: {
     selectedTarget:
@@ -279,6 +285,7 @@ describe("App", () => {
         eventsEndpoint: null,
       }),
     )
+    expect(screen.getByText("PostprocessRecoveryPanel:read")).toBeTruthy()
     expect(screen.getByText("UnifiedReviewPanel:none")).toBeTruthy()
     expect(unifiedReviewPanelMock).toHaveBeenCalledWith({
       selectedTarget: null,

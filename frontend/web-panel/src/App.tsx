@@ -7,6 +7,7 @@ import {
   type DashboardScreenItem,
 } from "./components/panel/DashboardScreenNav"
 import { PanelHero } from "./components/panel/PanelHero"
+import { PostprocessRecoveryPanel } from "./components/panel/PostprocessRecoveryPanel"
 import { ProcessingCard } from "./components/panel/ProcessingCard"
 import { RecordingLibraryPanel } from "./components/panel/RecordingLibraryPanel"
 import { RuntimeCard } from "./components/panel/RuntimeCard"
@@ -55,8 +56,8 @@ const SCREEN_COPY: Record<
   },
   review: {
     eyebrow: "Review",
-    title: "네 검토 source를 한 줄로 연결",
-    description: "archive evidence, 시간표 분류 제안, 내용 기반 제목 제안, 녹음별 남은 review를 함께 훑고 guarded workbench에서 명시적으로 처리합니다.",
+    title: "강의 복구와 보관소 검토",
+    description: "후처리에서 빠진 녹음의 과목을 확정하고 보관소에 남은 검토 항목을 확인합니다.",
   },
   timetable: {
     eyebrow: "Timetable",
@@ -324,7 +325,7 @@ export default function App() {
         ? "처리 화면에서 상태와 로그를 하나의 실시간 연결로 받고 있습니다."
         : `실시간 연결을 기다리는 동안 ${panelState.summary.poll_interval_sec}초 주기 조회로 상태와 로그를 맞춥니다.`
       : currentScreen === "review"
-        ? "네 source는 이 화면에서만 새로 읽습니다. 상태 변경·확정·승격은 각 guarded workbench의 비활성 기본값과 plan/count/digest/allow-write guard를 그대로 따릅니다."
+        ? "원전사가 바뀌면 재등록 전에 다시 확인해야 합니다."
         : currentScreen === "library"
           ? currentRoute.libraryStorageKey
             ? "선택한 storage_key detail은 별도 read-only query로 읽고, 현재 목록와 독립적으로 유지합니다."
@@ -413,7 +414,12 @@ export default function App() {
   }
 
   function renderReviewScreen() {
-    return <UnifiedReviewPanel selectedTarget={currentRoute.reviewTarget} />
+    return (
+      <>
+        <PostprocessRecoveryPanel canControl={panelState.actions.can_control === true} />
+        <UnifiedReviewPanel selectedTarget={currentRoute.reviewTarget} />
+      </>
+    )
   }
 
   function renderSettingsScreen() {
