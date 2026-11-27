@@ -3,6 +3,10 @@
 이 파일은 저장소에 반영된 변경을 날짜순으로 누적 기록한다.
 최신 항목을 위에 추가한다.
 
+## 2026-11-28
+
+- [이슈 #22](https://github.com/altius03/lecture-stt-pipeline/issues/22) · [운영 화면과 강의 복구 통합 배포](work-log/022-live-integration.md) · [PR #23](https://github.com/altius03/lecture-stt-pipeline/pull/23)
+
 ## 2026-11-27
 
 - [이슈 #20](https://github.com/altius03/lecture-stt-pipeline/issues/20) · [누락 강의 단건 복구 패널](work-log/020-panel-course-recovery.md) · [PR #21](https://github.com/altius03/lecture-stt-pipeline/pull/21)

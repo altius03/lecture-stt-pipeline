@@ -45,6 +45,11 @@ vi.mock("../src/components/panel/ActivityPanel", () => ({
   ActivityPanel: () => <div>ActivityPanel</div>,
 }))
 
+vi.mock("../src/components/panel/JobViews", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/components/panel/JobViews")>()),
+  QualityReviewPanel: ({ canControl }: { canControl: boolean }) => <div>QualityReviewPanel:{canControl ? "control" : "read"}</div>,
+}))
+
 vi.mock("../src/components/panel/ArchiveReviewPanel", () => ({
   ArchiveReviewPanel: () => <div>ArchiveReviewPanel</div>,
 }))
@@ -170,11 +175,9 @@ beforeEach(() => {
     error: null,
     pendingAction: null,
     pendingNotificationSelection: null,
-    pendingNotificationApplyNow: false,
     runAction: vi.fn(),
     saveNotificationSelection: vi.fn(),
     retry: vi.fn(),
-    logResetKey: 0,
     realtimeConnected: true,
     streamEndpoint: logsEnabled ? PANEL_EVENTS_ENDPOINT : PANEL_STATE_EVENTS_ENDPOINT,
   }))
@@ -203,18 +206,14 @@ function setHash(hash: string) {
 }
 
 describe("App", () => {
-  it("shows review-needed counts separately from errors in the queue ledger", () => {
-    setHash("processing")
+  it("shows review requests separately from errors on entry", () => {
+    setHash("home")
     render(<App />)
-
-    const ledger = screen.getByRole("heading", { name: "작업 장부" }).closest("article")
-    expect(ledger).not.toBeNull()
-    const scope = within(ledger as HTMLElement)
-
-    expect(scope.getByText("확인 필요")).toBeTruthy()
-    expect(scope.getByText("오류")).toBeTruthy()
-    expect(scope.getByText("2")).toBeTruthy()
-    expect(scope.getByText("4")).toBeTruthy()
+    const summary = screen.getByLabelText("작업 요약")
+    expect(within(summary).getByText("확인 요청")).toBeTruthy()
+    expect(within(summary).getByText("오류")).toBeTruthy()
+    expect(within(summary).getByText("2")).toBeTruthy()
+    expect(within(summary).getByText("4")).toBeTruthy()
   })
 
   it("explains how to request control when opening a read-only connection", () => {
@@ -227,7 +226,7 @@ describe("App", () => {
     expect(screen.getByText(/이 접속은 읽기 전용입니다/)).toBeTruthy()
   })
 
-  it("keeps logs disabled on home and mounts only the home analytics panel", () => {
+  it("keeps logs disabled on home and shows the job table", () => {
     setHash("home")
     render(<App />)
 
@@ -238,7 +237,8 @@ describe("App", () => {
         eventsEndpoint: null,
       }),
     )
-    expect(screen.getByText("TranscriptionAnalyticsPanel")).toBeTruthy()
+    expect(screen.getByRole("heading", { name: "작업 목록" })).toBeTruthy()
+    expect(screen.queryByText("TranscriptionAnalyticsPanel")).toBeNull()
     expect(screen.queryByText("ActivityPanel")).toBeNull()
     expect(screen.queryByText("TimetablePanel")).toBeNull()
   })
@@ -286,12 +286,24 @@ describe("App", () => {
       }),
     )
     expect(screen.getByText("PostprocessRecoveryPanel:read")).toBeTruthy()
+    expect(screen.getByText("QualityReviewPanel:read")).toBeTruthy()
     expect(screen.getByText("UnifiedReviewPanel:none")).toBeTruthy()
     expect(unifiedReviewPanelMock).toHaveBeenCalledWith({
       selectedTarget: null,
     })
     expect(screen.queryByText("ActivityPanel")).toBeNull()
     expect(screen.queryByText("TimetablePanel")).toBeNull()
+  })
+
+  it("allows an operator to use the missing-lecture workbench in the redesigned review screen", () => {
+    const hookState = usePanelStateMock()
+    const state = createState()
+    state.actions.can_control = true
+    usePanelStateMock.mockReturnValue({ ...hookState, state })
+    setHash("review")
+    render(<App />)
+    expect(screen.getByText("PostprocessRecoveryPanel:control")).toBeTruthy()
+    expect(screen.getByText("QualityReviewPanel:control")).toBeTruthy()
   })
 
   it("mounts RecordingLibraryPanel and disables logs on library hash", () => {
@@ -486,7 +498,7 @@ describe("App", () => {
     render(<App />)
 
     expect(usePanelStateMock).toHaveBeenCalledWith({ logsEnabled: false })
-    expect(screen.getByText("TranscriptionAnalyticsPanel")).toBeTruthy()
+    expect(screen.getByRole("heading", { name: "작업 현황" })).toBeTruthy()
     expect(screen.queryByText("ActivityPanel")).toBeNull()
     expect(screen.queryByText("TimetablePanel")).toBeNull()
   })
@@ -527,18 +539,18 @@ describe("App", () => {
     setHash("home")
     render(<App />)
 
-    const commandRail = screen.getByRole("navigation", { name: "운영 워크벤치" })
+    const commandRail = screen.getByRole("navigation", { name: "운영 화면" })
     const links = within(commandRail).getAllByRole("link")
-    expect(links).toHaveLength(6)
+    expect(links).toHaveLength(7)
 
-    const home = within(commandRail).getByRole("link", { name: /홈\./ })
-    const processing = within(commandRail).getByRole("link", { name: /처리 현황\./ })
-    const library = within(commandRail).getByRole("link", { name: /녹음 보관함\./ })
-    const review = within(commandRail).getByRole("link", { name: /검토 큐\./ })
-    const timetable = within(commandRail).getByRole("link", { name: /시간표\./ })
-    const settings = within(commandRail).getByRole("link", { name: /설정\./ })
+    const home = within(commandRail).getByRole("link", { name: "현황" })
+    const processing = within(commandRail).getByRole("link", { name: "로그" })
+    const library = within(commandRail).getByRole("link", { name: "녹음 보관함" })
+    const review = within(commandRail).getByRole("link", { name: /확인/ })
+    const timetable = within(commandRail).getByRole("link", { name: "시간표" })
+    const settings = within(commandRail).getByRole("link", { name: "설정" })
 
-    expect(home.getAttribute("href")).toBe("#")
+    expect(home.getAttribute("href")).toBe("#home")
     expect(processing.getAttribute("href")).toBe("#processing")
     expect(library.getAttribute("href")).toBe("#library")
     expect(review.getAttribute("href")).toBe("#review")
@@ -547,7 +559,7 @@ describe("App", () => {
 
     expect(home.getAttribute("aria-current")).toBe("page")
     expect(processing.getAttribute("aria-current")).toBeNull()
-    expect(screen.getByRole("navigation", { name: "운영 워크벤치" }).getAttribute("aria-label")).toBe("운영 화면")
+    expect(commandRail.getAttribute("aria-label")).toBe("운영 화면")
 
     for (const link of links) {
       expect(link.textContent).not.toMatch(/\b0[1-6]\b/)
@@ -557,10 +569,10 @@ describe("App", () => {
   it("updates active nav semantics and screen header context after hash navigation", async () => {
     render(<App />)
 
-    expect(screen.getByRole("heading", { name: "전사 운영과 품질을 한눈에" })).toBeTruthy()
+    expect(screen.getByRole("heading", { name: "작업 현황" })).toBeTruthy()
 
-    const commandRail = screen.getByRole("navigation", { name: "운영 워크벤치" })
-    expect(within(commandRail).getByRole("link", { name: /홈\./ }).getAttribute("aria-current")).toBe("page")
+    const commandRail = screen.getByRole("navigation", { name: "운영 화면" })
+    expect(within(commandRail).getByRole("link", { name: "현황" }).getAttribute("aria-current")).toBe("page")
 
     act(() => {
       window.location.hash = "#processing"
@@ -568,11 +580,11 @@ describe("App", () => {
     })
 
     await waitFor(() => {
-      expect(screen.getByRole("heading", { name: "워커 진행과 운영 기록" })).toBeTruthy()
+      expect(screen.getByRole("heading", { name: "작업 로그" })).toBeTruthy()
       expect(
-        within(commandRail).getByRole("link", { name: /처리 현황\./ }).getAttribute("aria-current"),
+        within(commandRail).getByRole("link", { name: "로그" }).getAttribute("aria-current"),
       ).toBe("page")
-      expect(within(commandRail).getByRole("link", { name: /홈\./ }).getAttribute("aria-current")).toBeNull()
+      expect(within(commandRail).getByRole("link", { name: "현황" }).getAttribute("aria-current")).toBeNull()
     })
   })
 

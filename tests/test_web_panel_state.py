@@ -20,6 +20,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from lecture_stt.ui import web_panel_state  # noqa: E402
+from lecture_stt.shared import db  # noqa: E402
 
 
 class WebPanelStateSnapshotTests(unittest.TestCase):
@@ -85,6 +86,8 @@ class WebPanelStateSnapshotTests(unittest.TestCase):
         self.assertEqual(snapshot["actions"]["endpoints"]["notification"], "/api/notification")
         self.assertEqual(snapshot["jobs_v2"][0]["id"], 7)
         self.assertEqual(snapshot["jobs_v2"][0]["file_name"], "lecture.m4a")
+        self.assertEqual(snapshot["jobs_v2"][0]["stages"]["audio"], "done")
+        self.assertEqual(snapshot["jobs_v2"][0]["stages"]["transcript"], "processing")
         self.assertEqual(snapshot["processing_v2"][0]["eta_sec"], 120)
         self.assertEqual(snapshot["summary"]["current_job"]["id"], 7)
         self.assertEqual(snapshot["summary"]["notice"], "정상 동작 중")
@@ -112,6 +115,20 @@ class WebPanelStateSnapshotTests(unittest.TestCase):
                 "clear_history",
             },
         )
+
+    def test_legacy_discord_config_is_not_exposed_as_a_selection(self) -> None:
+        state = self._make_state()
+        state.config_data = {
+            "notification": {
+                "provider": "discord",
+                "enabled": True,
+                "dual_send_providers": ["telegram"],
+            }
+        }
+        state._notification_availability = mock.Mock(return_value={"telegram": True})
+        notification = state.snapshot(include_log=False)["notification"]
+        self.assertEqual(notification["selection"], "disabled")
+        self.assertEqual([option["id"] for option in notification["options"]], ["telegram", "disabled"])
 
     def test_snapshot_controller_idle_with_kill_switch_is_stopped(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -164,14 +181,19 @@ class WebPanelStateSnapshotTests(unittest.TestCase):
                 "_notification_availability",
                 return_value={"telegram": True, "discord": True},
             ):
-                state.update_notification_selection("both")
+                state.update_notification_selection("telegram")
 
             saved = state._load_config()
             self.assertEqual(saved["notification"]["provider"], "telegram")
-            self.assertEqual(saved["notification"]["dual_send_providers"], ["discord"])
+            self.assertNotIn("dual_send_providers", saved["notification"])
             self.assertTrue(saved["notification"]["enabled"])
             self.assertTrue(saved["notification"]["send_review"])
             self.assertIn("다음 작업부터 적용", state.notice)
+            self.assertEqual([option["id"] for option in state._notification_options({"telegram": True})], ["telegram", "disabled"])
+            with self.assertRaises(RuntimeError):
+                state.update_notification_selection("both")
+            with self.assertRaises(RuntimeError):
+                state.update_notification_selection("discord")
 
     def test_save_config_keeps_original_when_replace_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2168,4 +2190,258 @@ class WebPanelControllerExecutionOwnerTests(unittest.TestCase):
             self.assertEqual(
                 web_panel_state.ControlState._count_transcript_sets(transcript_dir),
                 "2",
+            )
+
+
+class WebPanelJobApiStateTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        root = Path(self.temp_dir.name)
+        self.transcripts = root / "transcripts"
+        self.transcripts.mkdir()
+        self.db_path = root / "jobs.sqlite3"
+        db.init_db(str(self.db_path)).close()
+        self.state = object.__new__(web_panel_state.ControlState)
+        self.state.db_path = self.db_path
+        self.state.transcript_folder = self.transcripts
+        self.state.config_data = {
+            "storage_v2": {"library": {"transcript_preview_enabled": True}},
+            "transcript_delivery": {"enabled": False},
+        }
+        self.state.repo_root = root
+        self.state.config_path = root / "config.yaml"
+        self.state.config_data["paths"] = {"db_path": str(self.db_path)}
+        self.state.config_path.write_text(json.dumps(self.state.config_data), encoding="utf-8")
+        self.state.notice = ""
+        self.state._set_poll_boost = mock.Mock()
+
+    def _job(self, *, status: str = "DONE", quality: dict | None = None, path: Path | None = None) -> int:
+        path = path or self.transcripts / "lecture.txt"
+        with db.connect_db(str(self.db_path)) as conn:
+            return db.create_job(
+                conn,
+                status=status,
+                orig_inbox_path=str(path),
+                orig_name="lecture.m4a",
+                canonical_base="lecture",
+                canonical_audio_path=str(self.transcripts / "lecture.m4a"),
+                transcript_txt_path=str(path),
+                transcript_json_path=str(path.with_suffix(".json")),
+                engine_params={"quality": quality or {}},
+            )
+
+    @staticmethod
+    def _soft_bad_quality() -> dict:
+        return {
+            "health": "bad",
+            "summary": "낮은 음량 구간",
+            "nonspace_chars": 100,
+            "nonempty_segments": 2,
+            "audio_duration_sec": 100,
+            "coverage_ratio": 0.8,
+        }
+
+    def test_preview_requires_opt_in_done_and_safe_bounded_text(self) -> None:
+        transcript = self.transcripts / "lecture.txt"
+        transcript.write_text("전사 본문\n", encoding="utf-8")
+        job_id = self._job(path=transcript)
+        self.assertEqual(
+            self.state.transcript_preview(job_id),
+            {"job_id": job_id, "text": "전사 본문\n", "truncated": False},
+        )
+
+        self.state.config_data["storage_v2"]["library"]["transcript_preview_enabled"] = False
+        with self.assertRaises(web_panel_state.JobPreviewDisabledError):
+            self.state.transcript_preview(job_id)
+        self.state.config_data["storage_v2"]["library"]["transcript_preview_enabled"] = True
+        with self.assertRaises(web_panel_state.JobPreviewNotFoundError):
+            self.state.transcript_preview(self._job(status="PROCESSING", path=transcript))
+
+        unsafe_paths = []
+        outside = Path(self.temp_dir.name) / "outside.txt"
+        outside.write_text("private", encoding="utf-8")
+        unsafe_paths.append(outside)
+        link = self.transcripts / "linked.txt"
+        link.symlink_to(outside)
+        unsafe_paths.append(link)
+        hardlink = self.transcripts / "hardlinked.txt"
+        os.link(transcript, hardlink)
+        unsafe_paths.append(hardlink)
+        too_large = self.transcripts / "large.txt"
+        too_large.write_bytes(b"a" * (2 * 1024 * 1024 + 1))
+        unsafe_paths.append(too_large)
+        invalid = self.transcripts / "invalid.txt"
+        invalid.write_bytes(b"\xff")
+        unsafe_paths.append(invalid)
+        nul = self.transcripts / "nul.txt"
+        nul.write_bytes(b"hello\x00world")
+        unsafe_paths.append(nul)
+        for path in unsafe_paths:
+            with self.subTest(path=path.name):
+                with db.connect_db(str(self.db_path)) as conn:
+                    db.update_job(conn, job_id, transcript_txt_path=str(path))
+                with self.assertRaises(web_panel_state.JobPreviewConflictError):
+                    self.state.transcript_preview(job_id)
+
+    def test_preview_respects_configured_max_bytes(self) -> None:
+        transcript = self.transcripts / "lecture.txt"
+        transcript.write_text("hello", encoding="utf-8")
+        job_id = self._job(path=transcript)
+        library = self.state.config_data["storage_v2"]["library"]
+        library["transcript_preview_max_bytes"] = 4
+        with self.assertRaises(web_panel_state.JobPreviewConflictError):
+            self.state.transcript_preview(job_id)
+        library["transcript_preview_max_bytes"] = 5
+        self.assertEqual(self.state.transcript_preview(job_id)["text"], "hello")
+        for invalid in (True, 0, web_panel_state.MAX_TRANSCRIPT_PREVIEW_MAX_BYTES + 1):
+            with self.subTest(invalid=invalid):
+                library["transcript_preview_max_bytes"] = invalid
+                with self.assertRaises(ValueError):
+                    self.state.transcript_preview(job_id)
+
+    def test_quality_review_is_open_after_completion_and_decision_is_idempotent(self) -> None:
+        job_id = self._job(quality=self._soft_bad_quality())
+        open_jobs = self.state.quality_review_jobs(limit=10)
+        self.assertEqual(open_jobs["total"], 1)
+        self.assertEqual(open_jobs["items"][0]["id"], job_id)
+        self.assertEqual(open_jobs["items"][0]["stages"]["correction"], "skipped")
+        self.assertTrue(open_jobs["items"][0]["quality_review"]["required"])
+
+        first = self.state.record_quality_review_decision(job_id, "no_issue")
+        self.assertEqual(first, self.state.record_quality_review_decision(job_id, "no_issue"))
+        self.assertEqual(self.state.quality_review_jobs()["total"], 0)
+        with self.assertRaises(web_panel_state.QualityReviewConflictError):
+            self.state.record_quality_review_decision(job_id, "needs_correction")
+        with self.assertRaises(ValueError):
+            self.state.record_quality_review_decision(job_id, "invalid")
+
+        hard_quality = {**self._soft_bad_quality(), "nonspace_chars": 0}
+        hard_id = self._job(quality=hard_quality)
+        with self.assertRaises(web_panel_state.QualityReviewConflictError):
+            self.state.record_quality_review_decision(hard_id, "no_issue")
+        self.assertEqual(self.state.quality_review_jobs()["total"], 0)
+
+    def test_needs_correction_stays_open_until_no_issue_transition(self) -> None:
+        self.state.log_path = Path(self.temp_dir.name) / "missing.log"
+        job_id = self._job(quality=self._soft_bad_quality())
+        for index in range(25):
+            self._job(
+                quality={"health": "good"},
+                path=self.transcripts / f"ordinary-{index}.txt",
+            )
+
+        first = self.state.record_quality_review_decision(job_id, "needs_correction")
+        self.assertTrue(first["required"])
+        self.assertEqual(first, self.state.record_quality_review_decision(job_id, "needs_correction"))
+        followups = self.state.quality_review_jobs(limit=10)
+        self.assertEqual(followups["total"], 1)
+        self.assertEqual(followups["items"][0]["id"], job_id)
+        self.assertEqual(followups["items"][0]["quality_review"]["decision"], "needs_correction")
+        self.assertTrue(followups["items"][0]["quality_review"]["required"])
+
+        self.assertEqual(self.state.clear_history(self.state.history_plan()["digest"])[0], 200)
+        with db.connect_db(str(self.db_path)) as conn:
+            self.assertEqual([row[0] for row in conn.execute("SELECT id FROM jobs")], [job_id])
+        closed = self.state.record_quality_review_decision(job_id, "no_issue")
+        self.assertFalse(closed["required"])
+        self.assertEqual(self.state.record_quality_review_decision(job_id, "no_issue"), closed)
+        self.assertEqual(self.state.quality_review_jobs()["total"], 0)
+        with self.assertRaises(web_panel_state.QualityReviewConflictError):
+            self.state.record_quality_review_decision(job_id, "needs_correction")
+        self.assertEqual(self.state.clear_history(self.state.history_plan()["digest"])[0], 200)
+        with db.connect_db(str(self.db_path)) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0], 0)
+
+    def test_quality_review_list_includes_old_blocking_job_without_soft_count(self) -> None:
+        soft_id = self._job(quality=self._soft_bad_quality())
+        hard_id = self._job(
+            status="NEEDS_REVIEW",
+            quality={**self._soft_bad_quality(), "nonspace_chars": 0},
+            path=self.transcripts / "blocked.txt",
+        )
+        for index in range(25):
+            self._job(
+                quality={"health": "good"},
+                path=self.transcripts / f"ordinary-{index}.txt",
+            )
+
+        self.assertEqual(len(self.state._open_quality_review_jobs()), 1)
+        first_page = self.state.quality_review_jobs(limit=1)
+        second_page = self.state.quality_review_jobs(limit=1, offset=1)
+        self.assertEqual(first_page["total"], 2)
+        self.assertEqual(first_page["items"][0]["id"], hard_id)
+        self.assertEqual(first_page["items"][0]["status"], "NEEDS_REVIEW")
+        self.assertTrue(first_page["items"][0]["quality_review"]["blocking"])
+        self.assertFalse(first_page["items"][0]["quality_review"]["required"])
+        self.assertEqual(second_page["items"][0]["id"], soft_id)
+        with self.assertRaises(web_panel_state.QualityReviewConflictError):
+            self.state.record_quality_review_decision(hard_id, "no_issue")
+
+    def test_quality_review_waits_for_enabled_postprocess_terminal_state(self) -> None:
+        self.state.config_data["transcript_delivery"]["enabled"] = "true"
+        self.state.config_path.write_text(json.dumps(self.state.config_data))
+        job_id = self._job(quality=self._soft_bad_quality())
+        self.assertEqual(self.state.quality_review_jobs()["total"], 0)
+        with self.assertRaises(web_panel_state.QualityReviewConflictError):
+            self.state.record_quality_review_decision(job_id, "no_issue")
+        with db.connect_db(str(self.db_path)) as conn:
+            db.insert_transcript_postprocess_job_if_absent(
+                conn, job_id,
+                logical_stem="lecture", activation_cutoff="2026-09-28T00:00:00+09:00",
+                route_method="test", status="PENDING",
+                source_txt_path="/tmp/source.txt", source_txt_sha256="0" * 64,
+                source_json_path="/tmp/source.json", source_json_sha256="0" * 64,
+                generator_backend="test",
+            )
+        self.assertEqual(self.state.quality_review_jobs()["total"], 0)
+        self.state.config_data["transcript_delivery"]["enabled"] = False
+        self.state.config_path.write_text(json.dumps(self.state.config_data))
+        self.assertEqual(self.state.quality_review_jobs()["total"], 0)
+        with self.assertRaises(web_panel_state.QualityReviewConflictError):
+            self.state.record_quality_review_decision(job_id, "no_issue")
+        self.state.config_data["transcript_delivery"]["enabled"] = "true"
+        self.state.config_path.write_text(json.dumps(self.state.config_data))
+        with db.connect_db(str(self.db_path)) as conn:
+            db.update_transcript_postprocess_job(
+                conn, job_id, status="DELIVERED", correction_status="READY", summary_status="READY"
+            )
+        open_jobs = self.state.quality_review_jobs()
+        self.assertEqual(open_jobs["total"], 1)
+        self.assertEqual(open_jobs["items"][0]["stages"]["summary"], "done")
+        self.assertEqual(self.state.record_quality_review_decision(job_id, "needs_correction")["decision"], "needs_correction")
+
+    def test_quality_decision_rechecks_policy_changed_after_preview(self) -> None:
+        job_id = self._job(quality=self._soft_bad_quality())
+        self.assertEqual(self.state.quality_review_jobs()["total"], 1)
+        saved = json.loads(self.state.config_path.read_text())
+        saved["transcript_delivery"] = {"enabled": "on"}
+        self.state.config_path.write_text(json.dumps(saved))
+        with self.assertRaises(web_panel_state.QualityReviewConflictError):
+            self.state.record_quality_review_decision(job_id, "no_issue")
+        with db.connect_db(str(self.db_path)) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM quality_review_decisions").fetchone()[0], 0)
+
+    def test_clear_history_preserves_open_quality_review_until_decision(self) -> None:
+        self.state.log_path = Path(self.temp_dir.name) / "missing.log"
+        open_id = self._job(quality=self._soft_bad_quality())
+        ordinary_id = self._job(quality={"health": "good"}, path=self.transcripts / "ordinary.txt")
+        hard_id = self._job(
+            quality={**self._soft_bad_quality(), "nonspace_chars": 0},
+            path=self.transcripts / "hard.txt",
+        )
+
+        self.assertEqual(self.state.clear_history(self.state.history_plan()["digest"])[0], 200)
+        with db.connect_db(str(self.db_path)) as conn:
+            kept = {row[0] for row in conn.execute("SELECT id FROM jobs")}
+        self.assertEqual(kept, {open_id})
+        self.assertNotIn(ordinary_id, kept)
+        self.assertNotIn(hard_id, kept)
+
+        self.state.record_quality_review_decision(open_id, "no_issue")
+        self.assertEqual(self.state.clear_history(self.state.history_plan()["digest"])[0], 200)
+        with db.connect_db(str(self.db_path)) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0], 0)
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM quality_review_decisions").fetchone()[0], 0
             )

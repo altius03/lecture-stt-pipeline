@@ -7,7 +7,6 @@ import logging
 from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
-import re
 import sqlite3
 import stat
 import sys
@@ -28,6 +27,9 @@ from lecture_stt.downstream.course_storage import (
 )
 from lecture_stt.downstream.semester import load_active_semester
 from lecture_stt.downstream.transcript_delivery import (
+    TRANSCRIPT_DELIVERY_DELIVERED,
+    TRANSCRIPT_DELIVERY_SKIPPED,
+    TRANSCRIPT_DELIVERY_UNROUTED,
     enqueue_completed_job,
     load_postprocess_settings,
 )
@@ -50,7 +52,12 @@ from lecture_stt.shared.paths import (
     resolve_executable,
     runtime_env,
 )
-from lecture_stt.stt.notifier import NoopNotifier, SUPPORTED_PROVIDERS, build_notifier
+from lecture_stt.stt.notifier import (
+    NoopNotifier,
+    SUPPORTED_PROVIDERS,
+    build_notifier,
+    redact_sensitive_text as _redact_sensitive_text,
+)
 from lecture_stt.stt.postprocess import postprocess
 from lecture_stt.stt.profiles import (
     legacy_unknown_snapshot,
@@ -60,6 +67,7 @@ from lecture_stt.stt.profiles import (
 from lecture_stt.stt.quality_gate import (
     evaluate as quality_evaluate,
     inherited_review_reason,
+    requires_blocking_review,
     validate_quality_scorecard,
     write_quality_scorecard,
 )
@@ -151,28 +159,6 @@ def _env_flag(name: str) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
-_SENSITIVE_TEXT_PATTERNS = (
-    (
-        re.compile(r"(?i)\b(authorization)\s*[:=]\s*(?:bearer\s+)?([^\s,;\)\]\}\"']+)"),
-        r"\1=[REDACTED]",
-    ),
-    (
-        re.compile(r"(?i)\b(api[_-]?key|token|password|passwd|secret)\s*[:=]\s*(?:bearer\s+)?([^\s,;\)\]\}\"']+)"),
-        r"\1=[REDACTED]",
-    ),
-    (re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+\-/=]+"), r"\1[REDACTED]"),
-    (re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{3,}\b"), "[REDACTED]"),
-    (re.compile(r"sk-[A-Za-z0-9_\-]{8,}"), "[REDACTED]"),
-)
-
-
-def _redact_sensitive_text(value: Any) -> str:
-    text = str(value)
-    for pattern, replacement in _SENSITIVE_TEXT_PATTERNS:
-        text = pattern.sub(replacement, text)
-    return text
-
-
 # 설정 파일을 읽고 기본 형식 유효성을 검사한다.
 def load_config(config_path: str = "config/config.yaml") -> dict:
     root = repo_root()
@@ -199,7 +185,7 @@ def load_config(config_path: str = "config/config.yaml") -> dict:
 
 
 def _notification_env(env: Mapping[str, str]) -> dict[str, str]:
-    keys = ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "TELEGRAM_MESSAGE_THREAD_ID", "DISCORD_WEBHOOK_URL")
+    keys = ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "TELEGRAM_MESSAGE_THREAD_ID")
     return {key: env[key] for key in keys if key in env}
 
 
@@ -220,6 +206,8 @@ def _parse_bool(name: str, value: Any) -> bool:
 
 def _validate_notification(notification: dict) -> None:
     provider = str(notification.get("provider", "auto") or "auto").strip().lower()
+    if provider == "discord":
+        provider = "noop"
     if provider not in SUPPORTED_PROVIDERS:
         raise ValueError(
             f"Config error: notification.provider must be one of {sorted(SUPPORTED_PROVIDERS)}"
@@ -229,26 +217,8 @@ def _validate_notification(notification: dict) -> None:
         if key in notification:
             notification[key] = _parse_bool(f"notification.{key}", notification[key])
 
-    dual_send = notification.get("dual_send_providers", [])
-    if dual_send is None:
-        dual_send = []
-    if isinstance(dual_send, str):
-        dual_send = [item.strip() for item in dual_send.split(",") if item.strip()]
-    if not isinstance(dual_send, list):
-        raise ValueError("Config error: notification.dual_send_providers must be a list or string")
-
-    normalized_dual: list[str] = []
-    for item in dual_send:
-        value = str(item).strip().lower()
-        if not value:
-            continue
-        if value not in SUPPORTED_PROVIDERS or value == "auto":
-            raise ValueError(
-                "Config error: notification.dual_send_providers contains unsupported provider"
-            )
-        normalized_dual.append(value)
     notification["provider"] = provider
-    notification["dual_send_providers"] = normalized_dual
+    notification.pop("dual_send_providers", None)
 
 
 def validate_config(
@@ -495,7 +465,6 @@ def _ensure_config_defaults(config: dict) -> dict:
             "send_success": True,
             "send_review": True,
             "send_failure": True,
-            "dual_send_providers": [],
         },
     }
 
@@ -888,6 +857,23 @@ class STTPipeline:
                 restored_pending,
                 cleared_pending_jobs,
             )
+        delivery = self.config.get("transcript_delivery")
+        if self.notifier.is_enabled() and not (isinstance(delivery, dict) and delivery.get("enabled") is True):
+            rows = self.conn.execute(
+                "SELECT j.id, j.orig_name, j.canonical_base, j.engine_params "
+                "FROM jobs j LEFT JOIN quality_review_decisions d ON d.job_id = j.id "
+                "WHERE j.status = ? AND d.job_id IS NULL AND "
+                "CASE WHEN json_valid(j.engine_params) THEN json_extract(j.engine_params, '$.quality.health') END = 'bad'",
+                (STATUS_DONE,),
+            ).fetchall()
+            for row in rows:
+                metadata = self._load_engine_params(row["engine_params"])
+                self._notify_completed_quality_if_downstream_disabled(
+                    job_id=int(row["id"]),
+                    source_path=Path(str(row["orig_name"])),
+                    canonical_base=str(row["canonical_base"]),
+                    metadata=metadata,
+                )
 
     # 공통 로그 헬퍼: 작업 컨텍스트를 함께 출력한다.
     def _log(self, level: int, message: str, job_ctx: Dict[str, str], *args: Any) -> None:
@@ -1333,7 +1319,7 @@ class STTPipeline:
                 metadata["quality"] = dict(prior_quality)
             else:
                 metadata["quality"] = quality_evaluate(segments, text).to_dict()
-            if duplicate["status"] == STATUS_NEEDS_REVIEW and metadata["quality"].get("health") != "bad":
+            if duplicate["status"] == STATUS_NEEDS_REVIEW and not requires_blocking_review(metadata["quality"]):
                 # Reusing bytes does not resolve an existing operator or recovery hold.
                 metadata["review_hold_source_job_id"] = int(duplicate["id"])
 
@@ -1347,8 +1333,7 @@ class STTPipeline:
             self._write_output(txt_path, json_path, segments, text, metadata)
             self._validate_output_files(txt_path, json_path)
             self._update_progress(job_id, "전사문 생성(TXT/JSON)")
-            replay_health = str(metadata["quality"].get("health", "")).strip().lower()
-            if replay_health == "bad" or inherited_review_reason(metadata):
+            if requires_blocking_review(metadata["quality"]) or inherited_review_reason(metadata):
                 self._handle_quality_review(
                     job_id=job_id,
                     source_path=source_path,
@@ -1412,6 +1397,12 @@ class STTPipeline:
                 "pending_count": queue.get("PENDING", 0),
                 "processing_count": queue.get("PROCESSING", 0),
             })
+            self._notify_completed_quality_if_downstream_disabled(
+                job_id=job_id,
+                source_path=source_path,
+                canonical_base=canonical_base,
+                metadata=metadata,
+            )
             return True
         except (OSError, json.JSONDecodeError, ValueError):
             if db.get_job(self.conn, job_id)["status"] == STATUS_DONE:
@@ -1619,6 +1610,47 @@ class STTPipeline:
             "processing_count": queue.get("PROCESSING", 0),
         })
         self._log(logging.WARNING, "transcript preserved for review: %s", {"job_id": str(job_id), "canonical_base": canonical_base}, safe_summary)
+
+    def _notify_completed_quality_if_downstream_disabled(
+        self,
+        *,
+        job_id: int,
+        source_path: Path,
+        canonical_base: str,
+        metadata: Mapping[str, Any],
+    ) -> None:
+        delivery = self.config.get("transcript_delivery")
+        if isinstance(delivery, dict) and delivery.get("enabled") is True:
+            return
+        quality = metadata.get("quality")
+        if not self.notifier.is_enabled() or not isinstance(quality, dict) or quality.get("health") != "bad":
+            return
+        if requires_blocking_review(quality):
+            return
+        postprocess = self.conn.execute(
+            "SELECT status FROM transcript_postprocess_jobs WHERE source_job_id = ?", (job_id,)
+        ).fetchone()
+        if postprocess is not None and postprocess["status"] not in {
+            TRANSCRIPT_DELIVERY_DELIVERED,
+            TRANSCRIPT_DELIVERY_UNROUTED,
+            TRANSCRIPT_DELIVERY_SKIPPED,
+        }:
+            return
+        if self.conn.execute(
+            "SELECT 1 FROM quality_review_decisions WHERE job_id = ?", (job_id,)
+        ).fetchone():
+            return
+        queue = self._queue_status()
+        self.notifier.notify_review({
+            "job_id": job_id,
+            "orig_name": source_path.name,
+            "canonical_base": canonical_base,
+            "review_step": "완료 후 품질 확인",
+            "review_message": _redact_sensitive_text(str(quality.get("summary") or "품질 경고")),
+            "pending_count": queue.get("PENDING", 0),
+            "processing_count": queue.get("PROCESSING", 0),
+            "completed": True,
+        })
 
     # 하나의 파일에 대해 이동, 중복 처리, 전사, 저장, 알림까지 수행한다.
     def process_job(
@@ -1875,7 +1907,7 @@ class STTPipeline:
             self._update_progress(job_id, "전사문 생성(TXT/JSON)", 94, 3)
             self._write_output(txt_path, json_path, segments, transcript_text, metadata)
             self._validate_output_files(txt_path, json_path)
-            if quality_report.health == "bad":
+            if requires_blocking_review(metadata["quality"]):
                 self._handle_quality_review(
                     job_id=job_id,
                     source_path=source_path,
@@ -1937,8 +1969,8 @@ class STTPipeline:
                 "processing_count": queue.get("PROCESSING", 0),
                 "updated_at": ended_at,
                 # --- v2 추가 ---
-                "quality_health": quality_report.health,
-                "quality_summary": quality_report.summary,
+                "quality_health": quality_report.health if quality_report.health != "bad" else "",
+                "quality_summary": quality_report.summary if quality_report.health != "bad" else "",
             })
             self.notifier.notify_completed({
                 "job_id": job_id,
@@ -1947,6 +1979,12 @@ class STTPipeline:
                 "pending_count": queue.get("PENDING", 0),
                 "processing_count": queue.get("PROCESSING", 0),
             })
+            self._notify_completed_quality_if_downstream_disabled(
+                job_id=job_id,
+                source_path=source_path,
+                canonical_base=canonical_base,
+                metadata=metadata,
+            )
             self._log(logging.INFO, "done", job_ctx)
             return single_job_result(
                 plan_sha256=str(single_job_plan["plan_sha256"]) if single_job_plan else "",
@@ -2204,7 +2242,7 @@ class STTPipeline:
             self._update_progress(job_id, "전사문 생성(TXT/JSON)", 94, 3)
             self._write_output(txt_path, json_path, segments, transcript_text, metadata)
             self._validate_output_files(txt_path, json_path)
-            if quality_report.health == "bad":
+            if requires_blocking_review(metadata["quality"]):
                 self._handle_quality_review(
                     job_id=job_id,
                     source_path=source_path,
@@ -2260,8 +2298,8 @@ class STTPipeline:
                 "pending_count": queue.get("PENDING", 0),
                 "processing_count": queue.get("PROCESSING", 0),
                 "updated_at": ended_at,
-                "quality_health": quality_report.health,
-                "quality_summary": quality_report.summary,
+                "quality_health": quality_report.health if quality_report.health != "bad" else "",
+                "quality_summary": quality_report.summary if quality_report.health != "bad" else "",
             })
             self.notifier.notify_completed({
                 "job_id": job_id,
@@ -2270,6 +2308,12 @@ class STTPipeline:
                 "pending_count": queue.get("PENDING", 0),
                 "processing_count": queue.get("PROCESSING", 0),
             })
+            self._notify_completed_quality_if_downstream_disabled(
+                job_id=job_id,
+                source_path=source_path,
+                canonical_base=canonical_base,
+                metadata=metadata,
+            )
             self._log(logging.INFO, "retry done", job_ctx)
 
         except RetryJobConflictError:

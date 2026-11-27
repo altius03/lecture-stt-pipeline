@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Dict, Mapping, Sequence
+import re
+from typing import Any, Dict, Mapping
 
 import requests
 
@@ -11,7 +12,22 @@ from lecture_stt.shared.paths import state_dir as default_state_dir
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_PROVIDERS = {"auto", "discord", "telegram", "noop"}
+SUPPORTED_PROVIDERS = {"auto", "telegram", "noop"}
+
+_SENSITIVE_TEXT_PATTERNS = (
+    (re.compile(r"(?i)\b(authorization)\s*[:=]\s*(?:bearer\s+)?([^\s,;\)\]\}\"']+)"), r"\1=[REDACTED]"),
+    (re.compile(r"(?i)\b(api[_-]?key|token|password|passwd|secret)\s*[:=]\s*(?:bearer\s+)?([^\s,;\)\]\}\"']+)"), r"\1=[REDACTED]"),
+    (re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+\-/=]+"), r"\1[REDACTED]"),
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{3,}\b"), "[REDACTED]"),
+    (re.compile(r"sk-[A-Za-z0-9_\-]{8,}"), "[REDACTED]"),
+)
+
+
+def redact_sensitive_text(value: Any) -> str:
+    text = str(value)
+    for pattern, replacement in _SENSITIVE_TEXT_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
 
 
 class BaseNotifier:
@@ -66,9 +82,12 @@ class BaseNotifier:
             marker.parent.mkdir(parents=True, exist_ok=True)
             marker.touch(exist_ok=True)
             return True
-        except Exception:
-            logger.warning("Failed to write notification marker %s", marker, exc_info=True)
+        except Exception as exc:
+            logger.warning("Failed to write notification marker %s: %s", marker, self._safe_error_text(exc))
             return False
+
+    def _safe_error_text(self, value: Any) -> str:
+        return redact_sensitive_text(value)
 
     def _queue_suffix(self, payload: Dict[str, Any]) -> str:
         pending = payload.get("pending_count")
@@ -92,7 +111,7 @@ class BaseNotifier:
             return
 
         content = "\n".join([line for line in lines if line])
-        content = self._truncate(content, self.MAX_CONTENT_LEN)
+        content = self._truncate(self._safe_error_text(content), self.MAX_CONTENT_LEN)
         if self._post(content):
             self._mark_notified(kind, event_job_id)
 
@@ -102,7 +121,7 @@ class BaseNotifier:
                 logger.info("%s notification sent successfully", self.provider_name.capitalize())
                 return True
         except Exception as exc:
-            logger.error("%s notification failed (%s)", self.provider_name, type(exc).__name__)
+            logger.error("Failed to send %s notification (%s)", self.provider_name.capitalize(), type(exc).__name__)
         return False
 
     def _transport_send(self, content: str) -> bool:
@@ -164,13 +183,17 @@ class BaseNotifier:
         job_id = str(payload.get("job_id", "-"))
         file_name = self._truncate(payload.get("orig_name", "-"), 240)
         review_step = self._truncate(payload.get("review_step", "검토 필요"), 80)
-        review_message = self._truncate(payload.get("review_message", "-"), 700)
+        review_message = self._truncate(redact_sensitive_text(payload.get("review_message", "-")), 700)
 
         self._send_once(
-            "review",
+            "review_completed" if payload.get("completed") else "review",
             job_id,
             [
-                f"⚠️ [{file_name}] 전사 결과 검토 필요",
+                (
+                    f"⚠️ [{file_name}] 처리 종료 · 결과 확인 권장"
+                    if payload.get("completed")
+                    else f"⚠️ [{file_name}] 전사 결과 검토 필요"
+                ),
                 f"작업 #{job_id}",
                 f"검토 단계: {review_step}",
                 f"사유: {review_message}",
@@ -210,59 +233,6 @@ class BaseNotifier:
 
     def notify_completed(self, payload: Dict[str, Any]) -> None:
         pass
-
-
-class DiscordNotifier(BaseNotifier):
-    def __init__(
-        self,
-        webhook_url: str | None,
-        state_dir: str | Path | None = None,
-        enabled: bool = True,
-        send_start: bool = True,
-        send_success: bool = True,
-        send_review: bool = True,
-        send_failure: bool = True,
-    ):
-        self.webhook_url = webhook_url
-        super().__init__(
-            provider_name="discord",
-            state_dir=state_dir,
-            enabled=enabled and bool(webhook_url),
-            send_start=send_start,
-            send_success=send_success,
-            send_review=send_review,
-            send_failure=send_failure,
-        )
-        if self.is_enabled():
-            logger.info("Discord notifier enabled (webhook URL set)")
-            self._test_webhook()
-        elif enabled:
-            logger.warning("Discord notifier disabled: DISCORD_WEBHOOK_URL not set")
-        else:
-            logger.info("Discord notifier disabled by config")
-
-    def _test_webhook(self) -> None:
-        if not self.webhook_url:
-            return
-        try:
-            response = requests.get(self.webhook_url, timeout=5)
-            if 200 <= response.status_code < 300:
-                logger.info("Discord webhook URL verified successfully")
-            else:
-                logger.error("Discord webhook URL verification failed (HTTP %s)", response.status_code)
-        except Exception as exc:
-            logger.error("Discord webhook URL verification failed (%s)", type(exc).__name__)
-
-    def _transport_send(self, content: str) -> bool:
-        if not self.webhook_url:
-            return False
-
-        response = requests.post(self.webhook_url, json={"content": content}, timeout=10)
-        if 200 <= response.status_code < 300:
-            return True
-
-        logger.error("Discord webhook failed (HTTP %s)", response.status_code)
-        return False
 
 
 class TelegramNotifier(BaseNotifier):
@@ -305,6 +275,13 @@ class TelegramNotifier(BaseNotifier):
     @property
     def _safe_api_base(self) -> str:
         return "https://api.telegram.org/bot<REDACTED>"
+
+    def _safe_error_text(self, value: Any) -> str:
+        text = str(value)
+        if self.bot_token:
+            text = text.replace(self._api_base, self._safe_api_base)
+            text = text.replace(self.bot_token, "<REDACTED>")
+        return redact_sensitive_text(text)
 
     def _test_bot(self) -> None:
         if not self.bot_token:
@@ -350,50 +327,6 @@ class NoopNotifier(BaseNotifier):
         return False
 
 
-class MultiNotifier:
-    def __init__(self, notifiers: Sequence[BaseNotifier]):
-        self.notifiers = list(notifiers)
-
-    def is_enabled(self) -> bool:
-        return any(notifier.is_enabled() for notifier in self.notifiers)
-
-    def notify_started(self, payload: Dict[str, Any]) -> None:
-        for notifier in self.notifiers:
-            notifier.notify_started(payload)
-
-    def notify_success(self, payload: Dict[str, Any]) -> None:
-        for notifier in self.notifiers:
-            notifier.notify_success(payload)
-
-    def notify_error(self, payload: Dict[str, Any]) -> None:
-        for notifier in self.notifiers:
-            notifier.notify_error(payload)
-
-    def notify_review(self, payload: Dict[str, Any]) -> None:
-        for notifier in self.notifiers:
-            notifier.notify_review(payload)
-
-    def notify_failure(self, payload: Dict[str, Any]) -> None:
-        for notifier in self.notifiers:
-            notifier.notify_failure(payload)
-
-    def notify_detected(self, payload: Dict[str, Any]) -> None:
-        for notifier in self.notifiers:
-            notifier.notify_detected(payload)
-
-    def notify_moved(self, payload: Dict[str, Any]) -> None:
-        for notifier in self.notifiers:
-            notifier.notify_moved(payload)
-
-    def notify_transcript_generated(self, payload: Dict[str, Any]) -> None:
-        for notifier in self.notifiers:
-            notifier.notify_transcript_generated(payload)
-
-    def notify_completed(self, payload: Dict[str, Any]) -> None:
-        for notifier in self.notifiers:
-            notifier.notify_completed(payload)
-
-
 def _bool_value(value: Any, default: bool = True) -> bool:
     if value is None:
         return default
@@ -406,96 +339,26 @@ def _bool_value(value: Any, default: bool = True) -> bool:
     return bool(value)
 
 
-def _list_value(value: Any) -> list[str]:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        items = [item.strip() for item in value.split(",")]
-        return [item for item in items if item]
-    if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
-        result: list[str] = []
-        for item in value:
-            if item is None:
-                continue
-            text = str(item).strip()
-            if text:
-                result.append(text)
-        return result
-    return []
-
-
-def _provider_order(notification_cfg: Mapping[str, Any], env: Mapping[str, str]) -> list[str]:
-    provider = str(notification_cfg.get("provider", "auto") or "auto").strip().lower()
-    dual_send = [item.lower() for item in _list_value(notification_cfg.get("dual_send_providers"))]
-
-    if provider == "auto":
-        configured_primary = "telegram" if env.get("TELEGRAM_BOT_TOKEN") and env.get("TELEGRAM_CHAT_ID") else ""
-        if not configured_primary and env.get("DISCORD_WEBHOOK_URL"):
-            configured_primary = "discord"
-        provider = configured_primary or "noop"
-
-    requested = [provider, *dual_send]
-    ordered: list[str] = []
-    for name in requested:
-        if name not in SUPPORTED_PROVIDERS or name == "auto":
-            continue
-        if name not in ordered:
-            ordered.append(name)
-    return ordered or ["noop"]
-
-
-def _build_provider(
-    provider_name: str,
-    notification_cfg: Mapping[str, Any],
-    env: Mapping[str, str],
-    state_dir: str | Path | None,
-) -> BaseNotifier:
-    enabled = _bool_value(notification_cfg.get("enabled"), True)
-    send_start = _bool_value(notification_cfg.get("send_start"), True)
-    send_success = _bool_value(notification_cfg.get("send_success"), True)
-    send_review = _bool_value(notification_cfg.get("send_review"), True)
-    send_failure = _bool_value(notification_cfg.get("send_failure"), True)
-
-    if provider_name == "telegram":
-        return TelegramNotifier(
-            bot_token=env.get("TELEGRAM_BOT_TOKEN"),
-            chat_id=env.get("TELEGRAM_CHAT_ID"),
-            message_thread_id=env.get("TELEGRAM_MESSAGE_THREAD_ID"),
-            state_dir=state_dir,
-            enabled=enabled,
-            send_start=send_start,
-            send_success=send_success,
-            send_review=send_review,
-            send_failure=send_failure,
-        )
-    if provider_name == "discord":
-        return DiscordNotifier(
-            webhook_url=env.get("DISCORD_WEBHOOK_URL"),
-            state_dir=state_dir,
-            enabled=enabled,
-            send_start=send_start,
-            send_success=send_success,
-            send_review=send_review,
-            send_failure=send_failure,
-        )
-    return NoopNotifier()
-
-
 def build_notifier(
     config: Mapping[str, Any] | None,
     env: Mapping[str, str] | None = None,
     state_dir: str | Path | None = None,
-) -> BaseNotifier | MultiNotifier:
+) -> BaseNotifier:
     resolved_env = env or {}
     notification_cfg = dict((config or {}).get("notification") or {})
-    provider_names = _provider_order(notification_cfg, resolved_env)
-    notifiers = [
-        _build_provider(provider_name, notification_cfg, resolved_env, state_dir)
-        for provider_name in provider_names
-    ]
-    enabled_notifiers = [notifier for notifier in notifiers if notifier.is_enabled()]
-    if not enabled_notifiers:
+    provider = str(notification_cfg.get("provider", "auto") or "auto").strip().lower()
+    if provider in {"noop", "discord"} or not _bool_value(notification_cfg.get("enabled"), True):
         return NoopNotifier()
-    if len(notifiers) == 1:
-        return notifiers[0]
-    return MultiNotifier(notifiers)
+    if provider not in {"auto", "telegram"}:
+        raise ValueError(f"Unsupported notification provider: {provider}")
+    notifier = TelegramNotifier(
+        bot_token=resolved_env.get("TELEGRAM_BOT_TOKEN"),
+        chat_id=resolved_env.get("TELEGRAM_CHAT_ID"),
+        message_thread_id=resolved_env.get("TELEGRAM_MESSAGE_THREAD_ID"),
+        state_dir=state_dir,
+        send_start=_bool_value(notification_cfg.get("send_start"), True),
+        send_success=_bool_value(notification_cfg.get("send_success"), True),
+        send_review=_bool_value(notification_cfg.get("send_review"), True),
+        send_failure=_bool_value(notification_cfg.get("send_failure"), True),
+    )
+    return notifier if notifier.is_enabled() else NoopNotifier()

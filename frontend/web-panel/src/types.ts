@@ -1,6 +1,6 @@
 export type RuntimeStatus = "running" | "paused" | "stopped"
 export type RuntimeSource = "web" | "controller" | "external" | "none"
-export type NotificationSelection = "telegram" | "discord" | "both" | "disabled"
+export type NotificationSelection = "telegram" | "disabled"
 export const PANEL_ACTIONS = [
   "start",
   "pause",
@@ -15,6 +15,16 @@ export type PanelAction = (typeof PANEL_ACTIONS)[number]
 export type PanelEndpointKey = "state" | "logs" | "notification" | PanelAction
 export type KnownJobStatus = "PENDING" | "PROCESSING" | "DONE" | "ERROR" | "NEEDS_REVIEW"
 export type JobStatus = KnownJobStatus | (string & {})
+export type JobStageStatus = "pending" | "processing" | "done" | "blocked" | "error" | "skipped"
+export type JobStage = "audio" | "transcript" | "correction" | "summary"
+export type QualityReviewDecision = "no_issue" | "needs_correction"
+
+export interface QualityReview {
+  required: boolean
+  decision: QualityReviewDecision | null
+  decided_at: string | null
+  summary: string | null
+}
 
 export interface CountSummary {
   PENDING: number
@@ -50,6 +60,14 @@ export interface PanelJob {
   step: string
   progress_pct: number
   error_message: string
+  stages?: Record<JobStage, JobStageStatus>
+  quality_review?: QualityReview
+}
+
+export interface JobTranscriptPreview {
+  job_id: number
+  text: string
+  truncated: false
 }
 
 export interface ProcessingJob {
@@ -117,6 +135,7 @@ export interface PanelState {
   summary: PanelSummary
   jobs_v2: PanelJob[]
   processing_v2: ProcessingJob[]
+  quality_review_open_count?: number
 }
 
 export interface LogPayload {

@@ -73,18 +73,6 @@ function createPanelState(): PanelState {
           available: true,
         },
         {
-          id: "discord",
-          label: "디스코드만",
-          description: "DISCORD_WEBHOOK_URL이 필요합니다.",
-          available: true,
-        },
-        {
-          id: "both",
-          label: "둘 다",
-          description: "텔레그램과 디스코드 secret이 모두 필요합니다.",
-          available: true,
-        },
-        {
           id: "disabled",
           label: "끄기",
           description: "알림 전송을 중단합니다.",

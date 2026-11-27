@@ -9,7 +9,7 @@ SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from lecture_stt.stt.quality_gate import evaluate
+from lecture_stt.stt.quality_gate import evaluate, requires_blocking_review
 
 
 class QualityGateTests(unittest.TestCase):
@@ -40,6 +40,7 @@ class QualityGateTests(unittest.TestCase):
         self.assertEqual(report.health, "bad")
         self.assertLess(report.quality_score, 60)
         self.assertIn("반복", report.summary)
+        self.assertFalse(requires_blocking_review(report.to_dict()))
 
     def test_noise_and_short_segments_raise_warning(self) -> None:
         segments = [
@@ -86,6 +87,19 @@ class QualityGateTests(unittest.TestCase):
         self.assertLess(report.chars_per_audio_min, 15)
         self.assertLess(report.coverage_ratio, 0.35)
         self.assertIn("전사량", report.summary)
+        self.assertTrue(requires_blocking_review(report.to_dict()))
+
+    def test_empty_transcript_blocks_even_without_duration(self) -> None:
+        report = evaluate([], "")
+        self.assertEqual(report.health, "bad")
+        self.assertTrue(requires_blocking_review(report.to_dict()))
+
+    def test_malformed_bad_quality_counts_block(self) -> None:
+        for value in ("1", -1, True):
+            with self.subTest(value=value):
+                self.assertTrue(requires_blocking_review({
+                    "health": "bad", "nonspace_chars": value, "nonempty_segments": 1,
+                }))
 
     def test_long_audio_with_dense_full_span_transcript_remains_good(self) -> None:
         segments = [

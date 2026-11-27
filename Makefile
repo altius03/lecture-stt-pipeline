@@ -31,8 +31,13 @@ controller-contracts:
 		tests.test_controller_gate \
 		-v
 
+# Darwin's system linker supplies the LC_UUID required by newer macOS loaders
+# when the pinned Go 1.22 toolchain builds the HTTP proxy's race test binary.
+ifeq ($(shell uname -s),Darwin)
+CONTROLLER_RACE_LINK := -ldflags=-linkmode=external
+endif
 controller-race:
-	go -C controller test -race ./...
+	go -C controller test -race $(CONTROLLER_RACE_LINK) ./...
 
 controller-sigterm:
 	go -C controller test -race -count=10 -run '^(TestMainSIGTERMEmitsInterruptedReportAndReapsDescendants|TestExitedButUnreapedFixtureMemberIsNotLive)$$' ./cmd/lecture-stt-shadow

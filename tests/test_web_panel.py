@@ -44,6 +44,12 @@ class WebPanelRequestHandlerTests(unittest.TestCase):
     def tearDown(self) -> None:
         web_panel.STATE = self.prev_state
 
+    def test_state_stream_signature_tracks_open_quality_reviews(self) -> None:
+        snapshot = {"jobs_v2": [], "quality_review_open_count": 1}
+        initial = web_panel._state_stream_signature(snapshot)
+        snapshot["quality_review_open_count"] = 0
+        self.assertNotEqual(initial, web_panel._state_stream_signature(snapshot))
+
     def test_main_allows_loopback_and_configured_proxy_hosts(self) -> None:
         server = mock.Mock(server_port=8765, server_address=("127.0.0.1", 8765))
         server.serve_forever.side_effect = KeyboardInterrupt
@@ -251,6 +257,109 @@ class WebPanelRequestHandlerTests(unittest.TestCase):
 
         handler._action_start.assert_not_called()
         handler._api_error.assert_called_once_with(403, "Cross-origin request is not allowed")
+
+    def test_job_preview_route_requires_exact_id_and_no_query(self) -> None:
+        handler = object.__new__(web_panel.RequestHandler)
+        handler.path = "/api/jobs/7/transcript-preview"
+        handler._serve_job_transcript_preview = mock.Mock()
+        handler._api_error = mock.Mock()
+        handler.do_GET()
+        handler._serve_job_transcript_preview.assert_called_once_with(7)
+        for path in (
+            "/api/jobs/0/transcript-preview",
+            "/api/jobs/07/transcript-preview",
+            "/api/jobs/7/",
+            "/api/jobs/9007199254740992/transcript-preview",
+        ):
+            with self.subTest(path=path):
+                handler.path = path
+                handler._api_error.reset_mock()
+                handler.do_GET()
+                handler._api_error.assert_called_once()
+        handler.path = "/api/jobs/7/transcript-preview?x=1"
+        handler._api_error.reset_mock()
+        handler.do_GET()
+        handler._api_error.assert_called_once_with(400, "job preview does not accept query parameters")
+
+    def test_job_preview_disabled_maps_to_403(self) -> None:
+        handler = object.__new__(web_panel.RequestHandler)
+        handler._api_error = mock.Mock()
+        handler._write_json = mock.Mock()
+        state = mock.Mock()
+        state.transcript_preview.side_effect = web_panel.JobPreviewDisabledError("disabled")
+        web_panel.STATE = state
+        handler._serve_job_transcript_preview(7)
+        handler._api_error.assert_called_once_with(403, "disabled")
+        handler._write_json.assert_not_called()
+
+    def test_job_preview_invalid_limit_maps_to_503(self) -> None:
+        handler = object.__new__(web_panel.RequestHandler)
+        handler._api_error = mock.Mock()
+        state = mock.Mock()
+        state.transcript_preview.side_effect = ValueError("invalid limit")
+        web_panel.STATE = state
+        handler._serve_job_transcript_preview(7)
+        handler._api_error.assert_called_once_with(503, "전사 본문 조회 설정이 유효하지 않습니다.")
+
+    def test_quality_review_route_uses_existing_origin_guard_and_form(self) -> None:
+        handler = object.__new__(web_panel.RequestHandler)
+        handler.path = "/api/jobs/7/quality-review"
+        handler.headers = {
+            "Host": "127.0.0.1:8765",
+            "Origin": "http://127.0.0.1:8765",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Content-Length": "17",
+        }
+        handler.rfile = io.BytesIO(b"decision=no_issue")
+        handler._write_json = mock.Mock()
+        handler._api_error = mock.Mock()
+        state = mock.Mock()
+        state.record_quality_review_decision.return_value = {
+            "job_id": 7, "decision": "no_issue", "required": False
+        }
+        web_panel.STATE = state
+        handler.do_POST()
+        state.record_quality_review_decision.assert_called_once_with(7, "no_issue")
+        handler._write_json.assert_called_once_with(
+            200, {"job_id": 7, "decision": "no_issue", "required": False}
+        )
+        handler.headers["Origin"] = "https://other.example"
+        handler._api_error.reset_mock()
+        handler.do_POST()
+        handler._api_error.assert_called_once_with(403, "Cross-origin request is not allowed")
+        state.record_quality_review_decision.assert_called_once()
+
+    def test_shared_quality_decision_requires_operator(self) -> None:
+        handler = object.__new__(web_panel.RequestHandler)
+        handler.path = "/api/jobs/7/quality-review"
+        handler.headers = {"Host": "panel.example", "Origin": "https://panel.example"}
+        handler.server = mock.Mock(allowed_hosts={"panel.example"}, loopback_listener=True,
+                                   shared_mode=True, control_token="operator-test")
+        handler.client_address = ("127.0.0.1", 3011)
+        handler._api_error = mock.Mock()
+        handler._action_job_quality_review = mock.Mock()
+        handler.do_POST()
+        self.assertEqual(handler._api_error.call_args.args[0], 403)
+        handler._action_job_quality_review.assert_not_called()
+        handler.headers["Authorization"] = "Bearer operator-test"
+        handler.do_POST()
+        handler._action_job_quality_review.assert_called_once_with(7)
+
+    def test_quality_review_list_route_validates_pagination(self) -> None:
+        handler = object.__new__(web_panel.RequestHandler)
+        handler.path = "/api/jobs/quality-reviews?limit=10&offset=2"
+        handler._api_error = mock.Mock()
+        handler._write_json = mock.Mock()
+        state = mock.Mock()
+        state.quality_review_jobs.return_value = {"total": 0, "limit": 10, "offset": 2, "items": []}
+        web_panel.STATE = state
+        handler.do_GET()
+        state.quality_review_jobs.assert_called_once_with(limit=10, offset=2)
+        handler._write_json.assert_called_once()
+        handler.path = "/api/jobs/quality-reviews?limit=01"
+        handler._api_error.reset_mock()
+        handler.do_GET()
+        handler._api_error.assert_called_once()
 
     def test_api_post_rejects_malformed_origin(self) -> None:
         handler = object.__new__(web_panel.RequestHandler)

@@ -11,6 +11,9 @@ import type {
   PanelActionResponse,
   PanelEndpoints,
   PanelJob,
+  JobStage,
+  JobStageStatus,
+  QualityReview,
   PanelState,
   PanelSummary,
   ProcessingJob,
@@ -22,7 +25,38 @@ import type {
 const RUNTIME_STATUSES = ["running", "paused", "stopped"] as const satisfies readonly RuntimeStatus[]
 const RUNTIME_SOURCES = ["web", "controller", "external", "none"] as const satisfies readonly RuntimeSource[]
 const PAUSE_ACTIONS = ["pause", "resume"] as const
-const NOTIFICATION_SELECTIONS = ["telegram", "discord", "both", "disabled"] as const satisfies readonly NotificationSelection[]
+const NOTIFICATION_SELECTIONS = ["telegram", "disabled"] as const satisfies readonly NotificationSelection[]
+const JOB_STAGE_STATUSES = ["pending", "processing", "done", "blocked", "error", "skipped"] as const satisfies readonly JobStageStatus[]
+const JOB_STAGES = ["audio", "transcript", "correction", "summary"] as const satisfies readonly JobStage[]
+
+function decodeStages(input: unknown): Record<JobStage, JobStageStatus> | undefined {
+  if (input === undefined) return undefined
+  const record = asRecord(input, "jobs_v2[].stages")
+  return Object.fromEntries(JOB_STAGES.map((stage) => [stage, readLiteral(record, stage, JOB_STAGE_STATUSES, "jobs_v2[].stages")])) as Record<JobStage, JobStageStatus>
+}
+
+function decodeQualityReview(input: unknown): QualityReview | undefined {
+  if (input === undefined) return undefined
+  const record = asRecord(input, "jobs_v2[].quality_review")
+  const decision = record.decision
+  if (decision !== null && decision !== "no_issue" && decision !== "needs_correction") {
+    throw new Error("jobs_v2[].quality_review.decision 값이 올바르지 않습니다.")
+  }
+  const decidedAt = record.decided_at
+  if (decidedAt !== null && typeof decidedAt !== "string") {
+    throw new Error("jobs_v2[].quality_review.decided_at 값이 올바르지 않습니다.")
+  }
+  const summary = record.summary
+  if (summary !== null && typeof summary !== "string") {
+    throw new Error("jobs_v2[].quality_review.summary 값이 올바르지 않습니다.")
+  }
+  return {
+    required: readBoolean(record, "required", "jobs_v2[].quality_review"),
+    decision,
+    decided_at: decidedAt,
+    summary,
+  }
+}
 
 function asRecord(input: unknown, label: string): Record<string, unknown> {
   if (!input || typeof input !== "object" || Array.isArray(input)) {
@@ -143,7 +177,7 @@ function decodeRuntimeState(input: unknown): RuntimeState {
   }
 }
 
-function decodePanelJob(input: unknown): PanelJob {
+export function decodePanelJob(input: unknown): PanelJob {
   const record = asRecord(input, "jobs_v2[]")
   return {
     id: readNumber(record, "id", "jobs_v2[]"),
@@ -153,6 +187,8 @@ function decodePanelJob(input: unknown): PanelJob {
     step: readString(record, "step", "jobs_v2[]"),
     progress_pct: readNumber(record, "progress_pct", "jobs_v2[]"),
     error_message: readString(record, "error_message", "jobs_v2[]"),
+    stages: decodeStages(record.stages),
+    quality_review: decodeQualityReview(record.quality_review),
   }
 }
 
@@ -206,13 +242,22 @@ function decodeNotificationOption(input: unknown): NotificationOption {
 
 function decodeNotificationState(input: unknown): NotificationState {
   const record = asRecord(input, "notification")
+  const rawSelection = readString(record, "selection", "notification")
+  if (!NOTIFICATION_SELECTIONS.includes(rawSelection as NotificationSelection) && rawSelection !== "discord" && rawSelection !== "both") {
+    throw new Error("notification.selection 값이 올바르지 않습니다.")
+  }
+  const selection = rawSelection === "telegram" ? "telegram" : "disabled"
   return {
-    selection: readLiteral(record, "selection", NOTIFICATION_SELECTIONS, "notification"),
-    selected_label: readString(record, "selected_label", "notification"),
+    selection,
+    selected_label: rawSelection === selection ? readString(record, "selected_label", "notification") : "꺼짐",
     apply_label: readString(record, "apply_label", "notification"),
     restart_required: readBoolean(record, "restart_required", "notification"),
     can_apply_now: readBoolean(record, "can_apply_now", "notification"),
-    options: readArray(record, "options", "notification").map(decodeNotificationOption),
+    options: readArray(record, "options", "notification").flatMap((option) => {
+      const optionRecord = asRecord(option, "notification.options[]")
+      const id = readString(optionRecord, "id", "notification.options[]")
+      return id === "discord" || id === "both" ? [] : [decodeNotificationOption(optionRecord)]
+    }),
   }
 }
 
@@ -228,18 +273,6 @@ function decodeNotificationStateOrFallback(input: unknown): NotificationState {
         {
           id: "telegram",
           label: "텔레그램만",
-          description: "현재 실행 중인 패널 백엔드는 이 설정을 아직 제공하지 않습니다.",
-          available: false,
-        },
-        {
-          id: "discord",
-          label: "디스코드만",
-          description: "현재 실행 중인 패널 백엔드는 이 설정을 아직 제공하지 않습니다.",
-          available: false,
-        },
-        {
-          id: "both",
-          label: "둘 다",
           description: "현재 실행 중인 패널 백엔드는 이 설정을 아직 제공하지 않습니다.",
           available: false,
         },
@@ -273,6 +306,7 @@ export function decodePanelState(input: unknown): PanelState {
   if (record.schema_version !== 2) {
     throw new Error("지원하지 않는 panel schema_version 입니다.")
   }
+  const qualityReviewCount = readOptionalNumber(record, "quality_review_open_count", "state")
 
   return {
     schema_version: 2,
@@ -284,6 +318,7 @@ export function decodePanelState(input: unknown): PanelState {
     summary: decodeSummary(record.summary),
     jobs_v2: readArray(record, "jobs_v2", "state").map(decodePanelJob),
     processing_v2: readArray(record, "processing_v2", "state").map(decodeProcessingJob),
+    ...(qualityReviewCount !== null ? { quality_review_open_count: qualityReviewCount } : {}),
   }
 }
 

@@ -44,9 +44,8 @@ storage_v2:
     enabled: false
   library:
     enabled: false
-    # Transcript body access is a separate opt-in because it crosses the
-    # metadata-only dashboard boundary. Every dashboard reader can use it while
-    # enabled; only verified current DONE TXT is read.
+    # Completed transcript body access is a separate opt-in for live jobs and
+    # imported recordings. Every permitted dashboard reader can use it while enabled.
     transcript_preview_enabled: false
     transcript_preview_max_bytes: 2097152
   archive_review:
@@ -171,7 +170,6 @@ notification:
   send_success: true
   send_review: true
   send_failure: true
-  dual_send_providers: []
 
 # Legacy correction/summary archive-evidence compatibility only. The active
 # distributor does not scan these folders.

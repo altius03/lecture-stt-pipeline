@@ -1,8 +1,10 @@
 # Design — Lecture STT
 
-A locked design system for the Lecture STT operator console. Every web-panel
-screen reads this file before visual changes are made. Extend this system when a
-new UI need appears; do not invent a separate per-screen theme.
+The current web panel follows the operator flow: status → finished job detail,
+completed quality checks, logs, and settings. Use this file when changing its UI.
+`frontend/web-panel/src/panel-redesign.css` owns the current surface palette and
+layout; `frontend/web-panel/tokens.css` retains shared typography, spacing, and
+compatibility roles for older workbenches.
 
 ## Audience, use, and tone
 
@@ -32,24 +34,15 @@ meaning.
 
 ## Theme
 
-`Cobalt`, adapted for a Korean operational product without network font
-dependencies.
+Neutral zinc, with colour used only for meaningful status and keyboard focus.
 
-- `--color-paper`: `oklch(98.3% 0.006 252)`
-- `--color-paper-2`: `oklch(96.4% 0.009 252)`
-- `--color-paper-3`: `oklch(93.8% 0.012 252)`
-- `--color-ink`: `oklch(22% 0.022 258)`
-- `--color-ink-2`: `oklch(31% 0.021 258)`
-- `--color-rule`: `oklch(88% 0.014 254)`
-- `--color-accent`: `oklch(50% 0.2 256)`
-- `--color-accent-ink`: `oklch(98.5% 0.006 252)`
-- `--color-focus`: `oklch(20% 0.025 258)`
+- Background/surface: `#fff`; muted surface: `#fafafa`; text: `#18181b`.
+- Rule: `#e4e4e7`; main action: `#18181b`; focus: `#2563eb`.
+- Dark mode follows the same surface hierarchy with `#111113` background.
 
-Cobalt is a signal, not a surface: active navigation, primary guarded actions,
-focus, and selected rows should keep it below roughly 3% of a viewport.
-Green, amber, and red are reserved for actual semantic states and never used as
-decoration. Dark mode keeps the same hue relationships and raises elevated
-surfaces by lightness.
+Green, amber, and red are reserved for actual status, warnings, and errors.
+Status is text plus a small dot or pictogram, never a repeated coloured pill.
+Do not use generated photos or decorative imagery in the operator workflow.
 
 ## Typography
 
@@ -66,17 +59,17 @@ tabular figures.
 
 ## Spacing
 
-The source scale lives in `frontend/web-panel/tokens.css` and follows a four
-pixel rhythm. Layout and component CSS use named tokens such as
-`var(--space-md)` rather than new raw spacing values.
+The shared scale lives in `frontend/web-panel/tokens.css` and follows a four
+pixel rhythm. The current panel fixes its measured layout values in
+`panel-redesign.css` and reuses the shared tokens where they fit.
 
 ## Layout
 
 - Desktop: command rail and main workbench form an intentionally unequal grid.
-- The top runtime strip keeps identity, connection mode, last update, notice,
-  notifications, theme, and runtime state together without becoming a hero.
-- Equal card grids are avoided. Each screen chooses the surface suited to its
-  evidence: ledger, queue, definition list, table, or queue/detail split.
+- The top strip shows runtime state; the rail owns product identity and routes.
+- Home uses one aligned job table with four equal stage columns. Detail uses
+  one transcript surface and a smaller metadata surface. Review uses a
+  queue/detail split only when there is something to inspect.
 - At narrow widths the command rail becomes a compact horizontal navigation
   surface and the workbench becomes one column.
 - The document never scrolls horizontally. Dense tables may own a bounded
@@ -106,7 +99,7 @@ pixel rhythm. Layout and component CSS use named tokens such as
 
 ## CTA voice
 
-- Primary: solid cobalt, 6 px radius, explicit verb naming the existing guarded
+- Primary: solid ink, 6 px radius, explicit verb naming the existing guarded
   action.
 - Secondary: paper surface with a visible rule and ink text.
 - Destructive: semantic error treatment only where the underlying operation is
@@ -125,7 +118,7 @@ pixel rhythm. Layout and component CSS use named tokens such as
 ## What pages MUST share
 
 - Lecture STT identity, functional command rail, and runtime strip.
-- Cobalt accent placement and the light/dark palette relationship.
+- Neutral light/dark surface hierarchy and small semantic status marks.
 - Pretendard and telemetry-mono roles.
 - Button height, radius, focus treatment, and guarded-action voice.
 - Left-aligned screen heading rhythm with no decorative ordinal eyebrow.
@@ -139,15 +132,15 @@ pixel rhythm. Layout and component CSS use named tokens such as
 
 ## Protected behavior
 
-Visual work must not change hash routes, API or DTO contracts, polling/SSE
-behavior, write guards, confirmation defaults, immutable storage keys, file
-paths, or operating data. It must not add upload, rename/move, automatic
-materialization, migration, worker restart, or launchd controls.
+Visual work preserves write guards, confirmation defaults, immutable storage
+keys, file paths, and operating data. The 2026-09-28 user-flow redesign adds
+the job detail, quality decision, and transcript preview contracts documented
+in `docs/ARCHITECTURE.md`. It adds no upload or automatic materialization.
 
 ## Exports
 
-`frontend/web-panel/tokens.css` is the runtime source of truth. The excerpts
-below are portable translations of its core system.
+The excerpts below are historical compatibility mappings for the original
+Cobalt system. Current surface values are in `panel-redesign.css`.
 
 ### tokens.css
 
