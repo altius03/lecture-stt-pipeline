@@ -854,15 +854,6 @@ def get_status_counts(conn: sqlite3.Connection) -> dict[str, int]:
     return counts
 
 
-def _transcript_contains_text(path: Path) -> bool:
-    has_text = False
-    with path.open(encoding="utf-8") as handle:
-        for chunk in iter(lambda: handle.read(64 * 1024), ""):
-            if not has_text and chunk.strip():
-                has_text = True
-    return has_text
-
-
 # txt/json 결과가 둘 다 존재하고 세그먼트 배열이 있으면 완료된 결과로 본다.
 def _has_complete_transcripts(txt_path: str | None, json_path: str | None) -> bool:
     if not txt_path or not json_path:
@@ -874,7 +865,10 @@ def _has_complete_transcripts(txt_path: str | None, json_path: str | None) -> bo
         return False
 
     try:
-        _transcript_contains_text(txt_file)
+        # Pending claims only need a readability check, including trailing bytes.
+        with txt_file.open(encoding="utf-8") as handle:
+            while handle.read(64 * 1024):
+                pass
         with json_file.open("r", encoding="utf-8") as handle:
             payload = json.load(handle)
     except (OSError, UnicodeError, json.JSONDecodeError):
@@ -1034,14 +1028,33 @@ def _repair_empty_transcript(
 
 def _completed_transcript_quality(
     conn: sqlite3.Connection, row: sqlite3.Row
-) -> tuple[str | None, str | None, str | None, dict]:
+) -> tuple[str | None, str | None, str | None, dict] | None:
+    """Read the pair once. A new incomplete pair is eligible for audio recovery."""
     json_path, txt_path = row["transcript_json_path"], row["transcript_txt_path"]
+    deferred = row["current_step"] == QUALITY_REPAIR_WAIT
     try:
+        if not deferred and (
+            not txt_path or not json_path or not Path(txt_path).is_file() or not Path(json_path).is_file()
+        ):
+            return None
         serialized = Path(json_path).read_bytes()
-        payload = json.loads(serialized)
+        # Initial admission requires UTF-8, including in the tail of the TXT.
+        payload = json.loads(serialized if deferred else serialized.decode("utf-8"))
         if not isinstance(payload, dict):
             raise ValueError("복구된 전사 JSON 형식 확인 필요")
         text = Path(txt_path).read_text(encoding="utf-8")
+        if not deferred and not isinstance(payload.get("segments"), list):
+            return None
+    except OSError:
+        if deferred:
+            raise
+        return None
+    except (TypeError, ValueError) as exc:
+        if deferred:
+            return None, None, f"복구된 전사 산출물 검증 실패: {exc}", {}
+        return None
+
+    try:
         segments = payload["segments"]
         if not text.strip() or not any(
             isinstance(segment, dict) and str(segment.get("text") or "").strip()
@@ -1095,14 +1108,14 @@ def recover_processing_jobs(
         # 오래된 상태인지는 메타 데이터로만 기록해 추적한다.
         # A deferred repair already saw a complete pair. An unavailable file
         # on its next read should wait; re-admitting its audio would lose that claim.
-        transcript_ready = row["current_step"] == QUALITY_REPAIR_WAIT or _has_complete_transcripts(txt, json_path)
-        if transcript_ready:
-            try:
-                quality_health, quality_summary, scorecard_error, fields = _completed_transcript_quality(conn, row)
-            except OSError as exc:
-                # Keep the recovery claim retryable when iCloud or the disk is unavailable.
-                update_job(conn, job_id, current_step=QUALITY_REPAIR_WAIT, error_message=str(exc))
-                continue
+        try:
+            verdict = _completed_transcript_quality(conn, row)
+        except OSError as exc:
+            # Keep the recovery claim retryable when iCloud or the disk is unavailable.
+            update_job(conn, job_id, current_step=QUALITY_REPAIR_WAIT, error_message=str(exc))
+            continue
+        if verdict is not None:
+            quality_health, quality_summary, scorecard_error, fields = verdict
             if scorecard_error:
                 set_status(
                     conn,

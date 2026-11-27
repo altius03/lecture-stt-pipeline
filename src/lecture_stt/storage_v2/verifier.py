@@ -1664,23 +1664,6 @@ def verify_library(
 
             current_jobs = conn.execute(
                 """
-                WITH selected_engines AS (
-                    SELECT
-                        job_id,
-                        COUNT(*) AS selected_engine_count,
-                        MIN(id) AS engine_run_id,
-                        MIN(engine_name) AS engine_name,
-                        MIN(engine_version) AS engine_version,
-                        MIN(status) AS engine_status,
-                        MIN(started_at) AS engine_started_at,
-                        MIN(finished_at) AS engine_finished_at,
-                        MIN(stderr_relpath) AS engine_stderr_relpath,
-                        MIN(log_relpath) AS engine_log_relpath
-                    FROM engine_runs
-                    WHERE is_selected = 1
-                      AND archived_at IS NULL
-                    GROUP BY job_id
-                )
                 SELECT
                     j.id,
                     j.job_key,
@@ -1691,21 +1674,23 @@ def verify_library(
                     j.queued_at,
                     j.started_at AS job_started_at,
                     j.finished_at AS job_finished_at,
-                    COALESCE(e.selected_engine_count, 0)
-                        AS selected_engine_count,
-                    e.engine_run_id,
-                    e.engine_name,
-                    e.engine_version,
-                    e.engine_status,
-                    e.engine_started_at,
-                    e.engine_finished_at,
-                    e.engine_stderr_relpath,
-                    e.engine_log_relpath
+                    COUNT(e.id) AS selected_engine_count,
+                    MIN(e.id) AS engine_run_id,
+                    MIN(e.engine_name) AS engine_name,
+                    MIN(e.engine_version) AS engine_version,
+                    MIN(e.status) AS engine_status,
+                    MIN(e.started_at) AS engine_started_at,
+                    MIN(e.finished_at) AS engine_finished_at,
+                    MIN(e.stderr_relpath) AS engine_stderr_relpath,
+                    MIN(e.log_relpath) AS engine_log_relpath
                 FROM transcription_jobs AS j
-                LEFT JOIN selected_engines AS e
+                LEFT JOIN engine_runs AS e
                   ON e.job_id = j.id
+                 AND e.is_selected = 1
+                 AND e.archived_at IS NULL
                 WHERE j.recording_id = ?
                   AND j.archived_at IS NULL
+                GROUP BY j.id
                 ORDER BY j.id ASC
                 """,
                 (recording_id,),

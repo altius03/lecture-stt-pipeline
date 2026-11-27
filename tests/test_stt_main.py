@@ -1771,6 +1771,17 @@ class SttPipelineBehaviorTests(unittest.TestCase):
         stt_main.db.recover_processing_jobs(self.pipeline.conn)
         self.assertEqual(self._assert_empty_review_artifacts(job_id, original), path)
 
+    def test_deferred_recovery_waits_for_missing_txt_before_assessing_segments(self):
+        job_id, txt, path, _ = self._historical_empty_output("deferred-io")
+        stt_main.db.update_job(self.pipeline.conn, job_id, current_step=stt_main.db.QUALITY_REPAIR_WAIT)
+        path.write_text("{}", encoding="utf-8")
+        txt.unlink()
+        stt_main.db.recover_processing_jobs(self.pipeline.conn, deferred_only=True)
+        self.assertEqual(stt_main.db.get_job(self.pipeline.conn, job_id)["status"], stt_main.STATUS_PROCESSING)
+        txt.write_text("restored", encoding="utf-8")
+        stt_main.db.recover_processing_jobs(self.pipeline.conn, deferred_only=True)
+        self.assertEqual(stt_main.db.get_job(self.pipeline.conn, job_id)["status"], stt_main.STATUS_NEEDS_REVIEW)
+
     def test_polling_worker_retries_only_deferred_repair_while_accepting_new_audio(self):
         job_id, _, path, original = self._historical_empty_output("poll-empty")
         fresh = self._write_stable_source("independent.m4a", b"independent")

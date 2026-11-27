@@ -289,14 +289,13 @@ class ControlState:
             return [str(item).strip().lower() for item in value if str(item).strip()]
         return []
 
-    def _notification_selection(self) -> str:
+    def _notification_selection(self, availability: dict[str, bool]) -> str:
         notification_cfg = self._notification_config()
         if not bool(notification_cfg.get("enabled", True)):
             return "disabled"
 
         provider = str(notification_cfg.get("provider", "auto") or "auto").strip().lower()
         dual_send = set(self._normalize_dual_send(notification_cfg.get("dual_send_providers")))
-        availability = self._notification_availability()
 
         if provider == "noop":
             return "disabled"
@@ -323,8 +322,8 @@ class ControlState:
         }
         return labels.get(selection, "끄기")
 
-    def _notification_options(self) -> list[dict[str, object]]:
-        availability = self._notification_availability()
+    @staticmethod
+    def _notification_options(availability: dict[str, bool]) -> list[dict[str, object]]:
         return [
             {
                 "id": "telegram",
@@ -353,7 +352,8 @@ class ControlState:
         ]
 
     def _notification_state(self) -> dict[str, object]:
-        selection = self._notification_selection()
+        availability = self._notification_availability()
+        selection = self._notification_selection(availability)
         apply_label = "실행 중인 전사를 유지하고 다음 작업부터 반영합니다."
         return {
             "selection": selection,
@@ -361,7 +361,7 @@ class ControlState:
             "apply_label": apply_label,
             "restart_required": False,
             "can_apply_now": False,
-            "options": self._notification_options(),
+            "options": self._notification_options(availability),
         }
 
     def update_notification_selection(self, selection: str) -> bool:

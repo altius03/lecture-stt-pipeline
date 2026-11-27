@@ -45,7 +45,7 @@ class StorageV2LibraryTests(unittest.TestCase):
 
         def insert_before_page(query: str) -> None:
             nonlocal inserted
-            if "WITH current_jobs AS" in query:
+            if "LIMIT" in query and "OFFSET" in query:
                 self._insert_recording("rec-demo-001")
                 self.conn.commit()
                 inserted = True
@@ -56,6 +56,24 @@ class StorageV2LibraryTests(unittest.TestCase):
         self.assertTrue(inserted)
         self.assertEqual((result["total"], result["summaries"]), (0, []))
         self.assertEqual(list_recordings(self.db_path)["total"], 1)
+
+    def test_later_page_only_counts_its_own_artifacts_and_reviews(self) -> None:
+        for i in range(3):
+            recording = self._insert_recording(f"rec_{i}")
+            job = self._insert_job(recording, f"job_{i}", is_current=(i != 1))
+            for revision in range(1, i + 2):
+                self._insert_artifact(recording, job, "transcript_raw_text", revision,
+                                      is_latest=revision == i + 1)
+                self._insert_review(recording)
+        self.conn.commit()
+        page = list_recordings(self.db_path, limit=1, offset=1)
+        self.assertEqual(page["total"], 3)
+        self.assertEqual(page["counts"]["open_reviews"], 6)
+        summary, = page["summaries"]
+        self.assertEqual(summary["storage_key"], "rec_1")
+        self.assertIsNone(summary["current_job"])
+        self.assertEqual((summary["artifact_count"], summary["open_review_count"]), (2, 2))
+        self.assertEqual(list_recordings(self.db_path, limit=1, offset=3)["summaries"], [])
 
     def test_detail_snapshot_excludes_a_review_committed_between_queries(self) -> None:
         recording_id = self._insert_recording("snapshot")
