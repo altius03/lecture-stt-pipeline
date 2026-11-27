@@ -72,6 +72,10 @@ class TranscriptDeliveryConflictError(TranscriptDeliveryError):
     """The queue already contains a different pinned row for the same source job."""
 
 
+class TranscriptDeliveryJobNotFoundError(TranscriptDeliveryConflictError):
+    """The requested source job has no postprocess queue row."""
+
+
 class TranscriptDeliveryUnsafePathError(TranscriptDeliveryError):
     """A source or destination path is unsafe to read or write."""
 
@@ -635,6 +639,14 @@ def _file_identity(path: Path) -> tuple[int, int, int, int, int]:
     return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
 
 
+def has_routing_artifact_reservation(row: sqlite3.Row) -> bool:
+    """Legacy blocked rows may already have an artifact pinned to an earlier route."""
+    return any(
+        row[name] is not None for name in row.keys()
+        if name.startswith(("correction_stage_", "summary_stage_", "destination_"))
+    ) or any(row[name] == STAGE_READY for name in ("correction_status", "summary_status"))
+
+
 def requeue_confirmed_job(
     conn: sqlite3.Connection,
     *,
@@ -643,11 +655,18 @@ def requeue_confirmed_job(
     source_txt_sha256: str,
     source_json_sha256: str,
     settings: TranscriptPostprocessSettings,
+    missing_course_only: bool = False,
 ) -> str:
     """Requeue only the confirmed source and course, preserving completed stages."""
     row = shared_db.get_transcript_postprocess_job(conn, source_job_id)
     if row is None:
-        raise TranscriptDeliveryConflictError("후처리 작업을 찾을 수 없습니다.")
+        raise TranscriptDeliveryJobNotFoundError("후처리 작업을 찾을 수 없습니다.")
+    if missing_course_only and row["status"] not in {TRANSCRIPT_DELIVERY_SKIPPED, TRANSCRIPT_DELIVERY_UNROUTED}:
+        # A repeated panel request may observe its own successful registration.
+        if row["route_method"] != "operator_confirmed" or row["status"] not in {
+            TRANSCRIPT_DELIVERY_PENDING, TRANSCRIPT_DELIVERY_DELIVERED,
+        }:
+            raise TranscriptDeliveryConflictError("과목 확인이 필요한 작업만 재등록할 수 있습니다.")
     job = _done_job_row(conn, source_job_id)
     source_paths = [Path(str(job[f"transcript_{kind}_path"]).strip()) for kind in ("txt", "json")]
     source_identities = [_file_identity(path) for path in source_paths]
@@ -666,12 +685,7 @@ def requeue_confirmed_job(
     active_identity = None
     fields = {}
     if status in {TRANSCRIPT_DELIVERY_SKIPPED, TRANSCRIPT_DELIVERY_UNROUTED}:
-        # Conflicting legacy rows can carry paths or hashes from an earlier
-        # delivery. Never redirect or reset an existing artifact reservation.
-        if any(
-            row[name] is not None for name in row.keys()
-            if name.startswith(("correction_stage_", "summary_stage_", "destination_"))
-        ) or any(row[name] == STAGE_READY for name in ("correction_status", "summary_status")):
+        if has_routing_artifact_reservation(row):
             raise TranscriptDeliveryConflictError("기존 후처리 산출물 기록이 있어 과목을 변경할 수 없습니다.")
         active_identity = _file_identity(settings.active_semester_path)
         active, digest = load_active_semester_snapshot(settings.active_semester_path)
