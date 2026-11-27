@@ -21,7 +21,7 @@ SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from lecture_stt.downstream import transcript_delivery as td  # noqa: E402
+from lecture_stt.downstream import semester, transcript_delivery as td  # noqa: E402
 from lecture_stt.downstream.course_storage import (  # noqa: E402
     CourseStorageError,
     descendant_relative_path,
@@ -293,6 +293,25 @@ class TranscriptPostprocessTests(unittest.TestCase):
             source_job_id,
             shared_db.get_transcript_postprocess_job(self.conn, source_job_id),
         )
+
+    def test_routing_and_digest_use_the_same_snapshot_when_semester_file_changes(self) -> None:
+        original = self.active_path.read_bytes()
+        replacement = json.loads(original)
+        replacement["semester"] = "next-semester"
+        resolve_courses = semester._courses_from_payload
+
+        def switch_while_resolving_courses(mapping):
+            self.active_path.write_text(json.dumps(replacement), encoding="utf-8")
+            return resolve_courses(mapping)
+
+        job_id, _, _ = self._insert_done_job(
+            canonical_base="260101CA_2", recorded_at="2026-01-01T10:30:00+09:00"
+        )
+        with mock.patch.object(semester, "_courses_from_payload", switch_while_resolving_courses):
+            td.enqueue_completed_job(self.conn, source_job_id=job_id, settings=self.settings)
+        row = shared_db.get_transcript_postprocess_job(self.conn, job_id)
+        self.assertEqual(row["semester"], "2026-1")
+        self.assertEqual(row["active_semester_sha256"], hashlib.sha256(original).hexdigest())
 
     def test_routes_alias_and_pins_all_postprocess_paths(self) -> None:
         _, row = self._queue_job(source_suffix="alias")
@@ -1080,13 +1099,12 @@ class TranscriptPostprocessTests(unittest.TestCase):
                 return perform
             with (
                 mock.patch.object(td, "_read_regular_file_bytes", observing(td._read_regular_file_bytes, "source")),
-                mock.patch.object(td, "load_active_semester", observing(td.load_active_semester, "semester")),
-                mock.patch.object(td, "_active_snapshot_sha256", observing(td._active_snapshot_sha256, "hash")),
+                mock.patch.object(td, "load_active_semester_snapshot", observing(td.load_active_semester_snapshot, "semester_and_hash")),
                 mock.patch.object(td, "_build_queue_fields", observing(td._build_queue_fields, "destinations")),
             ):
                 self.assertEqual(self._confirmed_requeue(row), "PENDING")
         events = [record[0] for record in self.conn.execute("SELECT event FROM progress")]
-        self.assertCountEqual(events, ["source", "source", "semester", "hash", "destinations"])
+        self.assertCountEqual(events, ["source", "source", "semester_and_hash", "destinations"])
 
     def test_requeue_does_not_overwrite_changes_during_confirmation(self) -> None:
         for change in ("source_row", "queue_pin", "source_file", "active_semester"):

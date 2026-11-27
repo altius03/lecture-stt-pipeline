@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import stat
 import time
 from typing import Dict, List
 
@@ -34,9 +35,6 @@ class PollingWatcher:
     # 파일을 스캔해 완성으로 판단되는 항목만 정렬해 반환한다.
     def scan_stable_files(self) -> List[Path]:
         stable_files: List[Path] = []
-        if not self.watch_folder.exists():
-            return stable_files
-
         now = utils.now()
         observed = set()
 
@@ -46,22 +44,19 @@ class PollingWatcher:
             return stable_files
 
         for path in entries:
-            if path.is_symlink() or not path.is_file():
-                continue
             if utils.is_temporary_file(path):
                 continue
-
-            observed.add(str(path))
             try:
-                stat = path.stat()
+                info = path.lstat()
             except OSError:
-                # 스캔 중 파일이 사라지거나 접근 불가해도 전체 루프가 중단되지 않게 한다.
-                self._states.pop(str(path), None)
                 continue
+            if not stat.S_ISREG(info.st_mode):
+                continue
+            observed.add(str(path))
             state = self._states.get(str(path))
 
-            if state is None or state.size != stat.st_size or state.mtime != stat.st_mtime:
-                self._states[str(path)] = _FileState(size=stat.st_size, mtime=stat.st_mtime, first_unstable_at=now)
+            if state is None or state.size != info.st_size or state.mtime != info.st_mtime:
+                self._states[str(path)] = _FileState(size=info.st_size, mtime=info.st_mtime, first_unstable_at=now)
                 continue
 
             unchanged_for = now - state.first_unstable_at

@@ -1190,6 +1190,16 @@ class StorageV2VerifierTests(unittest.TestCase):
             self.assertEqual(issue["job_key"], "job_verifier")
             self.assertEqual(issue["selected_engine_count"], 0)
 
+    def test_archived_selected_engine_is_excluded_from_current_job_check(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path, records_root, _ = self._fixture(Path(tmpdir))
+            with sqlite3.connect(db_path) as conn:
+                conn.execute("UPDATE engine_runs SET archived_at = CURRENT_TIMESTAMP")
+            result = verify_library(db_path, records_root)
+            counts = [issue["selected_engine_count"] for issue in result["issues"]
+                      if issue["code"] == "current_job_selected_engine_invariant"]
+            self.assertEqual(counts, [0])
+
     def test_engine_bound_artifact_requires_selected_engine_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path, records_root, _ = self._fixture(Path(tmpdir))

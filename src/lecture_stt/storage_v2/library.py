@@ -732,19 +732,20 @@ def list_recordings(
         )
         rows = conn.execute(
             """
-            WITH current_jobs AS (
+            WITH recording_page AS (
                 SELECT
-                    job.recording_id,
-                    job.job_key,
-                    job.status,
-                    job.progress,
-                    job.requested_profile,
-                    job.requested_profile_version,
-                    job.queued_at,
-                    job.finished_at
-                FROM transcription_jobs AS job
-                WHERE job.is_current = 1
-                  AND job.archived_at IS NULL
+                    recording.id,
+                    job.id AS job_id,
+                    COALESCE(recording.recorded_at, recording.received_at,
+                             job.queued_at, recording.created_at) AS sort_time
+                FROM recordings AS recording
+                LEFT JOIN transcription_jobs AS job
+                  ON job.recording_id = recording.id
+                 AND job.is_current = 1
+                 AND job.archived_at IS NULL
+                WHERE recording.archived_at IS NULL
+                ORDER BY sort_time DESC, recording.id DESC
+                LIMIT ? OFFSET ?
             ),
             review_counts AS (
                 SELECT
@@ -752,6 +753,7 @@ def list_recordings(
                     COUNT(*) AS open_review_count
                 FROM review_items AS review
                 WHERE review.status IN ('open', 'triaged')
+                  AND review.recording_id IN (SELECT id FROM recording_page)
                 GROUP BY review.recording_id
             ),
             artifact_counts AS (
@@ -762,7 +764,8 @@ def list_recordings(
                 JOIN transcription_jobs AS job
                   ON job.id = artifact.job_id
                  AND job.recording_id = artifact.recording_id
-                WHERE artifact.archived_at IS NULL
+                WHERE artifact.recording_id IN (SELECT id FROM recording_page)
+                  AND artifact.archived_at IS NULL
                   AND job.archived_at IS NULL
                 GROUP BY artifact.recording_id
             )
@@ -792,29 +795,20 @@ def list_recordings(
                 job.finished_at,
                 COALESCE(review_counts.open_review_count, 0) AS open_review_count,
                 COALESCE(artifact_counts.artifact_count, 0) AS artifact_count
-            FROM recordings AS recording
+            FROM recording_page AS page
+            JOIN recordings AS recording ON recording.id = page.id
             LEFT JOIN recording_titles AS title
               ON title.recording_id = recording.id
              AND title.is_current = 1
             LEFT JOIN recording_contexts AS context
               ON context.recording_id = recording.id
              AND context.is_selected = 1
-            LEFT JOIN current_jobs AS job
-              ON job.recording_id = recording.id
+            LEFT JOIN transcription_jobs AS job ON job.id = page.job_id
             LEFT JOIN review_counts
               ON review_counts.recording_id = recording.id
             LEFT JOIN artifact_counts
               ON artifact_counts.recording_id = recording.id
-            WHERE recording.archived_at IS NULL
-            ORDER BY
-                COALESCE(
-                    recording.recorded_at,
-                    recording.received_at,
-                    job.queued_at,
-                    recording.created_at
-                ) DESC,
-                recording.id DESC
-            LIMIT ? OFFSET ?
+            ORDER BY page.sort_time DESC, page.id DESC
             """,
             (normalized_limit, normalized_offset),
         ).fetchall()

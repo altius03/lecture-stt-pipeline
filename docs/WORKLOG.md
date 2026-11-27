@@ -5,6 +5,8 @@
 
 ## 2026-11-27
 
+- [이슈 #14](https://github.com/altius03/lecture-stt-pipeline/issues/14) · [운영 조회와 전사 복구의 반복 작업 감소](work-log/014-runtime-reads.md) · [PR #18](https://github.com/altius03/lecture-stt-pipeline/pull/18)
+
 - [이슈 #12](https://github.com/altius03/lecture-stt-pipeline/issues/12) · [원음 보존과 전사·후처리 복구 검증](work-log/012-pipeline-reliability.md) · [PR #13](https://github.com/altius03/lecture-stt-pipeline/pull/13)
 
 - [이슈 #10](https://github.com/altius03/lecture-stt-pipeline/issues/10) · [main 운영 코드의 dev 통합](work-log/010-integrate-main.md) · [PR #11](https://github.com/altius03/lecture-stt-pipeline/pull/11)

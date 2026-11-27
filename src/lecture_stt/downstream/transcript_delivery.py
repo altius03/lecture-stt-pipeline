@@ -44,6 +44,7 @@ from lecture_stt.downstream.semester import (
     ActiveSemester,
     DEFAULT_ACTIVE_SEMESTER_PATH,
     load_active_semester,
+    load_active_semester_snapshot,
 )
 from lecture_stt.shared import db as shared_db
 from lecture_stt.shared import utils
@@ -237,10 +238,6 @@ def _read_regular_file_bytes(path: Path, *, field: str) -> bytes:
 
 def _sha256_bytes(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
-
-
-def _active_snapshot_sha256(path: Path) -> str:
-    return utils.compute_sha256(path)
 
 
 def _done_job_row(conn: sqlite3.Connection, source_job_id: int) -> sqlite3.Row:
@@ -581,8 +578,7 @@ def enqueue_completed_job(
     settings: TranscriptPostprocessSettings,
 ) -> str | None:
     shared_db.init_transcript_postprocess_jobs_table(conn)
-    active = load_active_semester(settings.active_semester_path)
-    active_sha256 = _active_snapshot_sha256(settings.active_semester_path)
+    active, active_sha256 = load_active_semester_snapshot(settings.active_semester_path)
     source = _read_legacy_job_source(_done_job_row(conn, source_job_id))
     completed_at = _parse_iso_datetime(source.completed_at)
     cutoff = _parse_iso_datetime(active.activated_at)
@@ -678,8 +674,7 @@ def requeue_confirmed_job(
         ) or any(row[name] == STAGE_READY for name in ("correction_status", "summary_status")):
             raise TranscriptDeliveryConflictError("기존 후처리 산출물 기록이 있어 과목을 변경할 수 없습니다.")
         active_identity = _file_identity(settings.active_semester_path)
-        active = load_active_semester(settings.active_semester_path)
-        digest = _active_snapshot_sha256(settings.active_semester_path)
+        active, digest = load_active_semester_snapshot(settings.active_semester_path)
         if digest != row["active_semester_sha256"]:
             raise TranscriptDeliveryConflictError("등록 당시의 활성 학기 설정이 달라졌습니다.")
         stem = row["logical_stem"]
@@ -790,8 +785,7 @@ def reconcile_completed_jobs(
     limit: int | None = None,
     dry_run: bool = False,
 ) -> dict[str, Any]:
-    active = load_active_semester(settings.active_semester_path)
-    active_sha256 = _active_snapshot_sha256(settings.active_semester_path)
+    active, active_sha256 = load_active_semester_snapshot(settings.active_semester_path)
     cutoff = _parse_iso_datetime(active.activated_at)
     if cutoff is None:
         raise TranscriptDeliveryError("active semester activated_at is invalid")

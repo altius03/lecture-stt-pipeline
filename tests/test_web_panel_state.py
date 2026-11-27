@@ -73,6 +73,7 @@ class WebPanelStateSnapshotTests(unittest.TestCase):
 
         snapshot = state.snapshot(include_log=False)
 
+        state._notification_availability.assert_called_once_with()
         self.assertEqual(snapshot["schema_version"], 2)
         self.assertEqual(snapshot["runtime_state"]["status"], "running")
         self.assertEqual(snapshot["runtime_state"]["source"], "web")

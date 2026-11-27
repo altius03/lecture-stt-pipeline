@@ -894,10 +894,24 @@ def _courses_from_payload(payload: Mapping[str, Any]) -> tuple[SemesterCourse, .
     return tuple(courses)
 
 
-def load_active_semester(path: Path | str = DEFAULT_ACTIVE_SEMESTER_PATH) -> ActiveSemester:
+def _read_active_semester(path: Path | str) -> bytes:
     active_path = _validate_existing_file(Path(path).expanduser(), field="active_path")
+    return active_path.read_bytes()
+
+
+def load_active_semester(path: Path | str = DEFAULT_ACTIVE_SEMESTER_PATH) -> ActiveSemester:
+    return _parse_active_semester(_read_active_semester(path))
+
+
+def load_active_semester_snapshot(path: Path | str) -> tuple[ActiveSemester, str]:
+    """Pin the exact bytes used to resolve courses and destinations."""
+    raw = _read_active_semester(path)
+    return _parse_active_semester(raw), hashlib.sha256(raw).hexdigest()
+
+
+def _parse_active_semester(raw: bytes) -> ActiveSemester:
     try:
-        payload = json.loads(active_path.read_text(encoding="utf-8"))
+        payload = json.loads(raw.decode("utf-8"))
     except json.JSONDecodeError as exc:
         raise SemesterManifestError(f"active_path is not valid JSON: {exc}") from exc
     mapping = _require_mapping(payload, field="active")
