@@ -103,7 +103,7 @@ Python 3.12로 검증했으며 음성 디코더는 Python 3.11 이상이 필요�
 ```bash
 cd /Users/geonha/DEV/lecture_stt
 python3.12 -m venv .venv
-.venv/bin/pip install -r requirements.txt
+make python-deps
 cp config/config.example.yaml config/config.yaml
 ```
 
@@ -126,14 +126,17 @@ TELEGRAM_CHAT_ID=...
 
 ## 5. 자주 쓰는 명령
 
-검증:
+저장소 루트에서 CI와 같은 검사를 실행합니다. 위에서 만든 Python 3.12 가상환경을 사용하며, 컨트롤러는 Go 버전을 `controller/go.mod`에 맞추고 웹 패널은 Node.js 22를 사용합니다.
 
 ```bash
-cd /Users/geonha/DEV/lecture_stt
-PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v
-.venv/bin/python -m compileall -q scripts tests src
+make check-python       # 전체 unittest와 소스 컴파일
+make check-controller   # macOS에서 Python 계약, Go race, 종료 회귀 10회, vet, Darwin 인수 검사
+make web-deps           # 처음 설치하거나 패널 잠금 파일이 바뀌었을 때
+make check-web          # Vitest와 프로덕션 빌드
 git diff --check
 ```
+
+의존성을 설치한 macOS에서는 `make check`로 세 묶음을 모두 실행할 수 있습니다. CI에서 실패한 단계는 로그에 나온 명령(예: `make controller-sigterm`)으로 다시 실행합니다.
 
 STT worker:
 
@@ -152,13 +155,10 @@ bash scripts/run_gui.sh
 # browser: http://127.0.0.1:8765
 ```
 
-React panel 개발/검증:
+패널 의존성을 설치한 뒤 개발 서버를 실행합니다.
 
 ```bash
 cd frontend/web-panel
-npm install
-npm test
-npm run build
 npm run dev
 ```
 

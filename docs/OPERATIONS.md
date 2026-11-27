@@ -6,7 +6,7 @@
 
 - 운영 repo: `/Users/geonha/DEV/lecture_stt`
 - 운영 branch: `main`
-- GitHub Actions workflow: `.github/workflows/ci.yml`에서 Python unittest/compileall과 web-panel test/build를 실행한다.
+- GitHub Actions는 Ubuntu에서 Python 전체 검사와 웹 패널 테스트·빌드를 실행하고, macOS에서 컨트롤러를 검증한다. 로컬 명령과 준비 절차는 [README](../README.md#5-자주-쓰는-명령)에서 확인한다.
 - 운영 모델: `large-v3` 유지. 모델 교체 금지.
 - runtime package: production `.venv`와 `requirements.txt`는 `faster-whisper==1.2.1`로 정렬되어 있다. 이는 package-only 변경이며 canonical STT model 변경이 아니다.
 - runtime path migration: 적용 완료. STT tmp는 `~/Library/Caches/lecture_stt/tmp`, app/downstream/launchd logs는 `~/Library/Logs/lecture_stt`, DB는 repo `state/jobs.sqlite3`에 유지한다.
@@ -32,8 +32,7 @@ uid=$(id -u)
 launchctl print "gui/$uid/com.geonha.lecture-stt" 2>/dev/null | sed -n '1,80p'
 launchctl print "gui/$uid/com.geonha.lecture-stt-distribute" 2>/dev/null | sed -n '1,80p'
 
-PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_*.py' -v
-.venv/bin/python -m compileall -q scripts src tests
+make check-python
 ```
 
 DB 무결성 확인:
@@ -400,8 +399,7 @@ Canary 실행/판정은 자동으로 강의를 넣는 것이 아니라 다음 �
 코드 변경 batch마다 최소:
 
 ```bash
-PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_*.py' -v
-.venv/bin/python -m compileall -q scripts src tests
+make check-python
 git diff --check
 git status --short --branch
 git diff --stat
