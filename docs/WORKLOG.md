@@ -5,7 +5,7 @@
 
 ## 2026-11-27
 
-- [이슈 #20](https://github.com/altius03/lecture-stt-pipeline/issues/20) · [누락 강의 단건 복구 패널](work-log/020-panel-course-recovery.md)
+- [이슈 #20](https://github.com/altius03/lecture-stt-pipeline/issues/20) · [누락 강의 단건 복구 패널](work-log/020-panel-course-recovery.md) · [PR #21](https://github.com/altius03/lecture-stt-pipeline/pull/21)
 
 - [이슈 #14](https://github.com/altius03/lecture-stt-pipeline/issues/14) · [운영 조회와 전사 복구의 반복 작업 감소](work-log/014-runtime-reads.md) · [PR #18](https://github.com/altius03/lecture-stt-pipeline/pull/18)
 
