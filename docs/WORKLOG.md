@@ -5,7 +5,7 @@
 
 ## 2026-11-28
 
-- [이슈 #22](https://github.com/altius03/lecture-stt-pipeline/issues/22) · [운영 화면과 강의 복구 통합 배포](work-log/022-live-integration.md)
+- [이슈 #22](https://github.com/altius03/lecture-stt-pipeline/issues/22) · [운영 화면과 강의 복구 통합 배포](work-log/022-live-integration.md) · [PR #23](https://github.com/altius03/lecture-stt-pipeline/pull/23)
 
 ## 2026-11-27
 
